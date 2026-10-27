@@ -1,0 +1,14 @@
+version: 2
+mode: docs
+docs:
+  include:
+    - "docs/next/**/*.md"
+    - "docs/next/**/*.mdx"
+  exclude:
+    - "docs/next/changelog/**"
+    - "docs/next/tutorials/linkly/_workspace/**"
+ai_check:
+  provider: anthropic
+  model: claude-sonnet-4-6
+  api_key_env_var: ANTHROPIC_API_KEY
+  max_tokens: 6000

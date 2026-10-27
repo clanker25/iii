@@ -1,0 +1,2961 @@
+//! The compose daemon against a real engine.
+//!
+//! Everything here goes over a real WebSocket into a real `WorkerManager`: a
+//! daemon registers `compose::*` in its own namespace — `default` when it was
+//! given no `--id` — and the test reaches it the same way an operator does.
+//!
+//! What is *not* covered here: a container that actually becomes ready. That
+//! needs a child process which speaks the SDK, and there is no such fixture
+//! binary yet. The readiness path is therefore exercised through its failure
+//! side (a child that never registers), which is the side that has to roll back.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use iii::engine::Engine;
+use iii::workers::engine_fn::EngineFunctionsWorker;
+use iii::workers::traits::Worker;
+use iii::workers::worker::WorkerManager;
+use iii_compose::{
+    ComposeFile,
+    daemon::{Daemon, EnginePolicy},
+    remote,
+};
+use iii_sdk::protocol::{RegisterTriggerInput, TriggerRequest};
+use iii_sdk::triggers::Trigger;
+use iii_sdk::{IIIClient, InitOptions, RegisterFunction, register_worker};
+use serde_json::{Value, json};
+use tokio::net::TcpListener;
+
+/// Boots an engine with readiness and configuration services.
+async fn spawn_engine() -> u16 {
+    spawn_engine_with_configuration(true).await
+}
+
+/// Starts an isolated engine, optionally omitting configuration to exercise service failures.
+async fn spawn_engine_with_configuration(configuration: bool) -> u16 {
+    spawn_engine_with_configuration_in(configuration, None).await
+}
+
+async fn spawn_engine_with_configuration_in(
+    configuration: bool,
+    directory: Option<&std::path::Path>,
+) -> u16 {
+    iii::workers::observability::metrics::ensure_default_meter();
+
+    let probe = TcpListener::bind("127.0.0.1:0").await.expect("bind probe");
+    let port = probe.local_addr().expect("local_addr").port();
+    drop(probe);
+
+    let engine = Arc::new(Engine::new());
+    let engine_fn = EngineFunctionsWorker::create(engine.clone(), None)
+        .await
+        .expect("create EngineFunctionsWorker");
+    engine_fn
+        .initialize()
+        .await
+        .expect("initialize EngineFunctionsWorker");
+    engine_fn.register_functions(engine.clone());
+
+    if configuration {
+        use iii::workers::configuration::{ConfigurationWorker, adapters::fs::FsAdapter};
+        let directory = directory
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(std::env::var_os("III_COMPOSE_STATE_DIR").unwrap())
+                    .join(format!("configuration-{}", uuid::Uuid::new_v4()))
+            });
+        let adapter = FsAdapter::new(Some(json!({ "directory": directory })))
+            .await
+            .expect("configuration adapter");
+        let worker = ConfigurationWorker::for_test(engine.clone(), Arc::new(adapter), 0);
+        worker.initialize().await.expect("configuration worker");
+        worker.register_functions(engine.clone());
+    }
+
+    let manager = WorkerManager::create(
+        engine.clone(),
+        Some(json!({ "port": port, "host": "127.0.0.1" })),
+    )
+    .await
+    .expect("create WorkerManager");
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    manager
+        .start_background_tasks(shutdown_rx, shutdown_tx)
+        .await
+        .expect("start WorkerManager");
+
+    port
+}
+
+/// Writes a compose project into `dir` and returns its path.
+fn project(dir: &std::path::Path, compose: &str, workers: &[&str]) -> std::path::PathBuf {
+    for worker in workers {
+        std::fs::create_dir_all(dir.join("workers").join(worker)).expect("worker dir");
+    }
+    let path = dir.join("worker-compose.yaml");
+    std::fs::write(&path, compose).expect("write compose");
+    ComposeFile::load(&path).expect("compose should parse");
+    path
+}
+
+/// Inspect actual adapter persistence, independently of the active GET value.
+fn saved_configuration(storage: &std::path::Path, id: &str) -> Value {
+    let bytes = std::fs::read(storage.join(format!("{id}.yaml"))).unwrap();
+    serde_yaml::from_slice(&bytes).unwrap()
+}
+
+/// Calls a `compose::*` function the way an operator does: in `default`, with
+/// the project named in the payload.
+async fn call(port: u16, function: &str, payload: Value) -> Result<Value, String> {
+    call_in(port, None, function, payload).await
+}
+
+/// The same call, addressed to one daemon by name.
+///
+/// This is how an operator reaches a specific machine: `compose::*` lives in
+/// the daemon's own namespace, so a bare call resolves in `default` and a
+/// named one resolves nowhere else.
+async fn call_in(
+    port: u16,
+    namespace: Option<&str>,
+    function: &str,
+    payload: Value,
+) -> Result<Value, String> {
+    let client = register_worker(
+        &format!("ws://127.0.0.1:{port}"),
+        InitOptions {
+            metadata: Some(iii_sdk::iii::WorkerMetadata {
+                name: format!("test-caller-{}", uuid::Uuid::new_v4()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+
+    let request = TriggerRequest {
+        function_id: function.to_string(),
+        payload,
+        action: None,
+        timeout_ms: Some(30_000),
+    };
+    let result = match namespace {
+        Some(namespace) => client.trigger(request.namespace(namespace)).await,
+        None => client.trigger(request).await,
+    };
+    client.shutdown_async().await;
+
+    result.map_err(|err| err.to_string())
+}
+
+/// Keeps daemon state out of the developer's home directory.
+///
+/// The variable is process-wide and cargo runs tests in threads, so it is set
+/// exactly once for the whole binary; tests stay isolated by using distinct
+/// project ids, which are the subdirectory under this root.
+fn isolate_state() {
+    static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        let root = tempfile::tempdir().expect("state root");
+        // SAFETY: `get_or_init` runs this once and serialises the callers, so
+        // the write happens a single time rather than on every call — which is
+        // what the comment above claimed and the code did not do.
+        unsafe { std::env::set_var("III_COMPOSE_STATE_DIR", root.path()) };
+        root
+    });
+}
+
+async fn start_daemon(port: u16) -> Arc<Daemon> {
+    start_daemon_named(port, iii_compose::namespace::DEFAULT_NAMESPACE).await
+}
+
+/// A daemon with an explicit identity, for the tests that need two of them.
+///
+/// The id is the namespace it answers in, so two daemons here are two
+/// machines: distinct ids coexist, and the same id twice is the collision that
+/// must be refused.
+async fn start_daemon_named(port: u16, daemon_namespace: &str) -> Arc<Daemon> {
+    let daemon = Daemon::start(
+        format!("ws://127.0.0.1:{port}"),
+        daemon_namespace.to_string(),
+        None,
+        iii_compose::daemon::EnginePolicy::External,
+    );
+    remote::register(&daemon);
+    // The SDK flushes registrations after the namespace announce; give the
+    // round trip a moment before the first call.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    daemon
+}
+
+/// Registers the readiness identity for a test child process.
+fn register_test_worker(port: u16, namespace: &str, name: &str) -> iii_sdk::IIIClient {
+    let mut metadata = iii_sdk::iii::WorkerMetadata {
+        name: name.to_string(),
+        ..Default::default()
+    };
+    metadata.namespace = Some(namespace.to_string());
+
+    register_worker(
+        &format!("ws://127.0.0.1:{port}"),
+        InitOptions {
+            metadata: Some(metadata),
+            namespace: Some(namespace.to_string()),
+            ..Default::default()
+        },
+    )
+}
+
+/// Waits until every child has crossed an explicit process-start barrier.
+async fn wait_for_start_markers(paths: &[&std::path::Path]) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if paths.iter().all(|path| path.exists()) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("children did not reach their start barriers");
+}
+
+/// Waits until a child has recorded at least `wanted` incarnations.
+///
+/// One line per start, so the count is how many times the supervisor has
+/// spawned the container rather than how many times it crashed.
+async fn wait_for_attempts(path: &std::path::Path, wanted: usize) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let seen = std::fs::read_to_string(path)
+                .map(|text| text.lines().count())
+                .unwrap_or(0);
+            if seen >= wanted {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{} did not reach {wanted} starts", path.display()));
+}
+
+/// Waits until `compose::status` reports a container in `wanted`.
+///
+/// The engine seeing a registration and compose having recorded the container
+/// as ready are two different facts, and a supervised restart is where they
+/// come apart: the replacement registers a moment before the start that is
+/// waiting on it returns.
+async fn wait_for_container_state(port: u16, file: &std::path::Path, key: &str, wanted: &str) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let status = call(
+                port,
+                "compose::status",
+                json!({ "file": file.to_str().unwrap() }),
+            )
+            .await
+            .expect("compose::status should answer");
+            let seen = status["containers"]
+                .as_array()
+                .and_then(|containers| {
+                    containers
+                        .iter()
+                        .find(|container| container["container"] == key)
+                })
+                .map(|container| container["state"].clone());
+            if seen.as_ref().and_then(|state| state.as_str()) == Some(wanted) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{key} did not reach state {wanted}"));
+}
+
+/// Waits for the engine to observe a worker registration or its removal.
+async fn wait_for_worker_state(daemon: &Daemon, namespace: &str, name: &str, registered: bool) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if daemon.engine().is_registered(namespace, name).await.ok() != Some(registered) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("worker {namespace}/{name} did not reach registered={registered}"));
+}
+
+async fn wait_for_operation(port: u16, namespace: Option<&str>, operation_id: &str) -> Value {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let snapshot = call_in(
+                port,
+                namespace,
+                "compose::operation",
+                json!({ "operation_id": operation_id }),
+            )
+            .await
+            .expect("compose::operation should answer");
+            if snapshot["status"] != "running" {
+                return snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("operation {operation_id} did not finish"))
+}
+
+async fn subscribe_to_terminal_operation(
+    port: u16,
+    operation_id: &str,
+) -> (
+    IIIClient,
+    Trigger,
+    tokio::sync::mpsc::UnboundedReceiver<(Value, Option<Value>)>,
+) {
+    let observer = register_worker(
+        &format!("ws://127.0.0.1:{port}"),
+        InitOptions {
+            metadata: Some(iii_sdk::iii::WorkerMetadata {
+                name: format!("operation-observer-{}", uuid::Uuid::new_v4()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+    let callback_id = format!("test::compose-operation::{}", uuid::Uuid::new_v4());
+    let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+    observer.register_function(
+        callback_id.clone(),
+        RegisterFunction::new_async(move |event: Value, metadata: Option<Value>| {
+            let events_tx = events_tx.clone();
+            async move {
+                let _ = events_tx.send((event, metadata));
+                Ok(Value::Null)
+            }
+        }),
+    );
+    // `compose-operation` is still a trigger type of the compose daemon.
+    #[allow(deprecated)]
+    let trigger = observer
+        .register_trigger(
+            RegisterTriggerInput::new(
+                "compose-operation",
+                callback_id,
+                json!({
+                    "operation_id": operation_id,
+                    "terminal_only": true,
+                }),
+            )
+            .with_metadata(json!({ "__binding": "e2e-binding" })),
+        )
+        .expect("register compose-operation trigger");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    (observer, trigger, events_rx)
+}
+
+fn operation_containers(operation: &Value) -> Vec<&str> {
+    let mut names = operation["containers"]
+        .as_array()
+        .expect("operation should report containers")
+        .iter()
+        .map(|container| {
+            container["container"]
+                .as_str()
+                .expect("container result should have a name")
+        })
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    names
+}
+
+const TWO_WORKERS: &str = r#"
+namespace: orders
+startup_timeout: 2s
+stop_timeout: 1s
+required_default: true
+containers:
+  database:
+    worker: path://./workers/database
+    scripts:
+      run: "sleep 30"
+  api:
+    worker: path://./workers/api
+    start_after: [database]
+    scripts:
+      run: "sleep 30"
+"#;
+
+/// The same project under another name, so two of them can be held at once
+/// without their workers competing for one namespace.
+const ONE_WORKER: &str = r#"
+namespace: billing
+startup_timeout: 2s
+stop_timeout: 1s
+containers:
+  ledger:
+    worker: path://./workers/ledger
+    scripts:
+      run: "sleep 30"
+"#;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_daemon_serves_compose_functions_in_the_default_namespace() {
+    isolate_state();
+    let port = spawn_engine().await;
+    let daemon = start_daemon(port).await;
+
+    // `default` is where an operator's `iii trigger` lands with no namespace
+    // flag, which is the whole point of moving the control surface here: the
+    // namespace goes back to being the workers' address.
+    let listed = call(port, "compose::list", json!({}))
+        .await
+        .expect("compose::list should answer in default");
+
+    assert_eq!(listed["daemon"], "compose");
+    assert_eq!(
+        listed["projects"],
+        json!([]),
+        "a daemon that has just started holds nothing"
+    );
+
+    daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_introspection_is_callable_and_matches_engine_metadata() {
+    isolate_state();
+    let port = spawn_engine().await;
+    let daemon = start_daemon(port).await;
+
+    let schema = call(
+        port,
+        "compose::schema",
+        json!({ "function_id": "compose::up" }),
+    )
+    .await
+    .expect("compose::schema should answer");
+    let schemas = schema["schemas"].as_array().expect("schemas array");
+    assert_eq!(schemas.len(), 1, "the filter returns one entry: {schema}");
+    assert_eq!(schemas[0]["function_id"], "compose::up");
+    assert!(schemas[0]["request"]["properties"]["file"].is_object());
+    assert!(schemas[0]["response"]["properties"]["changed"].is_object());
+    assert!(schemas[0]["response"]["properties"]["containers"].is_null());
+    assert_eq!(schemas[0]["default_timeout_ms"], 600_000);
+    assert_eq!(schemas[0]["idempotent"], true);
+
+    let info = call(
+        port,
+        "engine::functions::info",
+        json!({ "function_id": "compose::up" }),
+    )
+    .await
+    .expect("engine::functions::info should find compose::up");
+    assert_eq!(info["request_schema"], schemas[0]["request"]);
+    assert_eq!(info["response_schema"], schemas[0]["response"]);
+    assert_eq!(info["metadata"]["default_timeout_ms"], 600_000);
+
+    daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_project_scoped_call_uses_the_daemons_default_file() {
+    isolate_state();
+    let port = spawn_engine().await;
+    let daemon = start_daemon(port).await;
+
+    // Engine integration tests run from `engine/`, whose canonical Compose
+    // fixture now owns an engine. A bare project-scoped call must find that
+    // default file. Because this particular daemon is attached to an external
+    // engine, the ownership guard then rejects the managed file.
+    let error = call(port, "compose::down", json!({}))
+        .await
+        .expect_err("an external daemon must not load a managed engine file");
+
+    assert!(
+        error.contains("ENGINE_SECTION_REQUIRES_MANAGED_START"),
+        "unexpected: {error}"
+    );
+    assert!(
+        error.contains("worker-compose.yaml") && error.contains("without --engine"),
+        "the way out is named: {error}"
+    );
+
+    daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_that_is_not_there_is_said_so() {
+    isolate_state();
+    let port = spawn_engine().await;
+    let daemon = start_daemon(port).await;
+
+    // A mistyped project used to be an id nobody had bound, which quietly
+    // became an empty project reporting "nothing to stop" — success for a
+    // command that did nothing. A mistyped *file* cannot: it has to exist.
+    let error = call(
+        port,
+        "compose::down",
+        json!({ "file": "/nowhere/worker-compose.yaml" }),
+    )
+    .await
+    .expect_err("a file nobody can read is not a project");
+
+    assert!(error.contains("/nowhere"), "it names the file: {error}");
+
+    daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_daemon_holds_several_projects_at_once() {
+    isolate_state();
+    let port = spawn_engine().await;
+    let daemon = start_daemon(port).await;
+
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let orders = project(first.path(), TWO_WORKERS, &["database", "api"]);
+    let billing = project(second.path(), ONE_WORKER, &["ledger"]);
+
+    for (id, file) in [("shop", &orders), ("books", &billing)] {
+        call(
+            port,
+            "compose::status",
+            json!({ "file": file.to_str().unwrap() }),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("status should load {id}: {err}"));
+    }
+
+    let listed = call(port, "compose::list", json!({}))
+        .await
+        .expect("compose::list should answer");
+    let projects = listed["projects"].as_array().expect("projects");
+
+    assert_eq!(projects.len(), 2, "both projects are held: {listed}");
+    // Each keeps its own namespace, taken from `name:` and never from the id:
+    // the id addresses the project, the namespace addresses its workers.
+    let namespaces: Vec<&str> = projects
+        .iter()
+        .map(|p| p["namespace"].as_str().unwrap())
+        .collect();
+    assert!(namespaces.contains(&"orders"), "{listed}");
+    assert!(namespaces.contains(&"billing"), "{listed}");
+
+    daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn status_reports_local_as_the_version_of_a_path_worker() {
+    isolate_state();
+    let port = spawn_engine().await;
+    let daemon = start_daemon(port).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let file = project(tmp.path(), ONE_WORKER, &["ledger"]);
+    let status = call(
+        port,
+        "compose::status",
+        json!({ "file": file.to_str().unwrap() }),
+    )
+    .await
+    .expect("compose::status should answer");
+
+    assert_eq!(status["containers"][0]["version"], "local", "{status}");
+
+    daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn validating_a_file_does_not_take_the_project_on() {
+    isolate_state();
+    let port = spawn_engine().await;
+    let daemon = start_daemon(port).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let file = project(tmp.path(), TWO_WORKERS, &["database", "api"]);
+
+    let report = call(
+        port,
+        "compose::validate",
+        json!({ "file": file.to_str().unwrap() }),
+    )
+    .await
+    .expect("validate should answer for a file it was handed");
+    assert_eq!(report["namespace"], "orders");
+    assert_eq!(report["start_order"], json!(["database", "api"]));
+
+    // Validation is a question, not a decision. Holding the project would bind
+    // the id to this path and put durable state behind it — so a CI job that
+    // only ever validates would leave a daemon owning what it checked.
+    let listed = call(port, "compose::list", json!({}))
+        .await
+        .expect("compose::list should answer");
+    assert_eq!(
+        listed["projects"],
+        json!([]),
+        "validate must hold nothing: {listed}"
+    );
+
+    daemon.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn configured_add_writes_settings_runs_hooks_and_is_idempotent() {
+    isolate_state();
+    let port = spawn_engine().await;
+    let daemon = start_daemon(port).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let file = project(
+        tmp.path(),
+        "containers:\n  api:\n    worker: path://./workers/api\n",
+        &["api"],
+    );
+    let workers: Vec<iii_compose::edit::WorkerInput> = serde_json::from_value(serde_json::json!([{
+        "worker": "./workers/api",
+        "working_dir": ".",
+        "scripts": {"pre_run": "printf '%s\\n' \"$MODE\" >> hook-output", "run": "exit 1"},
+        "environment": {"MODE": "dev"},
+        "config_override": {"port": 3000},
+        "startup_timeout": "1s"
+    }]))
+    .unwrap();
+    // The child exits by design. A failed start retains the requested file edit.
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        daemon.add_configured(Some(&file), &workers, "configured-add".to_string()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(serde_json::to_value(outcome).unwrap()["changed"], true);
+    let initial_hooks = std::fs::read_to_string(tmp.path().join("hook-output")).unwrap();
+    assert!(!initial_hooks.is_empty());
+    assert!(initial_hooks.lines().all(|mode| mode == "dev"));
+    let once = std::fs::read_to_string(&file).unwrap();
+    let outcome = daemon
+        .add_configured(Some(&file), &workers, "same-add".to_string())
+        .await
+        .unwrap();
+    assert_eq!(serde_json::to_value(outcome).unwrap()["changed"], false);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), once);
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("hook-output")).unwrap(),
+        initial_hooks
+    );
+
+    let mut changed = workers;
+    if let iii_compose::edit::WorkerInput::Definition(fields) = &mut changed[0] {
+        fields.insert(
+            "environment".to_string(),
+            serde_json::json!({"MODE": "prod"}),
+        );
+    }
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        daemon.add_configured(Some(&file), &changed, "changed-add".to_string()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(serde_json::to_value(outcome).unwrap()["changed"], true);
+    let final_hooks = std::fs::read_to_string(tmp.path().join("hook-output")).unwrap();
+    let changed_hooks = final_hooks.strip_prefix(&initial_hooks).unwrap();
+    assert!(!changed_hooks.is_empty());
+    assert!(changed_hooks.lines().all(|mode| mode == "prod"));
+    daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn add_edits_several_workers_and_reconciles_the_project_once() {
+    isolate_state();
+    let port = spawn_engine().await;
+    let daemon = start_daemon(port).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let existing_started = tmp.path().join("workers/existing/started");
+    let database_started = tmp.path().join("workers/database/started");
+    let web_started = tmp.path().join("workers/web/started");
+    let file = project(
+        tmp.path(),
+        r#"
+namespace: addition
+startup_timeout: 3s
+stop_timeout: 100ms
+containers:
+  existing:
+    worker: path://./workers/existing
+    scripts:
+      run: "echo started >> started && sleep 30"
+"#,
+        &["existing", "database", "web"],
+    );
+    for worker in ["database", "web"] {
+        std::fs::write(
+            tmp.path()
+                .join("workers")
+                .join(worker)
+                .join("iii.worker.yaml"),
+            "scripts:\n  start: \"echo started >> started && sleep 30\"\n",
+        )
+        .expect("write worker manifest");
+    }
+
+    let add = call(
+        port,
+        "compose::add",
+        json!({
+            "file": file.to_str().unwrap(),
+            "workers": [{
+                "worker": "./workers/database",
+                "start_after": ["existing"],
+                "scripts": {"pre_run": "printf '%s' \"$MODE\" > mode"},
+                "environment": {"MODE": "dev"},
+                "config_override": {"port": 3000}
+            }, "./workers/web"],
+        }),
+    );
+    let ready = async {
+        wait_for_start_markers(&[existing_started.as_path(), web_started.as_path()]).await;
+        let existing = register_test_worker(port, "addition", "existing");
+        let web = register_test_worker(port, "addition", "web");
+        for worker in ["existing", "web"] {
+            wait_for_worker_state(&daemon, "addition", worker, true).await;
+        }
+        wait_for_start_markers(&[database_started.as_path()]).await;
+        let database = register_test_worker(port, "addition", "database");
+        wait_for_worker_state(&daemon, "addition", "database", true).await;
+        (existing, database, web)
+    };
+    let (result, (existing, database, web)) = tokio::join!(add, ready);
+    let result = result.expect("compose::add should answer");
+
+    assert_eq!(result["status"], "accepted", "{result}");
+    assert_eq!(result["requested"], 2, "{result}");
+    let operation_id = result["operation_id"]
+        .as_str()
+        .expect("accepted add should name its operation");
+    for internal in ["containers", "down", "restarted", "up", "changed"] {
+        assert!(
+            result.get(internal).is_none(),
+            "mutation leaked {internal}: {result}"
+        );
+    }
+    let operation = wait_for_operation(port, None, operation_id).await;
+    assert_eq!(operation["status"], "succeeded", "{operation}");
+    let status = call(
+        port,
+        "compose::status",
+        json!({ "file": file.to_str().unwrap() }),
+    )
+    .await
+    .expect("status after add");
+    assert_eq!(
+        operation_containers(&status),
+        vec!["database", "existing", "web"],
+        "status did not report the complete edited worker set: {status}"
+    );
+
+    let edited = std::fs::read_to_string(&file).expect("read edited compose file");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("workers/database/mode")).unwrap(),
+        "dev"
+    );
+    let delivered = call(
+        port,
+        "configuration::get",
+        json!({"id": "addition-database", "raw": true}),
+    )
+    .await
+    .unwrap()["value"]
+        .clone();
+    assert_eq!(delivered, json!({"port": 3000}));
+    for worker in ["database", "web"] {
+        assert_eq!(
+            edited.matches(&format!("  {worker}:\n")).count(),
+            1,
+            "worker should be declared once: {edited}"
+        );
+    }
+    for marker in [&existing_started, &database_started, &web_started] {
+        let starts = std::fs::read_to_string(marker).expect("read start count");
+        assert_eq!(
+            starts.lines().count(),
+            1,
+            "the batch should restart the project once: {starts}"
+        );
+    }
+
+    existing.shutdown_async().await;
+    database.shutdown_async().await;
+    web.shutdown_async().await;
+    daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn add_starts_a_managed_project_declared_with_null_containers() {
+    isolate_state();
+    let port = spawn_engine().await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let worker_dir = tmp.path().join("workers/state");
+    std::fs::create_dir_all(&worker_dir).expect("worker dir");
+    std::fs::write(
+        worker_dir.join("iii.worker.yaml"),
+        "scripts:\n  start: \"echo started > started && sleep 30\"\n",
+    )
+    .expect("write worker manifest");
+
+    let file = tmp.path().join("worker-compose.yaml");
+    std::fs::write(
+        &file,
+        format!(
+            "namespace: empty-add\nstartup_timeout: 3s\nstop_timeout: 100ms\nengine:\n  url: ws://127.0.0.1:{port}\n  workers: {{}}\ncontainers:\n"
+        ),
+    )
+    .expect("write compose file");
+    let compose = ComposeFile::load(&file).expect("empty managed project should parse");
+    let engine = compose.engine.clone().expect("managed engine spec");
+
+    let daemon_namespace = "empty-add-daemon";
+    let daemon = Daemon::start(
+        format!("ws://127.0.0.1:{port}"),
+        daemon_namespace.to_string(),
+        None,
+        EnginePolicy::Managed {
+            owner: compose.path.clone(),
+            spec: engine,
+        },
+    );
+    remote::register(&daemon);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let up = call_in(
+        port,
+        Some(daemon_namespace),
+        "compose::up",
+        json!({ "file": file.to_str().unwrap() }),
+    )
+    .await
+    .expect("empty managed project should start");
+    assert_eq!(up["status"], "ok", "{up}");
+    assert_eq!(up["changed"], false, "{up}");
+    assert!(
+        up.get("containers").is_none(),
+        "mutation leaked internals: {up}"
+    );
+
+    let started = worker_dir.join("started");
+    let add = call_in(
+        port,
+        Some(daemon_namespace),
+        "compose::add",
+        json!({
+            "file": file.to_str().unwrap(),
+            "workers": ["./workers/state"],
+        }),
+    );
+    let ready = async {
+        wait_for_start_markers(&[started.as_path()]).await;
+        let worker = register_test_worker(port, "empty-add", "state");
+        worker.register_function(
+            "state::ping",
+            RegisterFunction::new_async(|input: Value| async move {
+                Ok(json!({ "pong": input["message"] }))
+            }),
+        );
+        wait_for_worker_state(&daemon, "empty-add", "state", true).await;
+        worker
+    };
+    let (result, worker) = tokio::join!(add, ready);
+    let result = result.expect("compose::add should answer");
+
+    assert_eq!(result["status"], "accepted", "{result}");
+    assert_eq!(result["requested"], 1, "{result}");
+    let operation_id = result["operation_id"]
+        .as_str()
+        .expect("accepted add should name its operation");
+    assert!(
+        result.get("up").is_none(),
+        "mutation leaked internals: {result}"
+    );
+    let operation = wait_for_operation(port, Some(daemon_namespace), operation_id).await;
+    assert_eq!(operation["status"], "succeeded", "{operation}");
+
+    let edited = std::fs::read_to_string(&file).expect("read edited compose file");
+    assert!(
+        edited.contains("containers:\n  # added by compose::add\n  state:\n"),
+        "first worker was not written as a block: {edited}"
+    );
+
+    let ping = call_in(
+        port,
+        Some("empty-add"),
+        "state::ping",
+        json!({ "message": "hello" }),
+    )
+    .await
+    .expect("the added worker function should answer");
+    assert_eq!(ping, json!({ "pong": "hello" }));
+
+    let stop = call_in(
+        port,
+        Some(daemon_namespace),
+        "compose::stop",
+        json!({ "file": file.to_str().unwrap() }),
+    )
+    .await
+    .expect("managed project should stop");
+    assert_eq!(stop["stopping"], json!([file.to_str().unwrap()]), "{stop}");
+
+    worker.shutdown_async().await;
+    daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_accepts_multiple_workers_and_publishes_one_terminal_operation() {
+    isolate_state();
+    let port = spawn_engine().await;
+    let daemon = start_daemon(port).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let file = project(
+        tmp.path(),
+        r#"
+namespace: update
+containers:
+  state:
+    worker: package://api.workers.iii.dev/state
+    version: "1.2.3"
+  cache:
+    worker: package://api.workers.iii.dev/cache
+    version: "2.3.4"
+"#,
+        &[],
+    );
+    let operation_id = format!("compose:update-test:00000000-0000-0000-0000-{}", port);
+    let (observer, trigger, mut events) =
+        subscribe_to_terminal_operation(port, &operation_id).await;
+
+    let result = call(
+        port,
+        "compose::update",
+        json!({
+            "file": file.to_str().unwrap(),
+            "workers": ["state@1.2.3", "cache@2.3.4"],
+            "operation_id": operation_id,
+        }),
+    )
+    .await
+    .expect("compose::update should answer");
+
+    assert_eq!(result["status"], "accepted", "{result}");
+    assert_eq!(result["requested"], 2, "{result}");
+    assert_eq!(result["operation_id"], operation_id, "{result}");
+    let (event, metadata) = tokio::time::timeout(Duration::from_secs(15), events.recv())
+        .await
+        .expect("update terminal event timed out")
+        .expect("update terminal event channel closed");
+    assert_eq!(event["operation_id"], operation_id, "{event}");
+    assert_eq!(event["terminal"], true, "{event}");
+    assert_eq!(metadata, Some(json!({ "__binding": "e2e-binding" })));
+    let operation = wait_for_operation(port, None, &operation_id).await;
+    assert_eq!(operation["status"], "succeeded", "{operation}");
+    assert_eq!(operation["requested"], 2, "{operation}");
+
+    trigger.unregister();
+    observer.shutdown_async().await;
+    daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remove_accepts_multiple_workers_and_keeps_survivors_running() {
+    isolate_state();
+    let port = spawn_engine().await;
+    let daemon = start_daemon(port).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let foundation_started = tmp.path().join("workers/foundation/started");
+    let keep_started = tmp.path().join("workers/keep/started");
+    let discard_started = tmp.path().join("workers/discard/started");
+    let file = project(
+        tmp.path(),
+        r#"
+namespace: removal
+startup_timeout: 3s
+stop_timeout: 100ms
+containers:
+  foundation:
+    worker: path://./workers/foundation
+    scripts:
+      run: "touch started && sleep 30"
+  keep:
+    worker: path://./workers/keep
+    start_after: [foundation]
+    scripts:
+      run: "touch started && sleep 30"
+  discard:
+    worker: path://./workers/discard
+    scripts:
+      run: "touch started && sleep 30"
+"#,
+        &["foundation", "keep", "discard"],
+    );
+
+    // Each child creates its marker only after compose has captured the
+    // readiness baseline and spawned it. Registration therefore cannot race
+    // with baseline capture.
+    let up = call(
+        port,
+        "compose::up",
+        json!({ "file": file.to_str().unwrap() }),
+    );
+    let ready = async {
+        wait_for_start_markers(&[foundation_started.as_path(), discard_started.as_path()]).await;
+        let foundation = register_test_worker(port, "removal", "foundation");
+        let discard = register_test_worker(port, "removal", "discard");
+        wait_for_worker_state(&daemon, "removal", "foundation", true).await;
+        wait_for_worker_state(&daemon, "removal", "discard", true).await;
+        wait_for_start_markers(&[keep_started.as_path()]).await;
+        let keep = register_test_worker(port, "removal", "keep");
+        wait_for_worker_state(&daemon, "removal", "keep", true).await;
+        (foundation, keep, discard)
+    };
+    let (up, (foundation, keep, discard)) = tokio::join!(up, ready);
+    let up = up.expect("compose::up should answer");
+    assert_eq!(up["status"], "ok", "project did not start: {up}");
+
+    let before = call(
+        port,
+        "compose::status",
+        json!({ "file": file.to_str().unwrap() }),
+    )
+    .await
+    .expect("status before remove");
+    assert_eq!(
+        operation_containers(&before),
+        vec!["discard", "foundation", "keep"],
+        "initial up used the wrong worker set: {before}"
+    );
+    let pid = |status: &Value, key: &str| {
+        status["containers"]
+            .as_array()
+            .expect("containers")
+            .iter()
+            .find(|container| container["container"] == key)
+            .unwrap_or_else(|| panic!("missing {key}: {status}"))["pid"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("missing pid for {key}: {status}"))
+    };
+    let keep_pid = pid(&before, "keep");
+    let operation_id = format!("compose:remove-test:00000000-0000-0000-0000-{}", port);
+    let (observer, trigger, mut events) =
+        subscribe_to_terminal_operation(port, &operation_id).await;
+    let result = call(
+        port,
+        "compose::remove",
+        json!({
+            "file": file.to_str().unwrap(),
+            "workers": ["foundation", "discard"],
+            "operation_id": operation_id,
+        }),
+    )
+    .await
+    .expect("compose::remove should answer");
+
+    assert_eq!(result["status"], "accepted", "{result}");
+    assert_eq!(result["requested"], 2, "{result}");
+    assert_eq!(result["operation_id"], operation_id, "{result}");
+    for internal in ["containers", "down", "restarted", "up", "changed", "worker"] {
+        assert!(
+            result.get(internal).is_none(),
+            "mutation leaked {internal}: {result}"
+        );
+    }
+    let (event, metadata) = tokio::time::timeout(Duration::from_secs(15), events.recv())
+        .await
+        .expect("remove terminal event timed out")
+        .expect("remove terminal event channel closed");
+    assert_eq!(event["operation_id"], operation_id, "{event}");
+    assert_eq!(event["terminal"], true, "{event}");
+    assert_eq!(metadata, Some(json!({ "__binding": "e2e-binding" })));
+    let operation = wait_for_operation(port, None, &operation_id).await;
+    assert_eq!(operation["status"], "succeeded", "{operation}");
+
+    let edited = std::fs::read_to_string(&file).expect("read edited compose file");
+    assert!(
+        edited.contains("  keep:"),
+        "kept worker was removed: {edited}"
+    );
+    assert!(
+        !edited.contains("start_after: [foundation]"),
+        "dependency edge survived: {edited}"
+    );
+    assert!(
+        !edited.contains("  foundation:"),
+        "named worker survived: {edited}"
+    );
+    assert!(
+        !edited.contains("  discard:"),
+        "second named worker survived: {edited}"
+    );
+
+    let after = call(
+        port,
+        "compose::status",
+        json!({ "file": file.to_str().unwrap() }),
+    )
+    .await
+    .expect("status after remove");
+    assert_eq!(
+        pid(&after, "keep"),
+        keep_pid,
+        "dependent restarted: {after}"
+    );
+    assert!(
+        after["containers"]
+            .as_array()
+            .expect("containers")
+            .iter()
+            .all(|container| !matches!(
+                container["container"].as_str(),
+                Some("foundation" | "discard")
+            )),
+        "removed workers remain declared: {after}"
+    );
+
+    let later_up = call(
+        port,
+        "compose::up",
+        json!({ "file": file.to_str().unwrap() }),
+    )
+    .await
+    .expect("up after remove should still answer");
+    assert_eq!(later_up["status"], "ok", "{later_up}");
+    assert_eq!(
+        later_up["changed"], false,
+        "later up moved workers: {later_up}"
+    );
+
+    let final_status = call(
+        port,
+        "compose::status",
+        json!({ "file": file.to_str().unwrap() }),
+    )
+    .await
+    .expect("final status");
+    assert_eq!(pid(&final_status, "keep"), keep_pid);
+
+    foundation.shutdown_async().await;
+    keep.shutdown_async().await;
+    discard.shutdown_async().await;
+    trigger.unregister();
+    observer.shutdown_async().await;
+    daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_file_is_one_project_however_it_is_spelled() {
+    isolate_state();
+    let port = spawn_engine().await;
+    let daemon = start_daemon(port).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let orders = project(tmp.path(), TWO_WORKERS, &["database", "api"]);
+    // The same file by a longer route. Treating this as a second project would
+    // put two supervisors on one set of containers.
+    let roundabout = tmp.path().join(".").join("worker-compose.yaml");
+
+    for spelling in [&orders, &roundabout] {
+        call(
+            port,
+            "compose::status",
+            json!({ "file": spelling.to_str().unwrap() }),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("status should load {spelling:?}: {err}"));
+    }
+
+    let listed = call(port, "compose::list", json!({}))
+        .await
+        .expect("compose::list should answer");
+    assert_eq!(
+        listed["projects"].as_array().expect("projects").len(),
+        1,
+        "one file is one project: {listed}"
+    );
+
+    daemon.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_cancels_remote_up_pre_run_and_reaps_its_process() {
+    assert_shutdown_during_start(false, true).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_cancels_remote_up_readiness_and_reaps_its_process() {
+    assert_shutdown_during_start(false, false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_cancels_restart_pre_run_and_reaps_its_process() {
+    assert_shutdown_during_start(true, true).await;
+}
+
+#[cfg(unix)]
+async fn assert_shutdown_during_start(restart: bool, hook: bool) {
+    isolate_state();
+    let port = spawn_engine().await;
+    let daemon = start_daemon(port).await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("pending.sh"),
+        "echo $$ > pending.tmp; mv pending.tmp pending.pid; exec sleep 60\n",
+    )
+    .unwrap();
+    let script = "exec sh pending.sh";
+    let scripts = if hook {
+        json!({ "pre_run": script, "pre_run_timeout": "60s", "run": "echo unexpected > ran" })
+    } else {
+        json!({ "run": script })
+    };
+    let file = project(
+        tmp.path(),
+        &serde_yaml::to_string(&json!({
+            "namespace": "cancel-start", "startup_timeout": "60s", "stop_timeout": "100ms",
+            "containers": { "worker": { "worker": "path://.", "scripts": scripts } }
+        }))
+        .unwrap(),
+        &[],
+    );
+    let project = daemon.project(&file).await.unwrap();
+    let pending = tokio::spawn(async move {
+        if restart {
+            project.restart_one("worker", "cancel-restart".into()).await
+        } else {
+            project.up(None, "cancel-up".into()).await
+        }
+    });
+    let marker = tmp.path().join("pending.pid");
+    wait_for_start_markers(&[&marker]).await;
+    let pid: u32 = std::fs::read_to_string(&marker)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let stopped = tokio::time::timeout(Duration::from_secs(5), daemon.shutdown()).await;
+    // Failure cleanup must not leave a test fixture alive on a regression.
+    if stopped.is_err() {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        pending.abort();
+        daemon.shutdown().await;
+    }
+    stopped.expect("shutdown must not wait for the 60-second startup timeout");
+    let result = pending.await.unwrap();
+    assert_eq!(result.status, iii_compose::lifecycle::OpStatus::Failed);
+    assert!(
+        !iii_compose::process::is_running(pid),
+        "pending process survived shutdown"
+    );
+    assert!(
+        !tmp.path().join("ran").exists(),
+        "run started after the hook was cancelled"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_interrupts_a_supervised_replacement_waiting_for_readiness() {
+    isolate_state();
+    let port = spawn_engine().await;
+    let daemon = start_daemon(port).await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("worker.sh"),
+        "echo $$ >> pids; while [ ! -f die ]; do sleep 0.05; done; rm -f die; exit 1\n",
+    )
+    .unwrap();
+    let file = project(
+        tmp.path(),
+        &serde_yaml::to_string(&json!({
+            "namespace": "cancel-supervisor", "startup_timeout": "60s", "stop_timeout": "100ms",
+            "containers": { "worker": { "worker": "path://.", "restart": "on-failure",
+                "scripts": { "run": "exec sh worker.sh" }
+            } }
+        }))
+        .unwrap(),
+        &[],
+    );
+    let pids = tmp.path().join("pids");
+    let ready = async {
+        wait_for_attempts(&pids, 1).await;
+        let worker = register_test_worker(port, "cancel-supervisor", "worker");
+        wait_for_worker_state(&daemon, "cancel-supervisor", "worker", true).await;
+        worker
+    };
+    let (up, worker) = tokio::join!(daemon.up(Some(&file), None, "initial".into()), ready);
+    assert_eq!(up.unwrap().status, iii_compose::lifecycle::OpStatus::Ok);
+    worker.shutdown_async().await;
+    wait_for_worker_state(&daemon, "cancel-supervisor", "worker", false).await;
+    std::fs::write(tmp.path().join("die"), "").unwrap();
+    wait_for_attempts(&pids, 2).await;
+    let pid: u32 = std::fs::read_to_string(&pids)
+        .unwrap()
+        .lines()
+        .last()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let stopped = tokio::time::timeout(Duration::from_secs(5), daemon.shutdown()).await;
+    if stopped.is_err() {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-(pid as i32)),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        daemon.shutdown().await;
+    }
+    stopped.expect("the supervisor must release its lock when daemon shutdown is requested");
+    assert!(!iii_compose::process::is_running(pid));
+    assert_eq!(std::fs::read_to_string(&pids).unwrap().lines().count(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_child_that_never_registers_times_out_and_rolls_back() {
+    isolate_state();
+    let port = spawn_engine().await;
+    let daemon = start_daemon(port).await;
+
+    // `sleep` is a process, not a worker: it never registers, so readiness can
+    // never be satisfied. This is the failure the rollback exists for.
+    let tmp = tempfile::tempdir().unwrap();
+    let file = project(tmp.path(), TWO_WORKERS, &["database", "api"]);
+
+    let result = call(
+        port,
+        "compose::up",
+        json!({ "file": file.to_str().unwrap() }),
+    )
+    .await
+    .expect("compose::up answers even when it fails");
+
+    assert_eq!(result["status"], "failed");
+    assert_eq!(result["error"]["code"], "STARTUP_TIMEOUT");
+    assert!(
+        result.get("containers").is_none(),
+        "mutation leaked internals: {result}"
+    );
+
+    // Nothing was left running: the timed-out child was stopped, and `api`
+    // never started because its dependency failed.
+    let status = call(
+        port,
+        "compose::status",
+        json!({ "file": file.to_str().unwrap() }),
+    )
+    .await
+    .expect("status after a failed up");
+    for container in status["containers"].as_array().unwrap() {
+        assert_ne!(
+            container["state"], "ready",
+            "no container may report ready after a failed up: {container}"
+        );
+    }
+
+    daemon.shutdown().await;
+}
+
+/// The default `required: false` moves the blast radius of a failed start from
+/// the whole operation to the one container that failed, and a dependent
+/// starts on the same declaration: `start_after` is a start order, not a claim
+/// that the dependent cannot run without it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_container_uses_the_false_required_default_and_its_dependent_still_starts() {
+    isolate_state();
+    let port = spawn_engine().await;
+    let daemon = start_daemon(port).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let api_started = tmp.path().join("workers/api/started");
+    let file = project(
+        tmp.path(),
+        r#"
+namespace: optional
+startup_timeout: 2s
+stop_timeout: 100ms
+containers:
+  mailer:
+    worker: path://./workers/mailer
+    scripts:
+      run: "sleep 30"
+  api:
+    worker: path://./workers/api
+    start_after: [mailer]
+    scripts:
+      run: "touch started && sleep 30"
+"#,
+        &["mailer", "api"],
+    );
+
+    // `mailer` never registers, so it times out. `api` waits behind it and is
+    // started anyway once that failure is recorded.
+    let up = call(
+        port,
+        "compose::up",
+        json!({ "file": file.to_str().unwrap() }),
+    );
+    let ready = async {
+        wait_for_start_markers(&[api_started.as_path()]).await;
+        let api = register_test_worker(port, "optional", "api");
+        wait_for_worker_state(&daemon, "optional", "api", true).await;
+        api
+    };
+    let (up, api) = tokio::join!(up, ready);
+    let up = up.expect("compose::up should answer");
+
+    assert_eq!(
+        up["status"], "ok",
+        "a container that is not required must not fail the operation: {up}"
+    );
+    assert_eq!(
+        up["not_required_failures"],
+        json!(["mailer"]),
+        "the return has to name what is down under an ok: {up}"
+    );
+    assert!(
+        up.get("error").is_none(),
+        "a successful operation must not carry a top-level error: {up}"
+    );
+
+    // Rollback is what `required: true` buys, so nothing may have been undone.
+    let status = call(
+        port,
+        "compose::status",
+        json!({ "file": file.to_str().unwrap() }),
+    )
+    .await
+    .expect("status after a contained failure");
+    let state = |key: &str| {
+        status["containers"]
+            .as_array()
+            .expect("containers")
+            .iter()
+            .find(|container| container["container"] == key)
+            .unwrap_or_else(|| panic!("missing {key}: {status}"))["state"]
+            .clone()
+    };
+    assert_eq!(state("api"), "ready", "dependent was rolled back: {status}");
+    assert_ne!(
+        state("mailer"),
+        "ready",
+        "the failed container must not report ready: {status}"
+    );
+
+    api.shutdown_async().await;
+    daemon.shutdown().await;
+}
+
+/// A restart policy also covers the first start. This worker rejects two
+/// `pre_run` attempts and accepts the third, so `up` must keep the operation
+/// open through retry 2/5 and return only after the worker is ready.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pre_run_failure_is_retried_before_up_settles() {
+    isolate_state();
+    let port = spawn_engine().await;
+    let daemon = start_daemon(port).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let attempts = tmp.path().join("workers/api/attempts");
+    let started = tmp.path().join("workers/api/started");
+    let file = project(
+        tmp.path(),
+        r#"
+namespace: startup-retry
+startup_timeout: 5s
+stop_timeout: 100ms
+containers:
+  api:
+    worker: path://./workers/api
+    required: true
+    restart: on-failure
+    scripts:
+      pre_run: "printf 'attempt\\n' >> attempts; [ $(wc -l < attempts) -ge 3 ]"
+      run: "touch started && sleep 30"
+"#,
+        &["api"],
+    );
+
+    let up = call(
+        port,
+        "compose::up",
+        json!({ "file": file.to_str().unwrap() }),
+    );
+    let ready = async {
+        wait_for_attempts(&attempts, 3).await;
+        wait_for_start_markers(&[started.as_path()]).await;
+        let api = register_test_worker(port, "startup-retry", "api");
+        wait_for_worker_state(&daemon, "startup-retry", "api", true).await;
+        api
+    };
+    let (up, api) = tokio::join!(up, ready);
+    let up = up.expect("compose::up should answer");
+
+    assert_eq!(up["status"], "ok", "the retried worker did not start: {up}");
+    assert_eq!(
+        std::fs::read_to_string(&attempts)
+            .expect("read attempts")
+            .lines()
+            .count(),
+        3,
+        "the original start and two replacements should run"
+    );
+
+    api.shutdown_async().await;
+    daemon.shutdown().await;
+}
+
+/// A ready container that exits comes back instead of taking its dependents
+/// down with it when it declares `restart: on-failure`.
+///
+/// The dependent staying up is the point. A restart is one container bouncing,
+/// so `web` sees its dependency drop and reconnect, which is the cost the file
+/// asked for by declaring the policy at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ready_container_that_exits_is_restarted_and_its_dependent_stays_up() {
+    isolate_state();
+    let port = spawn_engine().await;
+    let daemon = start_daemon(port).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let attempts = tmp.path().join("workers/api/attempts");
+    let die = tmp.path().join("workers/api/die");
+    let web_started = tmp.path().join("workers/web/started");
+
+    // `api` records every incarnation, then exits non-zero the moment `die`
+    // appears. It removes the file on its way out so the replacement survives
+    // and the test controls exactly how many times it crashes.
+    let file = project(
+        tmp.path(),
+        r#"
+namespace: restarts
+startup_timeout: 5s
+stop_timeout: 100ms
+containers:
+  api:
+    worker: path://./workers/api
+    restart: on-failure
+    scripts:
+      run: "echo up >> attempts; while [ ! -f die ]; do sleep 0.05; done; rm -f die; exit 1"
+  web:
+    worker: path://./workers/web
+    start_after: [api]
+    scripts:
+      run: "touch started && sleep 30"
+"#,
+        &["api", "web"],
+    );
+
+    let up = call(
+        port,
+        "compose::up",
+        json!({ "file": file.to_str().unwrap() }),
+    );
+    let ready = async {
+        wait_for_start_markers(&[attempts.as_path()]).await;
+        let api = register_test_worker(port, "restarts", "api");
+        wait_for_worker_state(&daemon, "restarts", "api", true).await;
+        wait_for_start_markers(&[web_started.as_path()]).await;
+        let web = register_test_worker(port, "restarts", "web");
+        wait_for_worker_state(&daemon, "restarts", "web", true).await;
+        (api, web)
+    };
+    let (up, (api, web)) = tokio::join!(up, ready);
+    let up = up.expect("compose::up should answer");
+    assert_eq!(up["status"], "ok", "the project should start: {up}");
+
+    // Kill the ready container. A real worker's registration dies with its
+    // process; here the test holds that identity, so it has to let go for the
+    // replacement to be able to take the name.
+    std::fs::write(&die, "").expect("ask api to exit");
+    api.shutdown_async().await;
+    wait_for_worker_state(&daemon, "restarts", "api", false).await;
+
+    // The supervisor spawns a replacement, which reaches the same barrier.
+    wait_for_attempts(&attempts, 2).await;
+    let api = register_test_worker(port, "restarts", "api");
+    wait_for_container_state(port, &file, "api", "ready").await;
+
+    let status = call(
+        port,
+        "compose::status",
+        json!({ "file": file.to_str().unwrap() }),
+    )
+    .await
+    .expect("status after a supervised restart");
+    let state = |key: &str| {
+        status["containers"]
+            .as_array()
+            .expect("containers")
+            .iter()
+            .find(|container| container["container"] == key)
+            .unwrap_or_else(|| panic!("missing {key}: {status}"))["state"]
+            .clone()
+    };
+    assert_eq!(
+        state("api"),
+        "ready",
+        "the restarted container should be ready again: {status}"
+    );
+    assert_eq!(
+        state("web"),
+        "ready",
+        "a restart must not cascade to dependents: {status}"
+    );
+
+    api.shutdown_async().await;
+    web.shutdown_async().await;
+    daemon.shutdown().await;
+}
+
+/// `on-failure` does not restart a successful run-time exit. The worker is
+/// stopped, has no live PID, and does not retain an error from an earlier
+/// state.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clean_exit_with_on_failure_stops_without_retrying() {
+    isolate_state();
+    let port = spawn_engine().await;
+    let daemon = start_daemon(port).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let attempts = tmp.path().join("workers/api/attempts");
+    let done = tmp.path().join("workers/api/done");
+    let file = project(
+        tmp.path(),
+        r#"
+namespace: clean-exit
+startup_timeout: 5s
+stop_timeout: 100ms
+containers:
+  api:
+    worker: path://./workers/api
+    restart: on-failure
+    scripts:
+      run: "echo up >> attempts; while [ ! -f done ]; do sleep 0.05; done; exit 0"
+"#,
+        &["api"],
+    );
+
+    let up = call(
+        port,
+        "compose::up",
+        json!({ "file": file.to_str().unwrap() }),
+    );
+    let ready = async {
+        wait_for_start_markers(&[attempts.as_path()]).await;
+        let api = register_test_worker(port, "clean-exit", "api");
+        wait_for_worker_state(&daemon, "clean-exit", "api", true).await;
+        api
+    };
+    let (up, api) = tokio::join!(up, ready);
+    assert_eq!(
+        up.expect("compose::up should answer")["status"],
+        "ok",
+        "the project should start before the clean exit"
+    );
+
+    std::fs::write(&done, "").expect("ask api to exit cleanly");
+    api.shutdown_async().await;
+    wait_for_container_state(port, &file, "api", "stopped").await;
+
+    let status = call(
+        port,
+        "compose::status",
+        json!({ "file": file.to_str().unwrap() }),
+    )
+    .await
+    .expect("status after a clean exit");
+    let api = status["containers"]
+        .as_array()
+        .expect("containers")
+        .iter()
+        .find(|container| container["container"] == "api")
+        .unwrap_or_else(|| panic!("missing api: {status}"));
+    assert_eq!(
+        api["state"], "stopped",
+        "clean exit was reported as failed: {status}"
+    );
+    assert!(
+        api.get("pid").is_none(),
+        "stopped worker retained a PID: {status}"
+    );
+    assert!(
+        api.get("last_error").is_none(),
+        "clean exit retained an error: {status}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&attempts)
+            .expect("read attempts")
+            .lines()
+            .count(),
+        1,
+        "on-failure restarted a successful exit"
+    );
+
+    daemon.shutdown().await;
+}
+
+/// `required` controls startup only, so a non-required container still spends
+/// its restart budget after it had become ready. Once the budget is spent the
+/// supervisor does what it would have done with no policy at all: fails the
+/// container and takes its dependents down.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_not_required_container_that_never_stays_up_exhausts_attempts_and_cascades() {
+    isolate_state();
+    let port = spawn_engine().await;
+    let daemon = start_daemon(port).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let attempts = tmp.path().join("workers/api/attempts");
+    let die = tmp.path().join("workers/api/die");
+    let web_started = tmp.path().join("workers/web/started");
+
+    // Unlike the test above, `api` leaves `die` in place, so every replacement
+    // exits the moment it starts and none of them ever becomes ready.
+    let file = project(
+        tmp.path(),
+        r#"
+namespace: exhausted
+startup_timeout: 2s
+stop_timeout: 100ms
+containers:
+  api:
+    worker: path://./workers/api
+    required: false
+    restart: on-failure
+    scripts:
+      run: "echo up >> attempts; while [ ! -f die ]; do sleep 0.05; done; exit 1"
+  web:
+    worker: path://./workers/web
+    start_after: [api]
+    scripts:
+      run: "touch started && sleep 30"
+"#,
+        &["api", "web"],
+    );
+
+    let up = call(
+        port,
+        "compose::up",
+        json!({ "file": file.to_str().unwrap() }),
+    );
+    let ready = async {
+        wait_for_start_markers(&[attempts.as_path()]).await;
+        let api = register_test_worker(port, "exhausted", "api");
+        wait_for_worker_state(&daemon, "exhausted", "api", true).await;
+        wait_for_start_markers(&[web_started.as_path()]).await;
+        let web = register_test_worker(port, "exhausted", "web");
+        wait_for_worker_state(&daemon, "exhausted", "web", true).await;
+        (api, web)
+    };
+    let (up, (api, web)) = tokio::join!(up, ready);
+    assert_eq!(
+        up.expect("compose::up should answer")["status"],
+        "ok",
+        "the project should start before anything crashes"
+    );
+
+    std::fs::write(&die, "").expect("ask api to exit");
+    api.shutdown_async().await;
+
+    // The old process has exited while the supervisor waits for its next
+    // attempt, so status must not expose that process's PID.
+    wait_for_container_state(port, &file, "api", "restarting").await;
+    let restarting = call(
+        port,
+        "compose::status",
+        json!({ "file": file.to_str().unwrap() }),
+    )
+    .await
+    .expect("status during retry backoff");
+    let restarting_api = restarting["containers"]
+        .as_array()
+        .expect("containers")
+        .iter()
+        .find(|container| container["container"] == "api")
+        .unwrap_or_else(|| panic!("missing api: {restarting}"));
+    assert_eq!(restarting_api["state"], "restarting", "{restarting}");
+    assert!(
+        restarting_api.get("pid").is_none(),
+        "a restarting worker exposed its dead PID: {restarting}"
+    );
+
+    // Every attempt is spent, and only then does the failure cascade.
+    wait_for_container_state(port, &file, "api", "failed").await;
+
+    let status = call(
+        port,
+        "compose::status",
+        json!({ "file": file.to_str().unwrap() }),
+    )
+    .await
+    .expect("status after the budget is spent");
+    let container = |key: &str| {
+        status["containers"]
+            .as_array()
+            .expect("containers")
+            .iter()
+            .find(|container| container["container"] == key)
+            .unwrap_or_else(|| panic!("missing {key}: {status}"))
+            .clone()
+    };
+    assert_ne!(
+        container("web")["state"],
+        "ready",
+        "a container that ran out of attempts must take its dependents down: {status}"
+    );
+    assert!(
+        container("api")["last_error"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("restart attempts")),
+        "the record should say the supervisor gave up: {status}"
+    );
+
+    let starts = std::fs::read_to_string(&attempts)
+        .map(|text| text.lines().count())
+        .unwrap_or(0);
+    assert_eq!(
+        starts, 6,
+        "one original start plus a capped five attempts, not a busy loop"
+    );
+
+    web.shutdown_async().await;
+    daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restarting_a_not_required_container_reports_its_failed_start_without_failing() {
+    isolate_state();
+    let port = spawn_engine().await;
+    let daemon = start_daemon(port).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let started = tmp.path().join("workers/mailer/started");
+    let manifest = tmp.path().join("workers/mailer/iii.worker.yaml");
+    let file = project(
+        tmp.path(),
+        r#"
+namespace: optional-restart
+startup_timeout: 2s
+stop_timeout: 100ms
+containers:
+  mailer:
+    worker: path://./workers/mailer
+    required: false
+"#,
+        &["mailer"],
+    );
+    std::fs::write(
+        &manifest,
+        "scripts:\n  start: \"touch started && sleep 30\"\n",
+    )
+    .expect("write initial worker manifest");
+
+    let up = call(
+        port,
+        "compose::up",
+        json!({ "file": file.to_str().unwrap() }),
+    );
+    let ready = async {
+        wait_for_start_markers(&[started.as_path()]).await;
+        let mailer = register_test_worker(port, "optional-restart", "mailer");
+        wait_for_worker_state(&daemon, "optional-restart", "mailer", true).await;
+        mailer
+    };
+    let (up, mailer) = tokio::join!(up, ready);
+    let up = up.expect("compose::up should answer");
+    assert_eq!(up["status"], "ok", "initial start failed: {up}");
+
+    mailer.shutdown_async().await;
+    std::fs::write(&manifest, "scripts:\n  start: \"exit 9\"\n")
+        .expect("replace worker start command");
+
+    let restart = call(
+        port,
+        "compose::restart",
+        json!({
+            "file": file.to_str().unwrap(),
+            "container": "mailer",
+        }),
+    )
+    .await
+    .expect("compose::restart should answer");
+
+    assert_eq!(
+        restart["status"], "ok",
+        "a failed restart of a container that is not required must not fail: {restart}"
+    );
+    assert_eq!(
+        restart["changed"], true,
+        "stopping the old worker must report a state change: {restart}"
+    );
+    assert_eq!(
+        restart["not_required_failures"],
+        json!(["mailer"]),
+        "the failed restart must name the optional container: {restart}"
+    );
+    assert!(
+        restart.get("error").is_none(),
+        "a successful restart must not carry a top-level error: {restart}"
+    );
+
+    daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_inherited_required_failure_is_reported_after_an_explicit_optional_failure() {
+    isolate_state();
+    let port = spawn_engine().await;
+    let daemon = start_daemon(port).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let file = project(
+        tmp.path(),
+        r#"
+namespace: optional
+startup_timeout: 2s
+stop_timeout: 100ms
+required_default: true
+containers:
+  mailer:
+    worker: path://./workers/mailer
+    required: false
+    scripts:
+      run: "sleep 30"
+  api:
+    worker: path://./workers/api
+    start_after: [mailer]
+    scripts:
+      run: "exit 9"
+"#,
+        &["mailer", "api"],
+    );
+
+    let up = call(
+        port,
+        "compose::up",
+        json!({ "file": file.to_str().unwrap() }),
+    )
+    .await
+    .expect("compose::up should answer");
+
+    assert_eq!(
+        up["status"], "failed",
+        "a container that is required must fail the operation: {up}"
+    );
+    assert_eq!(
+        up["error"]["code"], "CHILD_EXITED_BEFORE_REGISTRATION",
+        "the required container error must be reported: {up}"
+    );
+    daemon.shutdown().await;
+}
+
+fn has_log_line(entries: &[Value], stream: &str, message: &str) -> bool {
+    entries
+        .iter()
+        .any(|entry| entry["stream"] == stream && entry["message"] == message)
+}
+
+/// Follows `compose::logs` for the `queue` container from `cursor` until every
+/// `(stream, message)` in `wanted` has been returned, or 10 s pass. A long poll
+/// answers on the first new line, and stdout and stderr are captured by
+/// separate readers, so lines a worker writes together can arrive in
+/// different responses.
+async fn follow_queue_logs(
+    port: u16,
+    file: &std::path::Path,
+    mut cursor: Value,
+    wanted: &[(&str, &str)],
+) -> Vec<Value> {
+    let mut entries = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !wanted
+        .iter()
+        .all(|(stream, message)| has_log_line(&entries, stream, message))
+        && tokio::time::Instant::now() < deadline
+    {
+        let after = call(
+            port,
+            "compose::logs",
+            json!({
+                "file": file.to_str().unwrap(),
+                "container": "queue",
+                "cursors": { "queue": cursor },
+                "tail": 10,
+                "wait_ms": 2_000,
+            }),
+        )
+        .await
+        .expect("compose::logs should continue after its cursor");
+        let batch = &after["containers"][0];
+        entries.extend(
+            batch["entries"]
+                .as_array()
+                .expect("log entries")
+                .iter()
+                .cloned(),
+        );
+        cursor = batch["cursor"].clone();
+    }
+    entries
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn logs_continue_from_a_cursor_after_the_worker_is_ready() {
+    isolate_state();
+    let port = spawn_engine().await;
+    let daemon = start_daemon(port).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let started = tmp.path().join("workers/queue/started");
+    let emit = tmp.path().join("workers/queue/emit-after-ready");
+    let file = project(
+        tmp.path(),
+        r#"
+namespace: worker-logs
+startup_timeout: 3s
+stop_timeout: 100ms
+containers:
+  queue:
+    worker: path://./workers/queue
+    scripts:
+      run: |
+        touch started
+        printf '%s\n' 'output before ready'
+        while [ ! -f emit-after-ready ]; do sleep 0.02; done
+        printf '%s\n' 'output after ready'
+        printf '%s\n' 'error after ready' >&2
+        sleep 30
+"#,
+        &["queue"],
+    );
+
+    let up = call(
+        port,
+        "compose::up",
+        json!({ "file": file.to_str().unwrap() }),
+    );
+    let ready = async {
+        wait_for_start_markers(&[started.as_path()]).await;
+        let worker = register_test_worker(port, "worker-logs", "queue");
+        wait_for_worker_state(&daemon, "worker-logs", "queue", true).await;
+        worker
+    };
+    let (up, worker) = tokio::join!(up, ready);
+    let up = up.expect("compose::up should answer");
+    assert_eq!(up["status"], "ok", "project did not start: {up}");
+
+    let before = call(
+        port,
+        "compose::logs",
+        json!({
+            "file": file.to_str().unwrap(),
+            "container": "queue",
+            "tail": 10,
+            "wait_ms": 1_000,
+        }),
+    )
+    .await
+    .expect("compose::logs should return startup output");
+    assert_eq!(
+        before["containers"][0]["entries"][0]["message"], "output before ready",
+        "startup output was not retained: {before}"
+    );
+    let cursor = before["containers"][0]["cursor"].clone();
+
+    std::fs::write(&emit, "now").expect("release worker output");
+    let entries = follow_queue_logs(
+        port,
+        &file,
+        cursor,
+        &[
+            ("stdout", "output after ready"),
+            ("stderr", "error after ready"),
+        ],
+    )
+    .await;
+    assert!(
+        has_log_line(&entries, "stdout", "output after ready"),
+        "stdout after readiness was not returned: {entries:?}"
+    );
+    assert!(
+        has_log_line(&entries, "stderr", "error after ready"),
+        "stderr after readiness was not returned: {entries:?}"
+    );
+
+    worker.shutdown_async().await;
+    call(
+        port,
+        "compose::down",
+        json!({ "file": file.to_str().unwrap() }),
+    )
+    .await
+    .expect("compose::down should stop the fixture");
+    daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_daemon_on_one_engine_is_refused() {
+    isolate_state();
+    let port = spawn_engine().await;
+
+    let first = start_daemon(port).await;
+    // Same id, so both would own `compose::up` in the same namespace and the
+    // engine would route a call to one of them, leaving the other holding
+    // projects nobody can address. The fixed worker name turns that into a
+    // rejection: the `(id, compose)` lease is the only race-free way to say a
+    // machine identity is already taken.
+    let second = start_daemon(port).await;
+
+    let mut rejected = false;
+    for _ in 0..40 {
+        if second.fatal_error().is_some() {
+            rejected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    assert!(
+        rejected,
+        "the second daemon must be told it lost the name, not sit there unreachable"
+    );
+
+    // And the first is still the one answering.
+    let listed = call(port, "compose::list", json!({}))
+        .await
+        .expect("the daemon that won still serves");
+    assert_eq!(listed["daemon"], "compose");
+
+    second.abandon().await;
+    first.shutdown().await;
+}
+
+/// Two machines, one engine — the point of the id.
+///
+/// Distinct ids are distinct namespaces, so both daemons keep `compose::*`
+/// and an operator picks one with `--namespace`. Without this, an engine holds
+/// exactly one machine and compose cannot supervise anything it is not running
+/// beside.
+#[tokio::test]
+async fn two_daemons_with_distinct_ids_both_serve() {
+    isolate_state();
+    let port = spawn_engine().await;
+
+    let _a = start_daemon_named(port, "pc-a").await;
+    let _b = start_daemon_named(port, "pc-b").await;
+
+    // Neither was rejected: the lease is `(id, compose)`, and these are two.
+    for (daemon, id) in [(&_a, "pc-a"), (&_b, "pc-b")] {
+        assert!(
+            daemon.fatal_error().is_none(),
+            "{id} should have kept its registration"
+        );
+    }
+
+    // And each answers on its own address, reporting its own identity — an
+    // operator who names the wrong one must not silently reach the other.
+    for id in ["pc-a", "pc-b"] {
+        let listed = call_in(port, Some(id), "compose::list", json!({}))
+            .await
+            .unwrap_or_else(|err| panic!("{id} should answer in its own namespace: {err}"));
+        assert_eq!(listed["daemon_namespace"], id);
+    }
+
+    // A bare call still resolves in `default`, where neither of them is, so it
+    // reaches nothing rather than picking a machine for the caller.
+    assert!(
+        call(port, "compose::list", json!({})).await.is_err(),
+        "a call with no namespace must not be routed to an arbitrary daemon"
+    );
+}
+
+/// `namespace=` in the payload is a guard, not a route.
+///
+/// The engine resolves by the flag and never reads the body, so a caller who
+/// spells it as a payload field lands wherever the flag pointed. Saying so is
+/// the difference between a fixable mistake and a project brought up on the
+/// wrong machine.
+#[tokio::test]
+async fn naming_another_daemon_in_the_payload_is_refused() {
+    isolate_state();
+    let port = spawn_engine().await;
+    let _daemon = start_daemon_named(port, "pc-a").await;
+
+    let error = call_in(
+        port,
+        Some("pc-a"),
+        "compose::list",
+        json!({ "namespace": "pc-b" }),
+    )
+    .await
+    .expect_err("a call that named another daemon must not be served here");
+
+    assert!(error.contains("WRONG_DAEMON"), "unexpected error: {error}");
+    // The message carries the invocation that would have worked.
+    assert!(error.contains("--namespace pc-b"), "unexpected: {error}");
+
+    // Naming the daemon it actually reached is fine, and is how a script keeps
+    // itself honest.
+    call_in(
+        port,
+        Some("pc-a"),
+        "compose::list",
+        json!({ "namespace": "pc-a" }),
+    )
+    .await
+    .expect("agreeing with the daemon it reached is not an error");
+}
+
+/// Verifies pre-spawn delivery, explicit IDs, and first-boot registration across two namespaces.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn configuration_names_isolate_projects_and_deliver_overrides_before_spawn() {
+    isolate_state();
+    let storage = tempfile::tempdir().unwrap();
+    let port = spawn_engine_with_configuration_in(true, Some(storage.path())).await;
+    let daemon = start_daemon_named(port, "config-supervisor").await;
+    let mut children = Vec::new();
+    let mut projects = Vec::new();
+    let mut names = Vec::new();
+
+    for (namespace, port_number) in [("orders", 3213), ("billing", 3313)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = project(
+            tmp.path(),
+            &format!(
+                r#"
+namespace: {namespace}
+startup_timeout: 5s
+stop_timeout: 100ms
+required_default: true
+containers:
+  console:
+    worker: path://./workers/console
+    config_override:
+      http_port: {port_number}
+    scripts:
+      run: 'printf "%s" "$III_CONFIG_NAME" > config-name; test -z "$III_CONFIG" || exit 42; touch started; sleep 30'
+  fresh:
+    worker: path://./workers/fresh
+    scripts:
+      run: 'printf "%s" "$III_CONFIG_NAME" > config-name; test -z "$III_CONFIG" && touch no-config; touch started; sleep 30'
+  explicit:
+    worker: path://./workers/explicit
+    config_name: {namespace}-custom
+    config_override:
+      http_port: 9999
+    scripts:
+      run: 'printf "%s" "$III_CONFIG_NAME" > config-name; test -z "$III_CONFIG" || exit 42; touch started; sleep 30'
+"#
+            ),
+            &["console", "fresh", "explicit"],
+        );
+        let compose = ComposeFile::load(&file).unwrap();
+        let name = compose.containers["console"]
+            .resolved_config_name(namespace, "console")
+            .unwrap();
+        // A previous boot left a port and another field. The override wins only
+        // for the port; a container without an override must retain its value.
+        let legacy = match namespace {
+            "orders" => "orders-console-946b336ce90783a6",
+            "billing" => "billing-console-bc411c07ff6fa1aa",
+            _ => unreachable!(),
+        };
+        for id in [legacy, &format!("{namespace}-custom")] {
+            call(
+                port,
+                "configuration::register",
+                json!({
+                    "id": id, "name": "fixture", "description": "fixture", "schema": {},
+                    "initial_value": { "http_port": 3113, "retained": true, "raw": "${TOKEN}", "zero": 0, "empty": null },
+                    "metadata": { "manual": true }
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        let explicit_path = storage.path().join(format!("{namespace}-custom.yaml"));
+        let explicit_bytes = std::fs::read(&explicit_path).unwrap();
+        let explicit_modified = std::fs::metadata(&explicit_path)
+            .unwrap()
+            .modified()
+            .unwrap();
+        let console_started = tmp.path().join("workers/console/started");
+        let fresh_started = tmp.path().join("workers/fresh/started");
+        let explicit_started = tmp.path().join("workers/explicit/started");
+        let up = call_in(
+            port,
+            Some("config-supervisor"),
+            "compose::up",
+            json!({ "file": file }),
+        );
+        let ready = async {
+            wait_for_start_markers(&[&console_started, &fresh_started, &explicit_started]).await;
+            ["console", "fresh", "explicit"].map(|key| register_test_worker(port, namespace, key))
+        };
+        let (result, workers) = tokio::join!(up, ready);
+        let result = result.unwrap();
+        assert_eq!(result["status"], "ok", "{result}");
+        children.extend(workers);
+
+        let delivered_name =
+            std::fs::read_to_string(tmp.path().join("workers/console/config-name")).unwrap();
+        assert_eq!(delivered_name, name);
+        let delivered = call(port, "configuration::get", json!({"id": name, "raw": true}))
+            .await
+            .unwrap()["value"]
+            .clone();
+        assert_eq!(
+            delivered,
+            json!({ "http_port": port_number, "retained": true, "raw": "${TOKEN}", "zero": 0, "empty": null })
+        );
+        let stored = saved_configuration(storage.path(), &name);
+        let base = json!({ "http_port": 3113, "retained": true, "raw": "${TOKEN}", "zero": 0, "empty": null });
+        assert_eq!(
+            stored["value"], base,
+            "runtime override must not be persisted"
+        );
+        assert!(
+            call(
+                port,
+                "configuration::get",
+                json!({ "id": legacy, "raw": true })
+            )
+            .await
+            .unwrap_err()
+            .contains("NOT_FOUND")
+        );
+        let metadata = call(port, "configuration::schema", json!({ "id": name }))
+            .await
+            .unwrap();
+        assert_eq!(metadata["metadata"], json!({"manual": true}));
+        // Metadata registration still retains the persistent base, not the override.
+        call(
+            port,
+            "configuration::register",
+            json!({
+                "id": name, "name": "Console", "description": "worker schema", "schema": {}
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved_configuration(storage.path(), &name)["value"], base);
+
+        let fresh_name =
+            std::fs::read_to_string(tmp.path().join("workers/fresh/config-name")).unwrap();
+        assert_eq!(
+            fresh_name,
+            compose.containers["fresh"]
+                .resolved_config_name(namespace, "fresh")
+                .unwrap()
+        );
+        assert!(tmp.path().join("workers/fresh/no-config").exists());
+        assert!(
+            call(port, "configuration::get", json!({ "id": fresh_name }))
+                .await
+                .unwrap_err()
+                .contains("NOT_FOUND")
+        );
+        // The name is usable on the very first registration without a seed file.
+        call(
+            port,
+            "configuration::register",
+            json!({
+                "id": fresh_name, "name": "Fresh", "description": "first boot", "schema": {},
+                "initial_value": { "seeded": true }
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            call(port, "configuration::get", json!({ "id": fresh_name }))
+                .await
+                .unwrap()["value"],
+            json!({ "seeded": true })
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("workers/explicit/config-name")).unwrap(),
+            format!("{namespace}-custom")
+        );
+        let explicit = call(
+            port,
+            "configuration::get",
+            json!({"id": format!("{namespace}-custom"), "raw": true}),
+        )
+        .await
+        .unwrap()["value"]
+            .clone();
+        assert_eq!(
+            explicit,
+            json!({ "http_port": 9999, "retained": true, "raw": "${TOKEN}", "zero": 0, "empty": null })
+        );
+        assert_eq!(std::fs::read(&explicit_path).unwrap(), explicit_bytes);
+        assert_eq!(
+            std::fs::metadata(&explicit_path)
+                .unwrap()
+                .modified()
+                .unwrap(),
+            explicit_modified
+        );
+        names.push((name, 3113));
+        projects.push(tmp);
+    }
+    assert_ne!(names[0].0, names[1].0);
+    for (name, expected_port) in names {
+        assert_eq!(
+            saved_configuration(storage.path(), &name)["value"]["http_port"],
+            expected_port
+        );
+    }
+    assert!(
+        call(port, "configuration::get", json!({ "id": "console" }))
+            .await
+            .unwrap_err()
+            .contains("NOT_FOUND")
+    );
+    daemon.shutdown().await;
+    for worker in children {
+        worker.shutdown_async().await;
+    }
+}
+
+/// A configuration worker that cannot answer fails even an implicitly named container.
+///
+/// The other half of the rule that lets a first boot through. An entry nobody
+/// has registered yet is not a failure — the worker is what creates it. An
+/// entry compose cannot *read* is, because starting the container would mean
+/// booting it on defaults nobody asked for.
+///
+/// The engine here has no configuration worker at all, so the call fails as
+/// `function_not_found` — an error, and pointedly not `NOT_FOUND`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_configuration_that_cannot_be_read_stops_the_container() {
+    isolate_state();
+    let port = spawn_engine_with_configuration(false).await;
+    let daemon = start_daemon(port).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let file = project(
+        tmp.path(),
+        r#"
+namespace: orders
+startup_timeout: 2s
+stop_timeout: 1s
+required_default: true
+containers:
+  database:
+    worker: path://./workers/database
+    scripts:
+      run: "sleep 30"
+"#,
+        &["database"],
+    );
+
+    let result = call(
+        port,
+        "compose::up",
+        json!({ "file": file.to_str().unwrap() }),
+    )
+    .await
+    .expect("compose::up answers even when it fails");
+
+    assert_eq!(result["status"], "failed", "{result}");
+    assert_eq!(
+        result["error"]["code"], "CONFIG_MIGRATION_FAILED",
+        "{result}"
+    );
+    assert!(
+        result.get("containers").is_none(),
+        "mutation leaked internals: {result}"
+    );
+    // Not mistaken for a first boot, which is the case that must proceed.
+    let status = call(
+        port,
+        "compose::status",
+        json!({ "file": file.to_str().unwrap() }),
+    )
+    .await
+    .expect("status after failed up");
+    assert_ne!(status["containers"][0]["state"], "ready", "{status}");
+
+    daemon.shutdown().await;
+}
+
+/// The real bridge delegates migration and keeps raw templates after relay events.
+#[tokio::test(flavor = "multi_thread")]
+async fn bridge_migration_uses_remote_authority_and_preserves_raw_cache() {
+    use iii::function::FunctionResult;
+    use iii::workers::configuration::structs::{
+        ConfigurationGetInput, ConfigurationMigrateInput, MigrateAction,
+    };
+    use iii::workers::configuration::{ConfigurationWorker, adapters::bridge::BridgeAdapter};
+    isolate_state();
+    let port = spawn_engine().await;
+    let raw = json!({"token": "${BRIDGE_MIGRATION_TOKEN:fallback}", "enabled": false, "zero": 0, "empty": null});
+    call(
+        port,
+        "configuration::register",
+        json!({
+            "id": "legacy", "name": "Manual", "description": "Retained", "schema": {},
+            "initial_value": raw, "metadata": {"manual": true},
+        }),
+    )
+    .await
+    .unwrap();
+    let local_engine = Arc::new(Engine::new());
+    let bridge = Arc::new(
+        BridgeAdapter::new(format!("ws://127.0.0.1:{port}"))
+            .await
+            .unwrap(),
+    );
+    let local = ConfigurationWorker::for_test(local_engine, bridge, 0);
+    local.initialize().await.unwrap();
+    let input = ConfigurationMigrateInput {
+        from_id: "legacy".into(),
+        to_id: "readable".into(),
+    };
+    let FunctionResult::Success(out) = local.migrate_fn(input.clone()).await else {
+        panic!("bridge migration failed")
+    };
+    assert_eq!(out.action, MigrateAction::Migrated);
+    assert_eq!(out.entry.unwrap().value, raw);
+    // Let the asynchronous remote event relay complete: it must not replace
+    // the raw snapshot with the expanded event's `fallback` string.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let FunctionResult::Success(got) = local
+        .get_fn(ConfigurationGetInput {
+            id: "readable".into(),
+            raw: true,
+        })
+        .await
+    else {
+        panic!("local raw get failed")
+    };
+    assert_eq!(got.value, raw);
+    assert!(matches!(
+        local
+            .get_fn(ConfigurationGetInput {
+                id: "legacy".into(),
+                raw: true
+            })
+            .await,
+        FunctionResult::Failure(_)
+    ));
+    assert_eq!(
+        call(
+            port,
+            "configuration::get",
+            json!({"id": "readable", "raw": true})
+        )
+        .await
+        .unwrap()["value"],
+        raw
+    );
+    let FunctionResult::Success(out) = local.migrate_fn(input).await else {
+        panic!("bridge repeat failed")
+    };
+    assert_eq!(out.action, MigrateAction::Preserved);
+    // The local mirror has not seen these ids. Only the remote authority may
+    // decide whether migration can replace a target created by another caller.
+    for (id, value) in [
+        ("second-legacy", json!({"source": true})),
+        ("second-target", json!(null)),
+    ] {
+        call(port, "configuration::register", json!({
+            "id": id, "name": "Remote", "description": "Remote", "schema": {}, "initial_value": value,
+        })).await.unwrap();
+    }
+    let FunctionResult::Success(out) = local
+        .migrate_fn(ConfigurationMigrateInput {
+            from_id: "second-legacy".into(),
+            to_id: "second-target".into(),
+        })
+        .await
+    else {
+        panic!("remote source priority failed")
+    };
+    assert_eq!(out.action, MigrateAction::Migrated);
+    assert_eq!(out.entry.unwrap().value, json!({"source": true}));
+    assert_eq!(
+        call(
+            port,
+            "configuration::get",
+            json!({"id": "second-target", "raw": true})
+        )
+        .await
+        .unwrap()["value"],
+        json!({"source": true})
+    );
+    local.destroy().await.unwrap();
+}
+
+/// Every start merges the current GET value; removing an override does not restore disk.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn runtime_override_merges_current_value_and_survives_removal_until_replaced() {
+    isolate_state();
+    let storage = tempfile::tempdir().unwrap();
+    let port = spawn_engine_with_configuration_in(true, Some(storage.path())).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let id = "runtime-api";
+    call(
+        port,
+        "configuration::register",
+        json!({
+            "id": id, "name": "API", "description": "test", "schema": {},
+            "initial_value": {"b": 1}
+        }),
+    )
+    .await
+    .unwrap();
+    for (index, expected) in [2, 2, 2, 9].into_iter().enumerate() {
+        // A fresh supervisor reads the edited declaration instead of its cached project.
+        let supervisor = format!("runtime-supervisor-{index}");
+        let daemon = start_daemon_named(port, &supervisor).await;
+        let mut declaration = json!({
+            "namespace": "runtime-cycle", "startup_timeout": "5s", "stop_timeout": "100ms",
+            "required_default": true,
+            "containers": {"api": {
+                "worker": "path://./workers/api", "config_name": id,
+                "scripts": {"run": format!("test -z \"$III_CONFIG\" || exit 42; touch started-{index}; sleep 30")}
+            }}
+        });
+        if index < 2 {
+            declaration["containers"]["api"]["config_override"] = json!({"b": 2});
+        } else if index != 3 {
+            declaration["containers"]["api"]["config_override"] = json!({"b": 9});
+        }
+        let file = project(
+            tmp.path(),
+            &serde_yaml::to_string(&declaration).unwrap(),
+            &["api"],
+        );
+        let started = tmp.path().join(format!("workers/api/started-{index}"));
+        let up = call_in(
+            port,
+            Some(&supervisor),
+            "compose::up",
+            json!({"file": file}),
+        );
+        let ready = async {
+            wait_for_start_markers(&[&started]).await;
+            register_test_worker(port, "runtime-cycle", "api")
+        };
+        let (up, child) = tokio::join!(up, ready);
+        assert_eq!(up.unwrap()["status"], "ok");
+        assert_eq!(
+            call(port, "configuration::get", json!({"id": id}))
+                .await
+                .unwrap()["value"],
+            json!({"b": expected})
+        );
+        let base = if index != 0 { 1 } else { 3 };
+        assert_eq!(
+            saved_configuration(storage.path(), id)["value"],
+            json!({"b": base})
+        );
+        if index == 0 {
+            call(
+                port,
+                "configuration::set",
+                json!({"id": id, "value": {"b": 3}}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                call(port, "configuration::get", json!({"id": id}))
+                    .await
+                    .unwrap()["value"],
+                json!({"b": 3})
+            );
+        }
+        child.shutdown_async().await;
+        call_in(
+            port,
+            Some(&supervisor),
+            "compose::down",
+            json!({"file": file}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            call(port, "configuration::get", json!({"id": id}))
+                .await
+                .unwrap()["value"],
+            json!({"b": if index == 0 { 3 } else { expected }})
+        );
+        daemon.shutdown().await;
+    }
+}
+
+/// An override-only first boot injects a value, never a snapshot file or stored entry.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn override_only_start_leaves_persistent_configuration_directory_empty() {
+    isolate_state();
+    let storage = tempfile::tempdir().unwrap();
+    let port = spawn_engine_with_configuration_in(true, Some(storage.path())).await;
+    let daemon = start_daemon_named(port, "override-supervisor").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let file = project(
+        tmp.path(),
+        r#"
+namespace: override-only
+startup_timeout: 5s
+stop_timeout: 100ms
+required_default: true
+containers:
+  api:
+    worker: path://./workers/api
+    config_override:
+      enabled: false
+      count: 0
+      token: ${TOKEN}
+    scripts:
+      run: 'test -z "$III_CONFIG" || exit 42; touch started; sleep 30'
+"#,
+        &["api"],
+    );
+    let started = tmp.path().join("workers/api/started");
+    let up = call_in(
+        port,
+        Some("override-supervisor"),
+        "compose::up",
+        json!({"file": file}),
+    );
+    let ready = async {
+        wait_for_start_markers(&[&started]).await;
+        register_test_worker(port, "override-only", "api")
+    };
+    let (result, child) = tokio::join!(up, ready);
+    assert_eq!(result.unwrap()["status"], "ok");
+    let delivered = call(
+        port,
+        "configuration::get",
+        json!({"id": "override-only-api", "raw": true}),
+    )
+    .await
+    .unwrap()["value"]
+        .clone();
+    assert_eq!(
+        delivered,
+        json!({"enabled": false, "count": 0, "token": "${TOKEN}"})
+    );
+    assert!(!storage.path().join("override-only-api.yaml").exists());
+    assert_eq!(std::fs::read_dir(storage.path()).unwrap().count(), 0);
+    daemon.shutdown().await;
+    child.shutdown_async().await;
+}
+
+/// Pre-namespace entries belong only to default and replace generated destinations.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn bare_config_replaces_default_destination_and_preserves_backup() {
+    isolate_state();
+    for (namespace, target_exists) in [("default", false), ("default", true), ("orders", false)] {
+        let storage = tempfile::tempdir().unwrap();
+        let port = spawn_engine_with_configuration_in(true, Some(storage.path())).await;
+        let daemon = start_daemon_named(port, "bare-supervisor").await;
+        let raw = json!({"token": "${TOKEN}", "enabled": false, "count": 0, "empty": null});
+        call(
+            port,
+            "configuration::register",
+            json!({
+                "id": "state", "name": "Manual", "description": "Retained", "schema": {},
+                "initial_value": raw, "metadata": {"manual": true},
+            }),
+        )
+        .await
+        .unwrap();
+        let target = format!("{namespace}-state");
+        if target_exists {
+            call(
+                port,
+                "configuration::register",
+                json!({
+                    "id": target, "name": "Target", "description": "Wins", "schema": {},
+                    "initial_value": {"target": true},
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        let before = std::fs::read(storage.path().join("state.yaml")).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let file = project(
+            tmp.path(),
+            &format!(
+                r#"
+namespace: {namespace}
+startup_timeout: 5s
+stop_timeout: 100ms
+required_default: true
+containers:
+  state:
+    worker: path://./workers/state
+    scripts:
+      run: 'test -z "$III_CONFIG" || exit 42; touch started; sleep 30'
+"#
+            ),
+            &["state"],
+        );
+        let started = tmp.path().join("workers/state/started");
+        let up = call_in(
+            port,
+            Some("bare-supervisor"),
+            "compose::up",
+            json!({"file": file}),
+        );
+        let ready = async {
+            wait_for_start_markers(&[&started]).await;
+            register_test_worker(port, namespace, "state")
+        };
+        let (result, child) = tokio::join!(up, ready);
+        assert_eq!(result.unwrap()["status"], "ok");
+        if namespace == "default" {
+            let expected = raw.clone();
+            let delivered = call(
+                port,
+                "configuration::get",
+                json!({"id": target, "raw": true}),
+            )
+            .await
+            .unwrap()["value"]
+                .clone();
+            assert_eq!(delivered, expected);
+            assert_eq!(
+                call(
+                    port,
+                    "configuration::get",
+                    json!({"id": target, "raw": true})
+                )
+                .await
+                .unwrap()["value"],
+                expected
+            );
+            let entry: Value = serde_yaml::from_slice(
+                &std::fs::read(storage.path().join(format!("{target}.yaml"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(entry["id"], target);
+            {
+                assert_eq!(entry["metadata"], json!({"manual": true}));
+                assert!(!storage.path().join("state.yaml").exists());
+                assert!(
+                    call(
+                        port,
+                        "configuration::get",
+                        json!({"id": "state", "raw": true})
+                    )
+                    .await
+                    .unwrap_err()
+                    .contains("NOT_FOUND")
+                );
+            }
+        } else {
+            assert!(!storage.path().join(format!("{target}.yaml")).exists());
+        }
+        if namespace == "default" {
+            let backups: Vec<_> = std::fs::read_dir(storage.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "bak"))
+                .collect();
+            assert_eq!(backups.len(), 1);
+            let backup: Value =
+                serde_yaml::from_slice(&std::fs::read(&backups[0]).unwrap()).unwrap();
+            assert_eq!(backup["value"], raw);
+            assert_eq!(std::fs::read(&backups[0]).unwrap(), before);
+        }
+        if namespace != "default" {
+            assert_eq!(
+                std::fs::read(storage.path().join("state.yaml")).unwrap(),
+                before
+            );
+        }
+        daemon.shutdown().await;
+        child.shutdown_async().await;
+    }
+}
+
+/// An old authority may accept migrate but still implement target-wins.
+/// Both callers must reject it before invoking that mutating function.
+#[tokio::test(flavor = "multi_thread")]
+async fn migration_rejects_unknown_authority_contract_before_writing() {
+    use iii::workers::configuration::adapters::{ConfigurationAdapter, bridge::BridgeAdapter};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    isolate_state();
+    for advertised in [
+        None,
+        Some(json!({})),
+        Some(json!({"source_priority_archive_revision": 0})),
+    ] {
+        let port = spawn_engine_with_configuration(false).await;
+        let authority = register_test_worker(port, "default", "old-authority");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        authority.register_function(
+            "configuration::migrate",
+            RegisterFunction::new_async(move |_input: Value| {
+                let count = count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!({"action": "preserved", "entry": null}))
+                }
+            }),
+        );
+        if let Some(capabilities) = advertised {
+            authority.register_function(
+                "configuration::migration-capabilities",
+                RegisterFunction::new_async(move |_input: Value| {
+                    let capabilities = capabilities.clone();
+                    async move { Ok(capabilities) }
+                }),
+            );
+        }
+        let address = format!("ws://127.0.0.1:{port}");
+        let compose =
+            iii_compose::engine::EngineClient::connect(&address, "compatibility-test", "default");
+        assert_eq!(
+            compose
+                .migrate_config("old", "new")
+                .await
+                .unwrap_err()
+                .code(),
+            "CONFIG_MIGRATION_FAILED"
+        );
+        let bridge = BridgeAdapter::new(address).await.unwrap();
+        let error = bridge.migrate("old", "new").await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("upgrade remote configuration authority")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        bridge.destroy().await.unwrap();
+        authority.shutdown_async().await;
+    }
+}

@@ -1,0 +1,50 @@
+[package]
+name = "iii-sdk"
+version = "0.25.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+authors = ["Motia LLC"]
+description = "SDK for III Engine - a platform for building distributed applications"
+repository = "https://github.com/iii-hq/iii"
+homepage = "https://github.com/iii-hq/iii"
+keywords = ["iii", "sdk", "engine", "distributed"]
+categories = ["api-bindings", "asynchronous", "development-tools"]
+
+[lib]
+name = "iii_sdk"
+path = "src/lib.rs"
+
+[dependencies]
+arc-swap = "1"
+async-trait = "0.1.92"
+futures-util = "0.3"
+hostname = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["unbounded_depth", "raw_value"] }
+schemars = "0.8"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+iii-helpers = { workspace = true }
+iii-filter = { workspace = true }
+
+# HTTP client (non-traced; traced variant lives in iii-helpers::observability)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[dev-dependencies]
+criterion = "0.5"
+ctor = "0.6.3"
+opentelemetry = { version = "0.32" }
+opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio", "trace", "testing"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart", "stream"] }
+serial_test = "3"
+tokio = { version = "1", features = ["test-util"] }
+tracing-test = "0.2"
+
+[[bench]]
+name = "observe_bench"
+harness = false

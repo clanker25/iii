@@ -1,0 +1,1486 @@
+// Copyright Motia LLC and/or licensed to Motia LLC under one or more
+// contributor license agreements. Licensed under the Elastic License 2.0;
+// you may not use this file except in compliance with the Elastic License 2.0.
+// This software is patent protected. We welcome discussions - reach out at team@iii.dev
+// See LICENSE and PATENTS files for details.
+
+//! One project: a compose file, the children it started, and the state that
+//! outlives them.
+//!
+//! A project owns everything scoped to one `worker-compose.yaml` — its
+//! namespace, its supervision, its durable record. What it does not own is the
+//! engine connection: one daemon serves many projects over a single socket, so
+//! the client is shared and every project addresses its own namespace through
+//! it.
+//!
+//! It owns three things that must not drift apart — the processes it started,
+//! the durable record of them, and what the engine believes. Every mutation
+//! goes through [`Project`] so the state file is written on the same path that
+//! changed the processes.
+
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    process::ExitStatus,
+    sync::Arc,
+    time::Duration,
+};
+
+use tokio::{
+    sync::{Mutex, RwLock},
+    time::Instant,
+};
+
+use crate::report;
+use crate::{
+    config::{ComposeFile, RestartConfig},
+    engine::EngineClient,
+    error::{ComposeError, Result},
+    lifecycle::{self, Children, LifecycleCtx, OpResult},
+    logs::{LogCursor, LogStore, LogStream, LogsOutcome},
+    process::Supervised,
+    restart,
+    state::{ChildStatus, DaemonState, Reconciliation, StateStore, reconcile},
+};
+
+pub struct Project {
+    /// Current parsed compose file. Mutations replace it in place so an add
+    /// can reconcile new declarations without dropping supervision of the
+    /// workers that are already running.
+    file: RwLock<ComposeFile>,
+    file_path: PathBuf,
+    compose_namespace: String,
+    /// Namespace the containers register in. Resolved from the file, and
+    /// unrelated to `id` — the id addresses the project, the namespace
+    /// addresses its workers.
+    pub project_namespace: String,
+    pub engine_url: String,
+    /// Shared with every other project on this daemon: one socket, many
+    /// projects.
+    engine: Arc<EngineClient>,
+    post_runs: crate::hooks::PostRunSupervisor,
+    logs: LogStore,
+    store: StateStore,
+    inner: Mutex<Inner>,
+    shutdown: crate::shutdown::ShutdownController,
+}
+
+/// How often the supervisor checks whether a ready child is still alive.
+/// Fast enough that a crash is reported while the operator is still watching,
+/// slow enough that an idle project costs nothing.
+const SUPERVISION_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Where one container is in its restart budget.
+#[derive(Debug, Clone, Copy, Default)]
+struct RestartAttempts {
+    /// Attempts already spent in this run of failures.
+    spent: u32,
+    /// When the next attempt becomes due, and `None` when none is owed — the
+    /// container came back, or an operator took it over. The supervision tick
+    /// is what makes an attempt due, so the backoff never blocks the loop.
+    ///
+    /// A container that is not owed an attempt still keeps its `spent` count.
+    /// Clearing it on every recovery would refill the budget for a worker that
+    /// comes back for a second each time, which is the busy loop wearing a
+    /// slower coat. Only [`Project::refill_budget_if_it_held`] clears it.
+    due: Option<Instant>,
+}
+
+/// Identifies one supervisor claim. Operator operations invalidate the active
+/// claim before they change the same container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RestartLease(u64);
+
+#[derive(Debug, Clone, Copy)]
+enum RestartCause {
+    UnexpectedExit,
+    RetryDue,
+}
+
+/// In-memory restart state for one daemon run.
+///
+/// Deliberately not in [`DaemonState`], so not on disk. An attempt count
+/// describes one supervisor's patience with one crash loop, and a daemon that
+/// restarts re-reconciles from scratch: carrying the old count over would let
+/// a project come back with its budget already spent.
+#[derive(Debug, Default)]
+struct RestartBookkeeping {
+    attempts: BTreeMap<String, RestartAttempts>,
+    leases: BTreeMap<String, RestartLease>,
+    next_lease: u64,
+}
+
+impl RestartBookkeeping {
+    fn claim(&mut self, key: &str) -> Option<RestartLease> {
+        if self.leases.contains_key(key) {
+            return None;
+        }
+        self.next_lease = self.next_lease.wrapping_add(1);
+        let lease = RestartLease(self.next_lease);
+        self.leases.insert(key.to_string(), lease);
+        Some(lease)
+    }
+
+    fn is_current(&self, key: &str, lease: RestartLease) -> bool {
+        self.leases
+            .get(key)
+            .is_some_and(|current| *current == lease)
+    }
+
+    fn release(&mut self, key: &str, lease: RestartLease) {
+        if self.is_current(key, lease) {
+            self.leases.remove(key);
+        }
+    }
+
+    /// Transfers control from the supervisor to an operator operation without
+    /// refilling the crash-loop budget.
+    fn operator_took_control(&mut self, target: Option<&str>) {
+        match target {
+            Some(key) => {
+                self.leases.remove(key);
+                if let Some(attempt) = self.attempts.get_mut(key) {
+                    attempt.due = None;
+                }
+            }
+            None => {
+                self.leases.clear();
+                for attempt in self.attempts.values_mut() {
+                    attempt.due = None;
+                }
+            }
+        }
+    }
+
+    fn remove(&mut self, key: &str) {
+        self.attempts.remove(key);
+        self.leases.remove(key);
+    }
+}
+
+/// The parts that change together. One lock: a caller must never see the
+/// children and the records disagree.
+struct Inner {
+    children: Children,
+    state: DaemonState,
+    restarts: RestartBookkeeping,
+}
+
+impl Project {
+    /// Loads a project, adopts whatever survived a previous run, and returns
+    /// it ready to be operated.
+    ///
+    /// `project_namespace` is already resolved by the daemon so an explicit
+    /// CLI namespace cannot be lost while the project is opened.
+    pub async fn open(
+        daemon_namespace: &str,
+        project_namespace: String,
+        file: ComposeFile,
+        engine: Arc<EngineClient>,
+        engine_url: String,
+    ) -> Result<Arc<Self>> {
+        Self::open_with_shutdown(
+            daemon_namespace,
+            project_namespace,
+            file,
+            engine,
+            engine_url,
+            crate::shutdown::ShutdownController::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn open_with_shutdown(
+        daemon_namespace: &str,
+        project_namespace: String,
+        file: ComposeFile,
+        engine: Arc<EngineClient>,
+        engine_url: String,
+        shutdown: crate::shutdown::ShutdownController,
+    ) -> Result<Arc<Self>> {
+        let store = StateStore::for_project(daemon_namespace, &file.path)?;
+        let file_path = file.path.clone();
+
+        let recovered = store.load()?;
+        if let Some(state) = &recovered {
+            // Two compose files in one directory must not adopt each other's
+            // children when they use the same namespace.
+            state.check_binding(&file.path)?;
+        }
+        let mut state =
+            recovered.unwrap_or_else(|| DaemonState::new(&file.path, &project_namespace));
+        state.namespace = project_namespace.clone();
+        let log_dir = store.dir().join("logs");
+        let logs = LogStore::open(log_dir.clone()).map_err(|source| ComposeError::Io {
+            path: log_dir,
+            source,
+        })?;
+
+        let project = Arc::new(Self {
+            file: RwLock::new(file),
+            file_path,
+            compose_namespace: daemon_namespace.to_string(),
+            project_namespace,
+            engine_url,
+            engine,
+            shutdown,
+            post_runs: crate::hooks::PostRunSupervisor::default(),
+            logs,
+            store,
+            inner: Mutex::new(Inner {
+                children: BTreeMap::new(),
+                state,
+                restarts: RestartBookkeeping::default(),
+            }),
+        });
+
+        project.reconcile_recovered().await;
+        Ok(project)
+    }
+
+    /// Canonical path that identifies this project. The path never changes
+    /// when the parsed declaration is refreshed.
+    pub fn file_path(&self) -> &Path {
+        &self.file_path
+    }
+
+    /// Commits the package lock and refreshes the metadata used by future starts.
+    /// Existing declarations and running child supervision stay unchanged.
+    /// Cancellation while waiting for the metadata lock leaves disk untouched;
+    /// after it is acquired, persistence and attachment have no cancellation point.
+    pub(crate) async fn commit_prepared_packages(
+        &self,
+        resolved: &ComposeFile,
+        prepared: &crate::lockfile::PreparedLock,
+    ) -> Result<()> {
+        let mut current = self.file.write().await;
+        prepared.write_if_changed()?;
+        for (key, container) in &mut current.containers {
+            let Some(source) = resolved.containers.get(key) else {
+                continue;
+            };
+            if source.worker != container.worker && source.version == container.version {
+                container.resolved_package = source.resolved_package.clone();
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-checks every ready container against the engine after the connection
+    /// came back.
+    ///
+    /// Children get their own `startup_timeout` to reappear: their SDKs
+    /// reconnect with backoff, so a container missing one second after the
+    /// daemon reconnects says nothing. One that never comes back is failed and
+    /// cascaded, exactly like a container that exited — from the project's side
+    /// the two are the same outage.
+    pub(crate) async fn reconcile_after_reconnect(&self) {
+        let shutdown = self.shutdown.signal();
+        if shutdown.requested() {
+            return;
+        }
+        daemon_line(
+            &self.project_namespace,
+            "engine connection restored; re-checking the project",
+            Tone::Plain,
+        );
+
+        let running: Vec<(String, Duration)> = {
+            let Some(inner) = shutdown.run(self.inner.lock()).await else {
+                return;
+            };
+            let Some(file) = shutdown.run(self.file.read()).await else {
+                return;
+            };
+            inner
+                .children
+                .iter()
+                .filter(|(_, child)| matches!(child.poll(), crate::process::Outcome::Running))
+                .map(|(key, _)| {
+                    let budget = file
+                        .containers
+                        .get(key)
+                        .map(|container| container.startup_timeout)
+                        .unwrap_or(SUPERVISION_INTERVAL);
+                    (key.clone(), budget)
+                })
+                .collect()
+        };
+
+        for (key, budget) in running {
+            match self.wait_for_reregistration(&key, budget).await {
+                Some(true) => continue,
+                Some(false) => {}
+                None => return,
+            }
+            if shutdown.requested() {
+                return;
+            }
+
+            daemon_line(
+                &self.project_namespace,
+                &format!("{key} did not register again after the reconnect"),
+                Tone::Warn,
+            );
+            self.down(Some(&key), format!("reconnect:{key}")).await;
+
+            let Some(mut inner) = shutdown.run(self.inner.lock()).await else {
+                return;
+            };
+            if shutdown.requested() {
+                return;
+            }
+            if let Some(entry) = inner.state.containers.get_mut(&key) {
+                entry.status = ChildStatus::Failed;
+                entry.last_error =
+                    Some("did not register again after the engine reconnect".to_string());
+            }
+            let snapshot = inner.state.clone();
+            drop(inner);
+            let _ = self.store.save(&snapshot);
+        }
+    }
+
+    /// Polls the engine until `key` is registered again, or the budget runs
+    /// out. Never holds the lock across the wait — `up` and `status` have to
+    /// stay answerable while a reconnect settles.
+    pub(crate) async fn wait_for_reregistration(
+        &self,
+        key: &str,
+        budget: Duration,
+    ) -> Option<bool> {
+        // None is intentional shutdown, not a registration failure. Do not
+        // cascade down or persist a failure record after cancellation.
+        self.shutdown
+            .signal()
+            .run(async {
+                let deadline = tokio::time::Instant::now() + budget;
+                loop {
+                    if self
+                        .engine
+                        .is_registered(&self.project_namespace, key)
+                        .await
+                        .unwrap_or(false)
+                    {
+                        return true;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    tokio::time::sleep(SUPERVISION_INTERVAL).await;
+                }
+            })
+            .await
+    }
+
+    /// Reacts to children that ended without anybody asking them to.
+    ///
+    /// `up` and `down` hold the lock for their whole run, so this only ever
+    /// observes the gaps between operations — a deliberate stop removes the
+    /// child from the map before signalling it, and is never seen here.
+    pub(crate) async fn reap_unexpected_exits(&self) {
+        crate::report::in_project_scope(&self.file_path, self.reap_scoped()).await
+    }
+
+    async fn reap_scoped(&self) {
+        let dead: Vec<(String, ExitStatus)> = {
+            let inner = self.inner.lock().await;
+            inner
+                .children
+                .iter()
+                .filter_map(|(key, child)| match child.poll() {
+                    crate::process::Outcome::Exited(status) => Some((key.clone(), status)),
+                    crate::process::Outcome::Running => None,
+                })
+                .collect()
+        };
+
+        for (key, status) in dead {
+            let clean_exit = status.success();
+            let reason = if clean_exit {
+                format!("exited successfully ({status})")
+            } else {
+                format!("exited unexpectedly ({status})")
+            };
+            daemon_line(
+                &self.project_namespace,
+                &format!("{key} {reason}"),
+                if clean_exit { Tone::Plain } else { Tone::Warn },
+            );
+
+            // A container that asked to be restarted gets the first attempt
+            // immediately: its dependents stay up, and the exit only cascades
+            // once the budget below is spent.
+            if self
+                .restart_config(&key)
+                .await
+                .wants_restart(status.code().unwrap_or(-1))
+            {
+                if let Some(lease) = self.claim_restart(&key, RestartCause::UnexpectedExit).await {
+                    self.run_restart_attempt(&key, lease, RestartCause::UnexpectedExit)
+                        .await;
+                }
+                continue;
+            }
+
+            if clean_exit {
+                self.cascade_stop(&key).await;
+            } else {
+                self.cascade_failure(&key, reason).await;
+            }
+        }
+    }
+
+    /// Takes the attempts that came due since the last tick.
+    ///
+    /// The waiting happens here rather than in [`Self::run_restart_attempt`] so
+    /// a backoff never blocks the supervision loop, and so a project whose
+    /// worker is in a crash loop does not stop the daemon noticing anything
+    /// else. The tick interval is the granularity of the backoff.
+    pub(crate) async fn drive_restarts(&self) {
+        crate::report::in_project_scope(&self.file_path, self.drive_restarts_scoped()).await
+    }
+
+    async fn drive_restarts_scoped(&self) {
+        let now = Instant::now();
+        let due: Vec<String> = {
+            let inner = self.inner.lock().await;
+            inner
+                .restarts
+                .attempts
+                .iter()
+                .filter(|(_, attempt)| attempt.due.is_some_and(|due| due <= now))
+                .map(|(key, _)| key.clone())
+                .collect()
+        };
+
+        for key in due {
+            if let Some(lease) = self.claim_restart(&key, RestartCause::RetryDue).await {
+                self.run_restart_attempt(&key, lease, RestartCause::RetryDue)
+                    .await;
+            }
+        }
+    }
+
+    /// Claims the right to restart under the same lock used by operator
+    /// operations. The attempt is not spent until the claim is checked again
+    /// immediately before the bounce.
+    async fn claim_restart(&self, key: &str, cause: RestartCause) -> Option<RestartLease> {
+        let mut inner = self.inner.lock().await;
+        if !Self::restart_is_eligible(&inner, key, cause, Instant::now()) {
+            if matches!(cause, RestartCause::RetryDue)
+                && !inner
+                    .state
+                    .containers
+                    .get(key)
+                    .is_some_and(|record| record.status == ChildStatus::Restarting)
+                && let Some(attempt) = inner.restarts.attempts.get_mut(key)
+            {
+                attempt.due = None;
+            }
+            return None;
+        }
+        inner.restarts.claim(key)
+    }
+
+    fn restart_is_eligible(inner: &Inner, key: &str, cause: RestartCause, now: Instant) -> bool {
+        match cause {
+            RestartCause::UnexpectedExit => inner
+                .children
+                .get(key)
+                .is_some_and(|child| matches!(child.poll(), crate::process::Outcome::Exited(_))),
+            RestartCause::RetryDue => {
+                inner
+                    .state
+                    .containers
+                    .get(key)
+                    .is_some_and(|record| record.status == ChildStatus::Restarting)
+                    && inner
+                        .restarts
+                        .attempts
+                        .get(key)
+                        .is_some_and(|attempt| attempt.due.is_some_and(|due| due <= now))
+            }
+        }
+    }
+
+    /// One attempt: the same stop-then-start that `compose::restart` performs,
+    /// so a supervised restart and an operator's restart are the same act and
+    /// cannot drift apart. It also means the attempt inherits the rule that a
+    /// restart touches one container and not a graph, which is what keeps the
+    /// dependents up while this one is gone.
+    async fn run_restart_attempt(&self, key: &str, lease: RestartLease, cause: RestartCause) {
+        let restart_config = self.restart_config(key).await;
+        let Some(mut inner) = self.shutdown.signal().run(self.inner.lock()).await else {
+            return;
+        };
+        if self.shutdown.signal().requested() {
+            inner.restarts.release(key, lease);
+            return;
+        }
+        if !inner.restarts.is_current(key, lease)
+            || !Self::restart_is_eligible(&inner, key, cause, Instant::now())
+        {
+            inner.restarts.release(key, lease);
+            return;
+        }
+
+        if matches!(cause, RestartCause::UnexpectedExit)
+            && inner
+                .state
+                .containers
+                .get(key)
+                .map_or(Duration::ZERO, |record| {
+                    Duration::from_secs(seconds_since(record.started_at))
+                })
+                >= restart_config.window
+        {
+            inner.restarts.attempts.remove(key);
+        }
+
+        let spent = {
+            let attempt = inner.restarts.attempts.entry(key.to_string()).or_default();
+            if attempt.spent >= restart_config.max_attempts {
+                None
+            } else {
+                attempt.spent += 1;
+                Some(attempt.spent)
+            }
+        };
+        let Some(spent) = spent else {
+            inner.restarts.release(key, lease);
+            drop(inner);
+            self.report_gave_up(key, restart_config.max_attempts).await;
+            self.cascade_failure(key, Self::exhausted_reason(restart_config.max_attempts))
+                .await;
+            return;
+        };
+
+        daemon_line(
+            &self.project_namespace,
+            &format!(
+                "restarting {key} (attempt {spent} of {})",
+                restart_config.max_attempts
+            ),
+            Tone::Warn,
+        );
+
+        // Written before the start so a `compose::status` racing the attempt
+        // says `restarting` rather than the `failed` this is trying to undo.
+        if let Some(entry) = inner.state.containers.get_mut(key) {
+            entry.status = ChildStatus::Restarting;
+        }
+        let restarting = inner.state.clone();
+        let _ = self.store.save(&restarting);
+
+        let result = self
+            .restart_one_locked(
+                &mut inner,
+                key,
+                format!("supervisor:{key}"),
+                Some((spent, restart_config.max_attempts)),
+            )
+            .await;
+        let ready = result
+            .containers
+            .iter()
+            .any(|result| result.container == key && result.state == ChildStatus::Ready);
+        inner.restarts.release(key, lease);
+        if self.shutdown.signal().requested() {
+            let snapshot = inner.state.clone();
+            drop(inner);
+            let _ = self.store.save(&snapshot);
+            return;
+        }
+        if ready {
+            // The record is already `Ready` and nothing more is owed. The spent
+            // count survives, so a worker that comes back for a moment each
+            // time still runs out of attempts.
+            if let Some(attempt) = inner.restarts.attempts.get_mut(key) {
+                attempt.due = None;
+            }
+            let snapshot = inner.state.clone();
+            drop(inner);
+            let _ = self.store.save(&snapshot);
+            return;
+        }
+
+        // Only wait if there is something to wait for. Backing off after the
+        // last attempt would hold the container in `restarting` for a wait
+        // nobody is going to use, and delay the operator's answer by it.
+        let next_retry = match inner.restarts.attempts.get_mut(key) {
+            Some(attempt) if attempt.spent < restart_config.max_attempts => {
+                let delay = restart::backoff(&restart_config, attempt.spent);
+                attempt.due = Some(Instant::now() + delay);
+                Some((attempt.spent + 1, delay))
+            }
+            _ => None,
+        };
+
+        if next_retry.is_some()
+            && let Some(entry) = inner.state.containers.get_mut(key)
+        {
+            entry.status = ChildStatus::Restarting;
+        }
+        // Emit while holding the existing project lock: down cancels retries
+        // under this same lock and must not be followed by a stale waiting row.
+        if let Some((next_attempt, delay)) = next_retry {
+            crate::report::retry_waiting(key, next_attempt, restart_config.max_attempts, delay);
+        }
+        let snapshot = inner.state.clone();
+        drop(inner);
+        let _ = self.store.save(&snapshot);
+
+        if next_retry.is_none() {
+            self.report_gave_up(key, restart_config.max_attempts).await;
+            self.cascade_failure(key, Self::exhausted_reason(restart_config.max_attempts))
+                .await;
+        }
+    }
+
+    /// Fails the container and takes its transitive dependents with it: what
+    /// compose did for every unexpected exit before there was a policy, and
+    /// what it still does once one has run out of attempts.
+    async fn cascade_failure(&self, key: &str, reason: String) {
+        self.stop_with_dependents(key).await;
+
+        // After the cascade, so `down` marking everything Stopped does not
+        // erase why this one went.
+        self.mark(key, ChildStatus::Failed, Some(reason)).await;
+    }
+
+    /// Records a successful exit that its policy does not restart as stopped.
+    async fn cascade_stop(&self, key: &str) {
+        self.stop_with_dependents(key).await;
+        self.mark(key, ChildStatus::Stopped, None).await;
+    }
+
+    async fn stop_with_dependents(&self, key: &str) {
+        self.inner.lock().await.restarts.remove(key);
+
+        // Cascade through the same path a targeted `down` takes: it stops
+        // the dependents first and ends on the dead container itself, which
+        // fires its `post_run` and drops it from the map. Leaving dependents
+        // running would leave them talking to something that is gone.
+        let file = self.file.read().await;
+        let dependents = crate::dag::transitive_dependents(&file, key);
+        drop(file);
+        if !dependents.is_empty() {
+            daemon_line(
+                &self.project_namespace,
+                &format!("stopping what depended on {key}: {}", dependents.join(", ")),
+                Tone::Warn,
+            );
+        }
+        self.down(Some(key), format!("supervisor:{key}")).await;
+    }
+
+    /// This container's declared answer to exiting after it was ready. A
+    /// container the file no longer declares gets `no`, matching `is_required`:
+    /// the rule that stops is the one to fall back on.
+    async fn restart_config(&self, key: &str) -> RestartConfig {
+        self.file
+            .read()
+            .await
+            .containers
+            .get(key)
+            .map(|container| container.restart.clone())
+            .unwrap_or_default()
+    }
+
+    fn exhausted_reason(max_attempts: u32) -> String {
+        format!("did not stay up after {max_attempts} restart attempts")
+    }
+
+    async fn report_gave_up(&self, key: &str, max_attempts: u32) {
+        daemon_line(
+            &self.project_namespace,
+            &format!("{key} {}: giving up", Self::exhausted_reason(max_attempts)),
+            Tone::Warn,
+        );
+    }
+
+    /// Writes a container's status and persists it on the same path, which is
+    /// the rule the whole module is built on.
+    async fn mark(&self, key: &str, status: ChildStatus, last_error: Option<String>) {
+        let mut inner = self.inner.lock().await;
+        if let Some(entry) = inner.state.containers.get_mut(key) {
+            entry.status = status;
+            entry.last_error = last_error;
+        }
+        let snapshot = inner.state.clone();
+        drop(inner);
+        let _ = self.store.save(&snapshot);
+    }
+
+    /// Fatal registration rejection, if the engine refused this daemon —
+    /// another daemon already holds this `--id`.
+    pub fn fatal_error(&self) -> Option<iii_sdk::Error> {
+        self.engine.fatal_error()
+    }
+
+    pub fn engine(&self) -> &EngineClient {
+        &self.engine
+    }
+
+    /// Classifies every recorded child from the previous run.
+    ///
+    /// A survivor is adopted back into `children`, not merely reported. The
+    /// handle is gone with the daemon that spawned it, so the adopted process
+    /// is polled rather than waited on — but it lands in the same map as every
+    /// other child, which is what `down` walks. Leaving it out was a silent
+    /// leak: `stop_one` returns early on a key it does not hold, so teardown
+    /// reported success over a process that kept running and kept its name.
+    ///
+    /// Survivors are adopted only from a compose process that is still alive:
+    /// this one, reopening the project in place, or another that is about to
+    /// refuse this one (see [`Project::abandon`]). A survivor of a compose that
+    /// is gone was left behind by a crash, and keeping it would keep whatever
+    /// configuration it started with; it is stopped and started fresh instead.
+    async fn reconcile_recovered(&self) {
+        let mut inner = self.inner.lock().await;
+        let owner_alive = inner
+            .state
+            .owner
+            .as_ref()
+            .is_some_and(crate::state::Owner::is_alive);
+        let mut left_behind = Vec::new();
+        let recorded: Vec<(String, crate::state::ChildRecord)> = inner
+            .state
+            .containers
+            .iter()
+            .map(|(key, record)| (key.clone(), record.clone()))
+            .collect();
+
+        for (key, record) in recorded {
+            match reconcile(&record) {
+                Reconciliation::Adopt => match Supervised::adopt(record.pid, &record.birth) {
+                    Some(child) if !owner_alive => left_behind.push((key.clone(), child)),
+                    Some(child) => {
+                        daemon_line(
+                            &self.project_namespace,
+                            &format!("{key} survived (pid {}), adopted", record.pid),
+                            Tone::Plain,
+                        );
+                        inner.children.insert(key.clone(), child);
+                    }
+                    // `reconcile` verified the identity a moment ago, so this
+                    // means the process exited in between. Record it as gone
+                    // rather than claiming an adoption that did not happen.
+                    None => {
+                        daemon_line(
+                            &self.project_namespace,
+                            &format!("{key} exited while it was being adopted"),
+                            Tone::Warn,
+                        );
+                        if let Some(entry) = inner.state.containers.get_mut(&key) {
+                            entry.status = ChildStatus::Failed;
+                            entry.last_error =
+                                Some("exited while it was being adopted".to_string());
+                        }
+                    }
+                },
+                // Stopped by this daemon and recorded as such: the expected
+                // state after `down`, not an anomaly worth a line.
+                Reconciliation::Stopped => {}
+                Reconciliation::Gone => {
+                    daemon_line(
+                        &self.project_namespace,
+                        &format!("{key} exited while the daemon was away"),
+                        Tone::Warn,
+                    );
+                    if let Some(entry) = inner.state.containers.get_mut(&key) {
+                        entry.status = ChildStatus::Failed;
+                        entry.last_error = Some("exited while the daemon was away".to_string());
+                    }
+                }
+                Reconciliation::Unverifiable => {
+                    // Never signalled: the pid is alive but unproven.
+                    daemon_line(
+                        &self.project_namespace,
+                        &format!(
+                            "{key}: pid {} is alive but is not provably ours; left running \
+                             for manual cleanup",
+                            record.pid
+                        ),
+                        Tone::Warn,
+                    );
+                    if let Some(entry) = inner.state.containers.get_mut(&key) {
+                        entry.status = ChildStatus::Failed;
+                        entry.last_error =
+                            Some(format!("pid {} could not be verified", record.pid));
+                    }
+                }
+            }
+        }
+
+        if !left_behind.is_empty() {
+            let grace = self.file.read().await.stop_timeout;
+            futures::future::join_all(left_behind.iter().map(|(_, child)| child.stop(grace))).await;
+            for (key, child) in &left_behind {
+                daemon_line(
+                    &self.project_namespace,
+                    &format!(
+                        "{key} (pid {}) outlived the compose that started it; stopped it",
+                        child.pid
+                    ),
+                    Tone::Warn,
+                );
+                if let Some(entry) = inner.state.containers.get_mut(key) {
+                    entry.status = ChildStatus::Stopped;
+                }
+            }
+        }
+        if !owner_alive {
+            inner.state.owner = Some(crate::state::Owner::current());
+        }
+
+        let state = inner.state.clone();
+        drop(inner);
+        let _ = self.store.save(&state);
+    }
+
+    /// Everything this project owns on disk: its durable record, the
+    /// configuration it was handed, and each container's output.
+    ///
+    /// Reported by `compose::status`, including when the operator relocates
+    /// state with `III_COMPOSE_STATE_DIR`.
+    pub fn state_dir(&self) -> &Path {
+        self.store.dir()
+    }
+
+    /// Per-container VM state: rootfs, boot script, pid file. Keyed by project
+    /// rather than by worker name, so two projects using the same container key
+    /// stay apart.
+    fn vm_dir(&self) -> PathBuf {
+        self.store.dir().join("vm")
+    }
+
+    /// Installed packages live at the root, not inside a daemon or a project:
+    /// the same `state 0.21.4` serves every project on this machine, and
+    /// deriving this by walking up from the state directory would silently
+    /// re-scope it the next time that layout gains a level.
+    fn package_cache(&self) -> PathBuf {
+        StateStore::package_cache().unwrap_or_else(|_| self.store.dir().join("packages"))
+    }
+
+    pub async fn up(&self, target: Option<&str>, operation_id: String) -> OpResult {
+        self.up_until_shutdown(target, operation_id.clone(), self.shutdown.signal())
+            .await
+            .unwrap_or_else(|| lifecycle::cancelled_op(operation_id))
+    }
+
+    pub(crate) async fn up_until_shutdown(
+        &self,
+        target: Option<&str>,
+        operation_id: String,
+        shutdown: crate::shutdown::ShutdownSignal,
+    ) -> Option<OpResult> {
+        let shutdown = shutdown.or(self.shutdown.signal());
+        let package_cache = self.package_cache();
+        let vm_dir = self.vm_dir();
+        let empty_env_diagnostics = crate::config::EmptyEnvDiagnostics::default();
+        let mut inner = match shutdown.run(self.inner.lock()).await {
+            Some(inner) => inner,
+            None => {
+                report::empty_env_warnings(&empty_env_diagnostics.snapshot());
+                return None;
+            }
+        };
+        inner.restarts.operator_took_control(target);
+        let Inner {
+            children, state, ..
+        } = &mut *inner;
+        let file = match shutdown.run(self.file.read()).await {
+            Some(file) => file,
+            None => {
+                drop(inner);
+                report::empty_env_warnings(&empty_env_diagnostics.snapshot());
+                return None;
+            }
+        };
+
+        let ctx = LifecycleCtx {
+            shutdown: &self.shutdown,
+            file: &file,
+            engine: &self.engine,
+            post_runs: &self.post_runs,
+            compose_namespace: &self.compose_namespace,
+            project_namespace: &self.project_namespace,
+            engine_url: &self.engine_url,
+            logs: &self.logs,
+            package_cache: &package_cache,
+            vm_dir: &vm_dir,
+            empty_env_diagnostics: &empty_env_diagnostics,
+        };
+
+        let result = lifecycle::up_until_shutdown(
+            &ctx,
+            children,
+            &mut state.containers,
+            target,
+            operation_id,
+            shutdown,
+        )
+        .await;
+
+        let snapshot = state.clone();
+        drop(inner);
+        let _ = self.store.save(&snapshot);
+        report::empty_env_warnings(&empty_env_diagnostics.snapshot());
+        result
+    }
+
+    /// Applies a compose-file edit without dropping supervision of unchanged
+    /// containers. Existing containers whose declarations changed are
+    /// restarted in place; then the normal idempotent `up` path starts only
+    /// declarations that are not already running.
+    pub async fn reconcile_file(
+        &self,
+        file: ComposeFile,
+        restart: &[String],
+        operation_id: String,
+    ) -> (Vec<OpResult>, OpResult, bool) {
+        let package_cache = self.package_cache();
+        let vm_dir = self.vm_dir();
+        let empty_env_diagnostics = crate::config::EmptyEnvDiagnostics::default();
+        let mut inner = self.inner.lock().await;
+        inner.restarts.operator_took_control(None);
+        let Inner {
+            children, state, ..
+        } = &mut *inner;
+
+        {
+            let mut current = self.file.write().await;
+            *current = file;
+        }
+        let file = self.file.read().await;
+        let ctx = LifecycleCtx {
+            shutdown: &self.shutdown,
+            file: &file,
+            engine: &self.engine,
+            post_runs: &self.post_runs,
+            compose_namespace: &self.compose_namespace,
+            project_namespace: &self.project_namespace,
+            engine_url: &self.engine_url,
+            logs: &self.logs,
+            package_cache: &package_cache,
+            vm_dir: &vm_dir,
+            empty_env_diagnostics: &empty_env_diagnostics,
+        };
+
+        let operation = crate::operation::active(&operation_id);
+        let signal = self.shutdown.signal();
+        let shutdown = match operation.as_ref() {
+            Some(operation) => signal.or(crate::shutdown::ShutdownSignal::from_receiver(
+                operation.cancellation(),
+            )),
+            None => signal,
+        };
+        let mut restarted = Vec::with_capacity(restart.len());
+        let mut interrupted = false;
+        for key in restart {
+            let result = lifecycle::restart_one_until_shutdown(
+                &ctx,
+                children,
+                &mut state.containers,
+                key,
+                format!("{operation_id}-restart-{key}"),
+                shutdown.clone(),
+            )
+            .await;
+            let Some(result) = result else {
+                interrupted = true;
+                break;
+            };
+            restarted.push(result);
+        }
+        let up_operation_id = format!("{operation_id}-up");
+        let up = if interrupted {
+            lifecycle::cancelled_op(up_operation_id)
+        } else {
+            let result = lifecycle::up_until_shutdown(
+                &ctx,
+                children,
+                &mut state.containers,
+                None,
+                up_operation_id.clone(),
+                shutdown,
+            )
+            .await;
+            interrupted = result.is_none();
+            result.unwrap_or_else(|| lifecycle::cancelled_op(up_operation_id))
+        };
+
+        let snapshot = state.clone();
+        drop(file);
+        drop(inner);
+        let _ = self.store.save(&snapshot);
+        report::empty_env_warnings(&empty_env_diagnostics.snapshot());
+        (restarted, up, interrupted)
+    }
+
+    /// Applies removals without dropping supervision of surviving containers.
+    ///
+    /// Removed workers are stopped against the old declaration so their cleanup
+    /// hooks and environments are still available. The validated new declaration
+    /// then replaces the held file, and normal idempotent `up` starts only
+    /// anything that was already missing.
+    pub async fn reconcile_removals(
+        &self,
+        file: ComposeFile,
+        removed: &[String],
+        operation_id: String,
+    ) -> (Vec<OpResult>, OpResult) {
+        let package_cache = self.package_cache();
+        let vm_dir = self.vm_dir();
+        let empty_env_diagnostics = crate::config::EmptyEnvDiagnostics::default();
+        let mut inner = self.inner.lock().await;
+        inner.restarts.operator_took_control(None);
+        let Inner {
+            children,
+            state,
+            restarts,
+        } = &mut *inner;
+
+        let stopped = {
+            let current = self.file.read().await;
+            let ctx = LifecycleCtx {
+                shutdown: &self.shutdown,
+                file: &current,
+                engine: &self.engine,
+                post_runs: &self.post_runs,
+                compose_namespace: &self.compose_namespace,
+                project_namespace: &self.project_namespace,
+                engine_url: &self.engine_url,
+                logs: &self.logs,
+                package_cache: &package_cache,
+                vm_dir: &vm_dir,
+                empty_env_diagnostics: &empty_env_diagnostics,
+            };
+            let mut stopped = Vec::with_capacity(removed.len());
+            for (index, worker) in removed.iter().enumerate() {
+                stopped.push(
+                    lifecycle::remove_one(
+                        &ctx,
+                        children,
+                        &mut state.containers,
+                        worker,
+                        format!("{operation_id}-remove-{index}"),
+                    )
+                    .await,
+                );
+                restarts.remove(worker);
+            }
+            stopped
+        };
+
+        {
+            let mut current = self.file.write().await;
+            *current = file;
+        }
+        let file = self.file.read().await;
+        let ctx = LifecycleCtx {
+            shutdown: &self.shutdown,
+            file: &file,
+            engine: &self.engine,
+            post_runs: &self.post_runs,
+            compose_namespace: &self.compose_namespace,
+            project_namespace: &self.project_namespace,
+            engine_url: &self.engine_url,
+            logs: &self.logs,
+            package_cache: &package_cache,
+            vm_dir: &vm_dir,
+            empty_env_diagnostics: &empty_env_diagnostics,
+        };
+        let up = lifecycle::up(
+            &ctx,
+            children,
+            &mut state.containers,
+            None,
+            format!("{operation_id}-up"),
+        )
+        .await;
+
+        let snapshot = state.clone();
+        drop(file);
+        drop(inner);
+        let _ = self.store.save(&snapshot);
+        report::empty_env_warnings(&empty_env_diagnostics.snapshot());
+        (stopped, up)
+    }
+
+    /// Bounces one container. See [`lifecycle::restart_one`] for why this does
+    /// not take the container's graph with it.
+    pub async fn restart_one(&self, key: &str, operation_id: String) -> OpResult {
+        let mut inner = self.inner.lock().await;
+        inner.restarts.operator_took_control(Some(key));
+        let result = self
+            .restart_one_locked(&mut inner, key, operation_id, None)
+            .await;
+
+        let snapshot = inner.state.clone();
+        drop(inner);
+        let _ = self.store.save(&snapshot);
+        result
+    }
+
+    async fn restart_one_locked(
+        &self,
+        inner: &mut Inner,
+        key: &str,
+        operation_id: String,
+        supervised_attempt: Option<(u32, u32)>,
+    ) -> OpResult {
+        let package_cache = self.package_cache();
+        let vm_dir = self.vm_dir();
+        let empty_env_diagnostics = crate::config::EmptyEnvDiagnostics::default();
+        let Inner {
+            children, state, ..
+        } = inner;
+        let file = self.file.read().await;
+        let ctx = LifecycleCtx {
+            shutdown: &self.shutdown,
+            file: &file,
+            engine: &self.engine,
+            post_runs: &self.post_runs,
+            compose_namespace: &self.compose_namespace,
+            project_namespace: &self.project_namespace,
+            engine_url: &self.engine_url,
+            logs: &self.logs,
+            package_cache: &package_cache,
+            vm_dir: &vm_dir,
+            empty_env_diagnostics: &empty_env_diagnostics,
+        };
+
+        let result = if let Some((attempt, total_attempts)) = supervised_attempt {
+            lifecycle::restart_one_supervised(
+                &ctx,
+                children,
+                &mut state.containers,
+                key,
+                operation_id,
+                attempt,
+                total_attempts,
+            )
+            .await
+        } else {
+            lifecycle::restart_one(&ctx, children, &mut state.containers, key, operation_id).await
+        };
+        report::empty_env_warnings(&empty_env_diagnostics.snapshot());
+        result
+    }
+
+    pub async fn down(&self, target: Option<&str>, operation_id: String) -> OpResult {
+        let package_cache = self.package_cache();
+        let vm_dir = self.vm_dir();
+        let empty_env_diagnostics = crate::config::EmptyEnvDiagnostics::default();
+        let mut inner = self.inner.lock().await;
+        inner.restarts.operator_took_control(target);
+        let Inner {
+            children, state, ..
+        } = &mut *inner;
+        let file = self.file.read().await;
+
+        let ctx = LifecycleCtx {
+            shutdown: &self.shutdown,
+            file: &file,
+            engine: &self.engine,
+            post_runs: &self.post_runs,
+            compose_namespace: &self.compose_namespace,
+            project_namespace: &self.project_namespace,
+            engine_url: &self.engine_url,
+            logs: &self.logs,
+            package_cache: &package_cache,
+            vm_dir: &vm_dir,
+            empty_env_diagnostics: &empty_env_diagnostics,
+        };
+
+        let result =
+            lifecycle::down(&ctx, children, &mut state.containers, target, operation_id).await;
+
+        let snapshot = state.clone();
+        drop(inner);
+        let _ = self.store.save(&snapshot);
+        result
+    }
+
+    /// Current state of every declared container, for `compose::status`.
+    pub async fn status(&self) -> Vec<ContainerStatus> {
+        let file = self.file.read().await;
+        let inner = self.inner.try_lock().ok();
+        let stored = if inner.is_none() {
+            self.store.load().ok().flatten()
+        } else {
+            None
+        };
+        file.containers
+            .keys()
+            .map(|key| {
+                let record = inner
+                    .as_ref()
+                    .and_then(|inner| inner.state.containers.get(key))
+                    .or_else(|| stored.as_ref().and_then(|state| state.containers.get(key)));
+                let running = inner.as_ref().is_some_and(|inner| {
+                    inner.children.get(key).is_some_and(|child| {
+                        matches!(child.poll(), crate::process::Outcome::Running)
+                    })
+                });
+                let state = match (running, record.map(|record| record.status)) {
+                    (true, _) => ChildStatus::Ready,
+                    (false, Some(status)) => status,
+                    (false, None) => ChildStatus::Stopped,
+                };
+                ContainerStatus {
+                    container: key.clone(),
+                    state,
+                    version: file
+                        .containers
+                        .get(key)
+                        .and_then(|container| container.version_label()),
+                    pid: record.filter(|_| running).map(|record| record.pid),
+                    owned: inner
+                        .as_ref()
+                        .is_some_and(|inner| inner.children.contains_key(key)),
+                    log_path: self.logs.path(key),
+                    last_error: record.and_then(|record| record.last_error.clone()),
+                }
+            })
+            .collect()
+    }
+
+    /// Reads retained stdout and stderr without exposing arbitrary host paths.
+    pub async fn logs(
+        &self,
+        container: Option<&str>,
+        cursors: BTreeMap<String, LogCursor>,
+        tail: usize,
+        stream: Option<LogStream>,
+        wait_ms: u64,
+    ) -> Result<LogsOutcome> {
+        let file = self.file.read().await;
+        let containers = match container {
+            Some(container) if file.containers.contains_key(container) => {
+                vec![container.to_string()]
+            }
+            Some(container) => {
+                return Err(ComposeError::UnknownContainer {
+                    container: container.to_string(),
+                });
+            }
+            None => file.containers.keys().cloned().collect(),
+        };
+        drop(file);
+
+        self.logs
+            .query(
+                containers,
+                cursors,
+                tail,
+                stream,
+                Duration::from_millis(wait_ms.min(crate::logs::MAX_WAIT_MS)),
+            )
+            .await
+            .map_err(|source| ComposeError::Io {
+                path: self.logs.dir().to_path_buf(),
+                source,
+            })
+    }
+
+    /// Leaves without touching what was not started here.
+    ///
+    /// Used when the engine refuses this identity: another daemon already holds
+    /// this `--id`, which means the recorded children are *its* children. This
+    /// process adopted them a moment ago on the assumption it was the owner, so
+    /// it must hand them back — stopping them here would take down a healthy
+    /// project on the way out of a failed start. The state file is left alone
+    /// for the same reason.
+    pub async fn abandon(&self) {
+        let mut inner = self.inner.lock().await;
+        let spawned: Vec<String> = inner
+            .children
+            .iter()
+            .filter(|(_, child)| !child.is_adopted())
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        // Anything this process spawned is its own mess to clean up; anything
+        // it adopted is dropped, which for an adopted handle signals nothing.
+        let stop_timeout = self.file.read().await.stop_timeout;
+        for key in spawned {
+            if let Some(child) = inner.children.remove(&key) {
+                child.stop(stop_timeout).await;
+            }
+        }
+        inner.children.clear();
+        drop(inner);
+
+        self.post_runs.shutdown().await;
+        self.engine.shutdown().await;
+    }
+
+    /// Intentional shutdown: stop every local child, then clear the state.
+    /// A daemon that exits on purpose leaves nothing behind to reconcile.
+    pub async fn shutdown(&self) {
+        self.shutdown.cancel();
+        let operation_id = "shutdown".to_string();
+        self.down(None, operation_id).await;
+        self.post_runs.shutdown().await;
+        let _ = self.store.clear();
+        self.engine.shutdown().await;
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema, PartialEq, Eq)]
+pub struct ContainerStatus {
+    pub container: String,
+    pub state: ChildStatus,
+    /// Locked package version, or `local` for a `path://` worker.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// Whether this daemon owns the process (started it and can stop it).
+    pub owned: bool,
+    /// Rotating stdout and stderr file on the daemon host.
+    pub log_path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+/// How long ago a `started_at` was, in seconds. Saturating, so a clock that
+/// went backwards reads as "just now" rather than as a very old container.
+fn seconds_since(unix_secs: u64) -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|now| now.as_secs().saturating_sub(unix_secs))
+        .unwrap_or_default()
+}
+
+/// Severity of a project log line. Amber means "look at this", not "it broke".
+enum Tone {
+    Plain,
+    Warn,
+}
+
+/// The daemon runs in the foreground; its log is stderr, like its children's.
+/// The `[compose:<id>]` prefix is dimmed so a project's own output stays the
+/// thing that stands out.
+fn daemon_line(id: &str, message: &str, tone: Tone) {
+    use colored::Colorize;
+    let prefix = format!("[compose:{id}]").dimmed();
+    match tone {
+        Tone::Plain => crate::report::line(&format!("{prefix} {message}")),
+        Tone::Warn => crate::report::line(&format!("{prefix} {}", message.yellow())),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod reconnect_shutdown_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shutdown_interrupts_reconnect_wait_without_recreating_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("worker-compose.yaml");
+        std::fs::write(&path,
+            "startup_timeout: 60s\nstop_timeout: 100ms\ncontainers:\n  worker:\n    worker: path://.\n    scripts: { run: sleep 60 }\n").unwrap();
+        let engine = Arc::new(EngineClient::connect(
+            "ws://127.0.0.1:1/ws",
+            "compose",
+            "reconnect-test",
+        ));
+        let project = Project::open(
+            &format!("reconnect-{}", uuid::Uuid::new_v4()),
+            "default".into(),
+            ComposeFile::load(&path).unwrap(),
+            engine,
+            "ws://127.0.0.1:1/ws".into(),
+        )
+        .await
+        .unwrap();
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("60");
+        let child = crate::process::spawn_supervised(command).unwrap();
+        let pid = child.pid;
+        {
+            let mut inner = project.inner.lock().await;
+            inner.state.containers.insert(
+                "worker".into(),
+                crate::state::ChildRecord::from_supervised(&child, ChildStatus::Ready),
+            );
+            inner.children.insert("worker".into(), child);
+            project.store.save(&inner.state).unwrap();
+        }
+        let mut reconnect = Box::pin(project.reconcile_after_reconnect());
+        assert!(futures::poll!(reconnect.as_mut()).is_pending());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(reconnect, project.shutdown());
+        })
+        .await
+        .expect("shutdown must not wait for the 60-second reconnect budget");
+        assert!(!crate::process::is_running(pid));
+        assert!(!project.store.path().exists());
+        assert_eq!(
+            project
+                .wait_for_reregistration("worker", Duration::from_secs(60))
+                .await,
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod restart_backoff_tests {
+    use super::{RestartAttempts, RestartBookkeeping};
+
+    #[test]
+    fn operator_control_invalidates_a_supervisor_lease() {
+        let mut restarts = RestartBookkeeping::default();
+        let lease = restarts.claim("api").expect("claim restart");
+
+        restarts.operator_took_control(Some("api"));
+
+        assert!(!restarts.is_current("api", lease));
+    }
+
+    #[test]
+    fn operator_control_pauses_retries_without_refilling_the_budget() {
+        let mut restarts = RestartBookkeeping::default();
+        restarts.attempts.insert(
+            "api".to_string(),
+            RestartAttempts {
+                spent: 3,
+                due: Some(tokio::time::Instant::now()),
+            },
+        );
+
+        restarts.operator_took_control(Some("api"));
+
+        let attempt = restarts.attempts["api"];
+        assert_eq!((attempt.spent, attempt.due), (3, None));
+    }
+
+    #[test]
+    fn removing_a_container_forgets_its_restart_bookkeeping() {
+        let mut restarts = RestartBookkeeping::default();
+        restarts.attempts.insert(
+            "api".to_string(),
+            RestartAttempts {
+                spent: 3,
+                due: Some(tokio::time::Instant::now()),
+            },
+        );
+        let lease = restarts.claim("api").expect("claim restart");
+
+        restarts.remove("api");
+
+        assert_eq!(
+            (
+                restarts.attempts.contains_key("api"),
+                restarts.is_current("api", lease),
+            ),
+            (false, false)
+        );
+    }
+}

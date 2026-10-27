@@ -1,0 +1,463 @@
+// Copyright Motia LLC and/or licensed to Motia LLC under one or more
+// contributor license agreements. Licensed under the Elastic License 2.0;
+// you may not use this file except in compliance with the Elastic License 2.0.
+// This software is patent protected. We welcome discussions - reach out at team@iii.dev
+// See LICENSE and PATENTS files for details.
+
+use std::path::PathBuf;
+
+use super::error::RegistryError;
+use super::registry::BinarySpec;
+
+/// Returns the current platform's target triple for asset lookup.
+///
+/// Linux x86_64 prefers musl for maximum portability.
+/// Linux aarch64 uses gnu (no musl builds available).
+pub fn current_target() -> &'static str {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    return "aarch64-apple-darwin";
+
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    return "x86_64-apple-darwin";
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    return "x86_64-unknown-linux-musl";
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    return "aarch64-unknown-linux-gnu";
+
+    #[cfg(all(target_os = "linux", target_arch = "arm"))]
+    return "armv7-unknown-linux-gnueabihf";
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    return "x86_64-pc-windows-msvc";
+
+    #[cfg(all(target_os = "windows", target_arch = "x86"))]
+    return "i686-pc-windows-msvc";
+
+    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+    return "aarch64-pc-windows-msvc";
+
+    #[cfg(not(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "macos", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "aarch64"),
+        all(target_os = "linux", target_arch = "arm"),
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "windows", target_arch = "x86"),
+        all(target_os = "windows", target_arch = "aarch64"),
+    )))]
+    compile_error!("unsupported target platform for iii")
+}
+
+/// The worker must match the host libc: unlike the static engine it uses
+/// dlopen for libkrunfw. In particular a musl-built engine can run on glibc.
+///
+/// `iii-init` is a Linux guest binary macOS hosts download and update; this
+/// mirrors install.sh's `init_target_for_host`.
+pub fn binary_target(binary_name: &str) -> &'static str {
+    if binary_name == "iii-worker" && cfg!(target_os = "linux") {
+        let arch = std::env::consts::ARCH;
+        let has_musl_loader = std::path::Path::new(&format!("/lib/ld-musl-{arch}.so.1")).exists();
+        return linux_worker_target(arch, has_musl_loader).unwrap_or_else(current_target);
+    }
+    if binary_name == "iii-init"
+        && let Some(target) = init_guest_target(std::env::consts::OS, std::env::consts::ARCH)
+    {
+        return target;
+    }
+    current_target()
+}
+
+fn linux_worker_target(arch: &str, has_musl_loader: bool) -> Option<&'static str> {
+    match (arch, has_musl_loader) {
+        ("x86_64", true) => Some("x86_64-unknown-linux-musl"),
+        ("x86_64", false) => Some("x86_64-unknown-linux-gnu"),
+        ("aarch64", true) => Some("aarch64-unknown-linux-musl"),
+        ("aarch64", false) => Some("aarch64-unknown-linux-gnu"),
+        _ => None,
+    }
+}
+
+fn init_guest_target(os: &str, arch: &str) -> Option<&'static str> {
+    match (os, arch) {
+        ("linux" | "macos", "x86_64") => Some("x86_64-unknown-linux-musl"),
+        ("linux" | "macos", "aarch64") => Some("aarch64-unknown-linux-gnu"),
+        _ => None,
+    }
+}
+
+/// Returns the archive extension for the current platform.
+pub fn archive_extension() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "zip"
+    } else {
+        "tar.gz"
+    }
+}
+
+/// Constructs the expected asset filename for a binary on the current platform.
+/// e.g., "iii-cloud-aarch64-apple-darwin.tar.gz"
+pub fn asset_name(binary_name: &str) -> String {
+    format!(
+        "{}-{}.{}",
+        binary_name,
+        binary_target(binary_name),
+        archive_extension()
+    )
+}
+
+/// Returns the platform-appropriate data directory for iii.
+///
+/// - Linux: $XDG_DATA_HOME/iii/ (fallback ~/.local/share/iii/)
+/// - macOS: ~/Library/Application Support/iii/
+/// - Windows: %APPDATA%\iii\
+///
+/// For backward compatibility, if the old `iii-cli` directory exists and the
+/// new `iii` directory does not, the old path is returned so existing state
+/// is preserved until the user migrates.
+pub fn data_dir() -> PathBuf {
+    data_dir_opt().unwrap_or_else(|| {
+        iii::bin_resolve::resolve_iii_dir(PathBuf::from(".").join(".local").join("share"))
+    })
+}
+
+/// Option-returning variant of [`data_dir`]: `None` when neither the platform
+/// data directory nor the home directory can be resolved. Unlike [`data_dir`],
+/// this never falls back to the current directory, so it is safe for building
+/// the managed bin path (see [`bin_dir`]).
+fn data_dir_opt() -> Option<PathBuf> {
+    let base =
+        dirs::data_dir().or_else(|| dirs::home_dir().map(|h| h.join(".local").join("share")))?;
+    Some(iii::bin_resolve::resolve_iii_dir(base))
+}
+
+/// Returns the directory where binaries are stored.
+///
+/// On macOS/Linux: ~/.local/bin/ (matches install.sh convention).
+/// On Windows: %APPDATA%\iii\bin\ (legacy %APPDATA%\iii-cli\bin\ during
+/// migration).
+///
+/// Delegates to [`iii::bin_resolve::managed_bin_dir`] so the install/update
+/// lifecycle and the execution resolver (`find_existing_binary`) can never
+/// disagree on where the managed copy lives.
+///
+/// Returns `None` when the home / data directory can't be resolved. We never
+/// fall back to the current directory: installing a managed `iii-*` binary
+/// into a CWD-relative path would let it be picked up and executed as a
+/// trusted helper from wherever the process happened to run.
+pub fn bin_dir() -> Option<PathBuf> {
+    iii::bin_resolve::managed_bin_dir()
+}
+
+/// Returns the path where a specific binary should be stored.
+///
+/// `None` when the managed bin dir can't be resolved (see [`bin_dir`]).
+pub fn binary_path(binary_name: &str) -> Option<PathBuf> {
+    let name = if cfg!(target_os = "windows") {
+        format!("{}.exe", binary_name)
+    } else {
+        binary_name.to_string()
+    };
+    Some(bin_dir()?.join(name))
+}
+
+/// Returns the path to the state.json file.
+pub fn state_file_path() -> PathBuf {
+    data_dir().join("state.json")
+}
+
+/// Checks whether the current platform is supported by the given binary.
+/// Returns Ok(()) if supported, or an error with a helpful message if not.
+pub fn check_platform_support(spec: &BinarySpec) -> Result<(), RegistryError> {
+    let target = binary_target(spec.name);
+    if spec.supported_targets.contains(&target) {
+        Ok(())
+    } else {
+        let supported = spec
+            .supported_targets
+            .iter()
+            .map(|t| format_target_human(t))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(RegistryError::UnsupportedPlatform {
+            binary: spec.name.to_string(),
+            platform: format_target_human(target),
+            supported,
+        })
+    }
+}
+
+/// Formats a target triple into a human-readable string.
+fn format_target_human(target: &str) -> String {
+    match target {
+        "aarch64-apple-darwin" => "macOS (Apple Silicon)".to_string(),
+        "x86_64-apple-darwin" => "macOS (Intel)".to_string(),
+        "x86_64-unknown-linux-gnu" => "Linux x86_64 (glibc)".to_string(),
+        "x86_64-unknown-linux-musl" => "Linux x86_64 (musl)".to_string(),
+        "aarch64-unknown-linux-gnu" => "Linux ARM64 (glibc)".to_string(),
+        "aarch64-unknown-linux-musl" => "Linux ARM64 (musl)".to_string(),
+        "armv7-unknown-linux-gnueabihf" => "Linux ARMv7".to_string(),
+        "x86_64-pc-windows-msvc" => "Windows x86_64".to_string(),
+        "i686-pc-windows-msvc" => "Windows x86".to_string(),
+        "aarch64-pc-windows-msvc" => "Windows ARM64".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Resolve an existing `iii-*` binary to EXECUTE, PATH-first.
+///
+/// Checks in order:
+/// 1. System PATH (a dev/override build earlier on PATH wins)
+/// 2. Our managed bin dir (~/.local/bin/ on macOS/Linux, data_dir/bin on Windows)
+///
+/// Returns the path to the binary if found, or None.
+///
+/// This is the single shared *execution* resolver: the CLI dispatcher
+/// (`mod.rs`) and the engine's known-external spawner (`workers::external`)
+/// both route through it so they can never disagree on
+/// which copy runs. The install/update lifecycle (`update.rs`) deliberately
+/// probes `binary_path()` — the managed `~/.local/bin` copy — first, because
+/// it manages that specific file regardless of what's on PATH.
+pub fn find_existing_binary(binary_name: &str) -> Option<PathBuf> {
+    iii::bin_resolve::find_existing_binary(binary_name)
+}
+
+/// Constructs the expected checksum asset filename for a binary.
+/// e.g., "iii-cloud-aarch64-apple-darwin.sha256"
+/// Note: taiki-e produces checksums as separate assets WITHOUT the archive extension.
+pub fn checksum_asset_name(binary_name: &str) -> String {
+    format!("{}-{}.sha256", binary_name, binary_target(binary_name))
+}
+
+/// Ensures the storage directories exist.
+///
+/// Creates both bin_dir() (~/.local/bin/) and data_dir() (for state.json).
+pub fn ensure_dirs() -> Result<(), super::error::StorageError> {
+    let bin = bin_dir().ok_or(super::error::StorageError::NoBinDir)?;
+    if !bin.exists() {
+        std::fs::create_dir_all(&bin).map_err(|e| super::error::StorageError::CreateDir {
+            path: bin.display().to_string(),
+            source: e,
+        })?;
+    }
+    let data = data_dir();
+    if !data.exists() {
+        std::fs::create_dir_all(&data).map_err(|e| super::error::StorageError::CreateDir {
+            path: data.display().to_string(),
+            source: e,
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_targets_match_host_libc_on_both_linux_architectures() {
+        for (arch, musl, expected) in [
+            ("x86_64", true, "x86_64-unknown-linux-musl"),
+            ("x86_64", false, "x86_64-unknown-linux-gnu"),
+            ("aarch64", true, "aarch64-unknown-linux-musl"),
+            ("aarch64", false, "aarch64-unknown-linux-gnu"),
+        ] {
+            assert_eq!(linux_worker_target(arch, musl), Some(expected));
+        }
+        assert_eq!(linux_worker_target("arm", true), None);
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn worker_asset_and_checksum_use_the_same_supported_target() {
+        let spec = super::super::registry::resolve_binary_for_update("iii-worker").unwrap();
+        let target = binary_target(spec.name);
+        assert!(spec.supported_targets.contains(&target));
+        assert_eq!(
+            asset_name(spec.name),
+            format!("iii-worker-{target}.{}", archive_extension())
+        );
+        assert_eq!(
+            checksum_asset_name(spec.name),
+            format!("iii-worker-{target}.sha256")
+        );
+    }
+
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
+    #[test]
+    fn init_asset_and_checksum_use_a_supported_linux_guest_target() {
+        let spec = super::super::registry::resolve_binary_for_update("iii-init").unwrap();
+        check_platform_support(spec).unwrap();
+        let target = binary_target(spec.name);
+        assert!(spec.supported_targets.contains(&target));
+        assert_eq!(
+            asset_name(spec.name),
+            format!("iii-init-{target}.{}", archive_extension())
+        );
+        assert_eq!(
+            checksum_asset_name(spec.name),
+            format!("iii-init-{target}.sha256")
+        );
+    }
+
+    #[test]
+    fn init_targets_on_both_macos_architectures_match_the_installer_mapping() {
+        for (os, arch, expected) in [
+            ("macos", "x86_64", "x86_64-unknown-linux-musl"),
+            ("macos", "aarch64", "aarch64-unknown-linux-gnu"),
+            ("linux", "x86_64", "x86_64-unknown-linux-musl"),
+            ("linux", "aarch64", "aarch64-unknown-linux-gnu"),
+        ] {
+            assert_eq!(init_guest_target(os, arch), Some(expected));
+        }
+        assert_eq!(init_guest_target("windows", "x86_64"), None);
+    }
+
+    #[test]
+    fn other_binaries_keep_the_portable_engine_target() {
+        assert_eq!(binary_target("iii"), current_target());
+        assert_eq!(binary_target("iii-cloud"), current_target());
+    }
+
+    #[test]
+    fn test_current_target_not_empty() {
+        assert!(!current_target().is_empty());
+    }
+
+    #[test]
+    fn test_archive_extension() {
+        let ext = archive_extension();
+        assert!(ext == "tar.gz" || ext == "zip");
+    }
+
+    #[test]
+    fn test_asset_name_format() {
+        let name = asset_name("iii-cloud");
+        assert!(name.starts_with("iii-cloud-"));
+        assert!(name.ends_with(archive_extension()));
+    }
+
+    #[test]
+    fn test_data_dir_not_empty() {
+        assert!(!data_dir().as_os_str().is_empty());
+    }
+
+    /// `ensure_dirs()` creates the managed bin dir (and data dir) under a fresh
+    /// HOME. Hermetic: relocates HOME to a tempdir so nothing touches the real
+    /// filesystem. `#[serial]` because it mutates the process env.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    #[serial_test::serial]
+    fn test_ensure_dirs_creates_bin_dir() {
+        let home = tempfile::tempdir().unwrap();
+        let orig_home = std::env::var_os("HOME");
+        let orig_xdg = std::env::var_os("XDG_DATA_HOME");
+        // SAFETY: #[serial] guarantees no parallel env mutation. Clear
+        // XDG_DATA_HOME so data_dir() falls back under the tempdir HOME.
+        unsafe {
+            std::env::set_var("HOME", home.path());
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+
+        let result = ensure_dirs();
+        let bin = bin_dir();
+        let data = data_dir();
+
+        unsafe {
+            match orig_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match orig_xdg {
+                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+        }
+
+        assert!(result.is_ok(), "ensure_dirs failed: {:?}", result.err());
+        let bin = bin.unwrap();
+        assert!(bin.starts_with(home.path()), "bin dir escaped tempdir HOME");
+        assert!(bin.is_dir(), "bin dir was not created: {}", bin.display());
+        assert!(
+            data.is_dir(),
+            "data dir was not created: {}",
+            data.display()
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_data_dir_opt_agrees_with_data_dir() {
+        // Wherever the platform dirs resolve, the option-returning variant
+        // must agree with data_dir(). When they don't resolve it is None,
+        // which bin_dir()/binary_path() propagate instead of installing
+        // under a CWD-relative path.
+        assert_eq!(data_dir_opt(), Some(data_dir()));
+    }
+
+    #[test]
+    fn test_resolve_iii_dir_never_bare_cwd() {
+        let d = iii::bin_resolve::resolve_iii_dir(PathBuf::from(".").join(".local").join("share"));
+        // Even the last-resort data_dir() fallback stays under .local/share,
+        // and the bin path never routes through it (data_dir_opt is None).
+        assert!(d.ends_with(PathBuf::from(".local").join("share").join("iii")));
+    }
+
+    #[test]
+    fn test_binary_path_format() {
+        let path = binary_path("iii-cloud").unwrap();
+        assert!(path.to_str().unwrap().contains("iii-cloud"));
+    }
+
+    #[test]
+    fn test_platform_support_check() {
+        use crate::cli::registry::REGISTRY;
+        // iii-cloud supports all major platforms
+        let cloud = REGISTRY
+            .iter()
+            .find(|spec| spec.name == "iii-cloud")
+            .expect("iii-cloud is a managed binary");
+        let result = check_platform_support(cloud);
+        assert!(result.is_ok());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_bin_dir_is_local_bin() {
+        let bd = bin_dir().unwrap();
+        let bd_str = bd.to_str().unwrap();
+        assert!(
+            bd_str.ends_with(".local/bin"),
+            "bin_dir() should end with .local/bin on Unix, got: {}",
+            bd_str
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_bin_dir_separate_from_data_dir() {
+        let bd = bin_dir().unwrap();
+        let dd = data_dir();
+        assert!(
+            !bd.starts_with(&dd),
+            "bin_dir() should NOT be a subdirectory of data_dir() on Unix"
+        );
+    }
+}

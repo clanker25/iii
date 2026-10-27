@@ -1,0 +1,61 @@
+namespace: default
+engine:
+  url: ws://127.0.0.1:49199
+  workers:
+    configuration:
+      adapter:
+        name: fs
+        config:
+          directory: ${III_SDK_CONFIGURATION_DIR}
+    iii-worker-manager:
+      port: 49199
+    "iii-worker-manager#rbac":
+      host: 0.0.0.0
+      port: 49135
+      middleware_function_id: test::rbac-worker::middleware
+      rbac:
+        auth_function_id: test::rbac-worker::auth
+        on_function_registration_function_id: test::rbac-worker::on-function-reg
+        on_trigger_registration_function_id: test::rbac-worker::on-trigger-reg
+        on_trigger_type_registration_function_id: test::rbac-worker::on-trigger-type-reg
+        expose_functions:
+          - match("test::ew::public::*")
+          - match("engine::functions::list")
+          - metadata:
+              ew_public: false
+    iii-stream:
+      port: ${STREAMS_PORT:3112}
+      host: 1.0.0.0
+      adapter:
+        name: kv
+        config:
+          store_method: file_based
+          file_path: ./data/stream_store
+    iii-http-functions:
+      security:
+        url_allowlist:
+          - localhost
+          - 127.0.0.1
+        block_private_ips: false
+        require_https: false
+containers:
+  state:
+    worker: package://api.workers.iii.dev/state
+    version: "0.22.2"
+    config_name: state
+  http:
+    worker: package://api.workers.iii.dev/http
+    version: "0.21.3"
+    config_name: http
+  pubsub:
+    worker: package://api.workers.iii.dev/pubsub
+    version: "0.21.2"
+    config_name: pubsub
+  cron:
+    worker: package://api.workers.iii.dev/cron
+    version: "0.21.9"
+    config_name: cron
+  queue:
+    worker: package://api.workers.iii.dev/queue
+    version: "0.21.5"
+    config_name: queue

@@ -1,0 +1,3 @@
+# iii engine configuration
+# Docs: https://iii.dev/docs/how-to/configure-engine
+workers: []

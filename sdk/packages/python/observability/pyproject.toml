@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "iii-observability"
+version = "0.25.0"
+description = "Deprecated shim: re-exports iii_helpers.observability. Import from iii-helpers instead."
+authors = [{ name = "III" }]
+license = { text = "Apache-2.0" }
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["iii", "observability", "logger"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "iii-helpers==0.25.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/iii-hq/iii"
+Repository = "https://github.com/iii-hq/iii"
+
+[tool.uv.sources]
+iii-helpers = { path = "../helpers", editable = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/iii_observability"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true

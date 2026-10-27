@@ -1,0 +1,1565 @@
+// Copyright Motia LLC and/or licensed to Motia LLC under one or more
+// contributor license agreements. Licensed under the Elastic License 2.0;
+// you may not use this file except in compliance with the Elastic License 2.0.
+// This software is patent protected. We welcome discussions - reach out at team@iii.dev
+// See LICENSE and PATENTS files for details.
+
+use std::{
+    collections::HashMap,
+    ffi::OsStr,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use indexmap::IndexMap;
+
+use iii_helpers::stream::{StreamDeleteResult, StreamSetResult, StreamUpdateResult, UpdateOp};
+use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::sync::RwLock;
+
+const KEY_FILE_EXTENSION: &str = "bin";
+
+// Immutable entries let persistence retain a consistent view without copying
+// each JSON tree. Public operations still return owned Values in insertion order.
+type Scope = IndexMap<String, Arc<Value>>;
+type Store = Arc<RwLock<HashMap<String, Scope>>>;
+
+/// Default persistence flush cadence (ms) for file-backed stores. Used when no
+/// `save_interval_ms` is configured at construction.
+const DEFAULT_SAVE_INTERVAL_MS: u64 = 6000;
+
+/// Floor for the save cadence (ms). A value below this — e.g. a hand-edited
+/// adapter config that bypasses the configuration schema's `minimum: 100` — is
+/// clamped up so it can never drive the save loop into a tight busy-loop.
+const MIN_SAVE_INTERVAL_MS: u64 = 100;
+
+#[derive(Archive, RkyvSerialize, RkyvDeserialize)]
+struct KeyStorage(String);
+
+#[derive(Clone, Copy, Debug)]
+enum DirtyOp {
+    Upsert,
+    Delete,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct KvLockEntry {
+    owner: String,
+    expires_at_ms: i64,
+}
+
+impl KvLockEntry {
+    fn is_expired(&self, now_ms: i64) -> bool {
+        self.expires_at_ms <= now_ms
+    }
+}
+
+fn encode_index(index: &str) -> String {
+    let mut out = String::with_capacity(index.len());
+    for byte in index.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    out
+}
+
+fn decode_index(encoded: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(encoded.len());
+    let mut iter = encoded.as_bytes().iter().copied();
+    while let Some(byte) = iter.next() {
+        if byte == b'%' {
+            let high = iter.next()?;
+            let low = iter.next()?;
+            let high = (high as char).to_digit(16)? as u8;
+            let low = (low as char).to_digit(16)? as u8;
+            bytes.push((high << 4) | low);
+        } else {
+            bytes.push(byte);
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn index_file_name(index: &str) -> String {
+    format!("{}.{}", encode_index(index), KEY_FILE_EXTENSION)
+}
+
+fn index_from_path(path: &Path) -> Option<String> {
+    let file_name = path.file_name()?.to_string_lossy();
+    let file_name = file_name.strip_suffix(&format!(".{}", KEY_FILE_EXTENSION))?;
+    decode_index(file_name)
+}
+
+fn load_store_from_dir(dir: &Path) -> HashMap<String, Scope> {
+    let mut store = HashMap::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::info!(error = ?err, "storage directory not found, starting empty");
+            return store;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path.extension() != Some(OsStr::new(KEY_FILE_EXTENSION)) {
+            continue;
+        }
+        let index = match index_from_path(&path) {
+            Some(index) => index,
+            None => {
+                tracing::warn!(path = %path.display(), "invalid index filename, skipping");
+                continue;
+            }
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::warn!(error = ?err, path = %path.display(), "failed to read index file");
+                continue;
+            }
+        };
+        let storage = match rkyv::access::<ArchivedKeyStorage, rkyv::rancor::Error>(&bytes) {
+            Ok(storage) => storage,
+            Err(err) => {
+                tracing::warn!(error = ?err, path = %path.display(), "failed to parse index file");
+                continue;
+            }
+        };
+        let value = match serde_json::from_str::<Scope>(storage.0.as_str()) {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(error = ?err, path = %path.display(), "failed to decode index value");
+                continue;
+            }
+        };
+        store.insert(index, value);
+    }
+
+    store
+}
+
+// The blocking flush owns all disk/CPU work. Keep the existing archive format
+// and temporary-file/rename contract, without an additional full binary buffer.
+fn persist_index_to_disk(dir: &Path, index: &str, value: &Scope) -> anyhow::Result<()> {
+    use std::io::Write;
+    std::fs::create_dir_all(dir)?;
+    let file_name = index_file_name(index);
+    let path = dir.join(&file_name);
+    let temp_path = dir.join(format!("{}.tmp", file_name));
+    let json = serde_json::to_string(value)?;
+    let file = std::fs::File::create(&temp_path)?;
+    let writer = rkyv::ser::writer::IoWriter::new(std::io::BufWriter::new(file));
+    let writer = rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(&KeyStorage(json), writer)?;
+    let mut buffered = writer.into_inner();
+    // Propagate write failures before rename (BufWriter::drop would hide them).
+    buffered.flush()?;
+    drop(buffered);
+    std::fs::rename(&temp_path, &path)?;
+    Ok(())
+}
+
+fn delete_index_from_disk(dir: &Path, index: &str) -> anyhow::Result<()> {
+    let path = dir.join(index_file_name(index));
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn requeue(dirty: &Arc<RwLock<HashMap<String, DirtyOp>>>, index: String, op: DirtyOp) {
+    // A failed older write must never overwrite a newer mutation's intent.
+    dirty.blocking_write().entry(index).or_insert(op);
+}
+
+pub struct BuiltinKvStore {
+    store: Store,
+    file_store_dir: Option<PathBuf>,
+    dirty: Arc<RwLock<HashMap<String, DirtyOp>>>,
+    /// Stop signal for the current save-loop instance. Replaced (and the prior
+    /// loop signalled to exit) when `save_interval_ms` is hot-reconfigured via
+    /// [`BuiltinKvStore::reconfigure`]. `None` for in-memory stores, which run
+    /// no save loop.
+    save_loop_stop: Arc<std::sync::Mutex<Option<tokio::sync::watch::Sender<bool>>>>,
+    /// The boot-configured save cadence (ms, already floored). A reconfigure
+    /// that clears `save_interval_ms` reverts to this rather than to the global
+    /// default, so clearing the runtime knob restores the adapter's configured
+    /// cadence instead of silently dropping to 5000.
+    default_interval: u64,
+    /// Shared by all save-loop generations. Owned by blocking disk work so an
+    /// aborted caller or hot reconfiguration cannot overlap temporary-file writes.
+    flush_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl BuiltinKvStore {
+    pub fn new(config: Option<Value>) -> Self {
+        tracing::debug!("Initializing KvStore with config: {:?}", config);
+        let store_method = config
+            .clone()
+            .and_then(|cfg| {
+                cfg.get("store_method")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| "in_memory".to_string());
+
+        if store_method == "in_memory" {
+            tracing::warn!(
+                "DO NOT USE IN_MEMORY STORE_METHOD IN PRODUCTION - DATA WILL BE LOST ON SHUTDOWN"
+            );
+        }
+
+        let file_path = config
+            .clone()
+            .and_then(|cfg| {
+                cfg.get("file_path")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| "kv_store_data.db".to_string());
+
+        let interval = config
+            .clone()
+            .and_then(|cfg| cfg.get("save_interval_ms").and_then(|v| v.as_u64()))
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_SAVE_INTERVAL_MS)
+            .max(MIN_SAVE_INTERVAL_MS);
+
+        let file_store_dir = match store_method.as_str() {
+            "file_based" => {
+                let dir = PathBuf::from(&file_path);
+                if let Err(err) = std::fs::create_dir_all(&dir) {
+                    tracing::error!(error = ?err, path = %dir.display(), "failed to create storage directory");
+                }
+                Some(dir)
+            }
+            "in_memory" => None,
+            other => {
+                tracing::warn!(store_method = %other, "Unknown store_method, defaulting to in_memory");
+                None
+            }
+        };
+
+        let data_from_disk = match &file_store_dir {
+            Some(dir) => load_store_from_dir(dir),
+            None => HashMap::new(),
+        };
+        let store = Arc::new(RwLock::new(data_from_disk));
+        let dirty = Arc::new(RwLock::new(HashMap::new()));
+
+        let kv = Self {
+            store,
+            file_store_dir,
+            dirty,
+            save_loop_stop: Arc::new(std::sync::Mutex::new(None)),
+            default_interval: interval,
+            flush_lock: Arc::new(tokio::sync::Mutex::new(())),
+        };
+
+        // File-backed stores run a background save loop; in-memory stores have
+        // nothing to persist. `spawn_save_loop` is a no-op when not file-backed.
+        kv.spawn_save_loop(interval);
+
+        kv
+    }
+
+    /// (Re)start the background save loop at `interval_ms`, signalling any prior
+    /// instance to exit so only the newest cadence persists. No-op for
+    /// in-memory stores. Called once from `new` and again from `reconfigure`.
+    fn spawn_save_loop(&self, interval_ms: u64) {
+        let Some(dir) = self.file_store_dir.clone() else {
+            return;
+        };
+
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        if let Some(previous) = self
+            .save_loop_stop
+            .lock()
+            .expect("save_loop_stop mutex poisoned")
+            .replace(stop_tx)
+        {
+            let _ = previous.send(true);
+        }
+
+        let store = Arc::clone(&self.store);
+        let dirty = Arc::clone(&self.dirty);
+        let flush_lock = Arc::clone(&self.flush_lock);
+        tokio::spawn(async move {
+            Self::save_loop(store, dirty, flush_lock, interval_ms, dir, stop_rx).await;
+        });
+    }
+
+    /// Hot-reconfigure the store. Currently honors `save_interval_ms`: when the
+    /// store is file-backed, respawn the save loop at the new cadence. A clear /
+    /// invalid value reverts to the boot-configured cadence (`default_interval`),
+    /// and any value is floored to `MIN_SAVE_INTERVAL_MS`. No-op for in-memory
+    /// stores.
+    pub fn reconfigure(&self, config: &Value) {
+        if self.file_store_dir.is_none() {
+            return;
+        }
+        let interval = config
+            .get("save_interval_ms")
+            .and_then(|v| v.as_u64())
+            .filter(|&n| n > 0)
+            .unwrap_or(self.default_interval)
+            .max(MIN_SAVE_INTERVAL_MS);
+        tracing::info!(
+            save_interval_ms = interval,
+            "[BuiltinKvStore] respawning save loop at new cadence"
+        );
+        self.spawn_save_loop(interval);
+    }
+
+    async fn save_loop(
+        store: Store,
+        dirty: Arc<RwLock<HashMap<String, DirtyOp>>>,
+        flush_lock: Arc<tokio::sync::Mutex<()>>,
+        polling_interval: u64,
+        dir: PathBuf,
+        mut stop_rx: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_millis(polling_interval));
+        loop {
+            tokio::select! {
+                changed = stop_rx.changed() => {
+                    if changed.is_err() || *stop_rx.borrow() { break; }
+                }
+                _ = interval.tick() => {
+                    let _ = Self::flush_dirty(&store, &dirty, &flush_lock, &dir).await;
+                }
+            }
+        }
+    }
+
+    async fn flush_dirty(
+        store: &Store,
+        dirty: &Arc<RwLock<HashMap<String, DirtyOp>>>,
+        flush_lock: &Arc<tokio::sync::Mutex<()>>,
+        dir: &Path,
+    ) -> anyhow::Result<()> {
+        let guard = Arc::clone(flush_lock).lock_owned().await;
+        // Empty ticks do not schedule a blocking job. New mutations after this
+        // check stay dirty for the next tick, exactly as after an empty drain.
+        if dirty.read().await.is_empty() {
+            return Ok(());
+        }
+        let store = Arc::clone(store);
+        let dirty = Arc::clone(dirty);
+        let dir = dir.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            let batch = dirty.blocking_write().drain().collect::<Vec<_>>();
+            let mut failed = 0usize;
+            for (index, op) in batch {
+                // DirtyOp is only a marker: a mutation may have completed after
+                // it was recorded, so derive the disk action from current state.
+                let snapshot = store
+                    .blocking_read()
+                    .get(&index)
+                    .filter(|scope| !scope.is_empty())
+                    .cloned();
+                let result = match snapshot {
+                    Some(value) => persist_index_to_disk(&dir, &index, &value),
+                    None => delete_index_from_disk(&dir, &index),
+                };
+                if let Err(error) = result {
+                    tracing::error!(error = ?error, index = %index, "failed to persist index");
+                    failed += 1;
+                    requeue(&dirty, index, op);
+                }
+            }
+            if failed > 0 {
+                anyhow::bail!("{failed} index(es) failed to persist and were requeued");
+            }
+            Ok(())
+        })
+        .await?
+    }
+
+    pub async fn set(&self, index: String, key: String, data: Value) -> StreamSetResult {
+        let old = {
+            let mut store = self.store.write().await;
+            store
+                .entry(index.clone())
+                .or_default()
+                .insert(key, Arc::new(data.clone()))
+        };
+        if self.file_store_dir.is_some() {
+            self.dirty.write().await.insert(index, DirtyOp::Upsert);
+        }
+        StreamSetResult {
+            old_value: old.map(Arc::unwrap_or_clone),
+            new_value: data,
+        }
+    }
+
+    pub async fn get(&self, index: String, key: String) -> Option<Value> {
+        // Copy only the handle while locked. Large JSON cloning does not need
+        // to block unrelated writers after selecting this immutable version.
+        let value = self
+            .store
+            .read()
+            .await
+            .get(&index)
+            .and_then(|scope| scope.get(&key))
+            .cloned();
+        value.map(Arc::unwrap_or_clone)
+    }
+
+    pub async fn delete(&self, index: String, key: String) -> StreamDeleteResult {
+        let (removed, dirty_op) = {
+            let mut store = self.store.write().await;
+            let index_map = store.get_mut(&index);
+
+            if let Some(index_map) = index_map {
+                let removed = index_map.shift_remove(&key);
+                let dirty_op = if removed.is_some() {
+                    if index_map.is_empty() {
+                        Some(DirtyOp::Delete)
+                    } else {
+                        Some(DirtyOp::Upsert)
+                    }
+                } else {
+                    None
+                };
+                (
+                    StreamDeleteResult {
+                        old_value: removed.map(Arc::unwrap_or_clone),
+                    },
+                    dirty_op,
+                )
+            } else {
+                (StreamDeleteResult { old_value: None }, None)
+            }
+        };
+
+        if removed.old_value.is_some()
+            && self.file_store_dir.is_some()
+            && let Some(dirty_op) = dirty_op
+        {
+            self.dirty.write().await.insert(index, dirty_op);
+        }
+
+        removed
+    }
+
+    pub async fn try_acquire_lock(&self, index: &str, key: &str, owner: &str, ttl_ms: u64) -> bool {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let expires_at_ms = now_ms.saturating_add(ttl_ms as i64);
+        let lock_value = serde_json::to_value(KvLockEntry {
+            owner: owner.to_string(),
+            expires_at_ms,
+        })
+        .unwrap_or(Value::Null);
+
+        let acquired = {
+            let mut store = self.store.write().await;
+            let index_map = store.entry(index.to_string()).or_insert_with(IndexMap::new);
+
+            let can_acquire = match index_map.get(key) {
+                None => true,
+                Some(value) => match KvLockEntry::deserialize(value.as_ref()) {
+                    Ok(entry) => entry.is_expired(now_ms),
+                    Err(_) => true,
+                },
+            };
+
+            if can_acquire {
+                index_map.insert(key.to_string(), Arc::new(lock_value));
+                true
+            } else {
+                false
+            }
+        };
+
+        if acquired && self.file_store_dir.is_some() {
+            self.dirty
+                .write()
+                .await
+                .insert(index.to_string(), DirtyOp::Upsert);
+        }
+
+        acquired
+    }
+
+    pub async fn release_lock(&self, index: &str, key: &str, owner: &str) -> bool {
+        let (released, dirty_op) = {
+            let mut store = self.store.write().await;
+            let index_map = store.get_mut(index);
+
+            if let Some(index_map) = index_map {
+                let should_remove = match index_map.get(key) {
+                    Some(value) => match KvLockEntry::deserialize(value.as_ref()) {
+                        Ok(entry) => entry.owner == owner,
+                        Err(_) => false,
+                    },
+                    None => false,
+                };
+
+                if should_remove {
+                    index_map.shift_remove(key);
+                    let dirty = if index_map.is_empty() {
+                        Some(DirtyOp::Delete)
+                    } else {
+                        Some(DirtyOp::Upsert)
+                    };
+                    (true, dirty)
+                } else {
+                    (false, None)
+                }
+            } else {
+                (false, None)
+            }
+        };
+
+        if released
+            && self.file_store_dir.is_some()
+            && let Some(dirty_op) = dirty_op
+        {
+            self.dirty.write().await.insert(index.to_string(), dirty_op);
+        }
+
+        released
+    }
+
+    pub async fn update(
+        &self,
+        index: String,
+        key: String,
+        ops: Vec<UpdateOp>,
+    ) -> StreamUpdateResult {
+        let mut store = self.store.write().await;
+
+        // Automatically create index_map if it doesn't exist
+        let index_map = store.entry(index.clone()).or_insert_with(IndexMap::new);
+
+        // The update needs one mutable working copy. Keep the original entry
+        // untouched until the operation completes, then move its value to the
+        // response when no persistence/read snapshot still shares it.
+        let current = index_map.get(&key).map(|value| value.as_ref().clone());
+        let (updated_value, errors) = crate::update_ops::apply_update_ops(current, &ops);
+        let previous = index_map.insert(key, Arc::new(updated_value.clone()));
+
+        drop(store);
+
+        if self.file_store_dir.is_some() {
+            self.dirty
+                .write()
+                .await
+                .insert(index.clone(), DirtyOp::Upsert);
+        }
+
+        StreamUpdateResult {
+            old_value: previous.map(Arc::unwrap_or_clone),
+            new_value: updated_value,
+            errors,
+        }
+    }
+
+    pub async fn list_keys_with_prefix(&self, prefix: String) -> Vec<String> {
+        let store = self.store.read().await;
+        store
+            .keys()
+            .filter(|k| k.starts_with(&prefix))
+            .cloned()
+            .collect()
+    }
+
+    pub async fn list(&self, index: String) -> Vec<Value> {
+        // Snapshot membership/order under the read lock; materialize the public
+        // owned response after releasing it. No hidden response cache is kept.
+        let values: Vec<_> = self
+            .store
+            .read()
+            .await
+            .get(&index)
+            .map_or_else(Vec::new, |scope| scope.values().map(Arc::clone).collect());
+        values.into_iter().map(Arc::unwrap_or_clone).collect()
+    }
+
+    pub async fn list_groups(&self) -> Vec<String> {
+        let store = self.store.read().await;
+        store.keys().cloned().collect()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use iii_helpers::stream::UpdateOp;
+
+    use super::*;
+
+    fn temp_store_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kv_store_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_file_based_load_set_delete() {
+        let dir = temp_store_dir();
+        let index = "test";
+        let key = "test_group::item1";
+        let data = serde_json::json!({"key": "value"});
+        let index_data = IndexMap::from([(key.to_string(), Arc::new(data.clone()))]);
+        let file_path = dir.join(index_file_name(index));
+
+        persist_index_to_disk(&dir, index, &index_data).unwrap();
+
+        let config = serde_json::json!({
+            "store_method": "file_based",
+            "file_path": dir.to_string_lossy(),
+            "save_interval_ms": 5
+        });
+        let kv_store = BuiltinKvStore::new(Some(config));
+
+        let loaded = kv_store.get(index.to_string(), key.to_string()).await;
+        assert_eq!(loaded, Some(data.clone()));
+
+        let updated = serde_json::json!({"key": "updated"});
+        kv_store
+            .set(index.to_string(), key.to_string(), updated.clone())
+            .await;
+
+        let timeout = std::time::Duration::from_secs(5);
+        let start = tokio::time::Instant::now();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let bytes = std::fs::read(&file_path).unwrap();
+            let storage = rkyv::from_bytes::<KeyStorage, rkyv::rancor::Error>(&bytes).unwrap();
+            let on_disk: IndexMap<String, Value> = serde_json::from_str(&storage.0).unwrap();
+            if on_disk.get(key) == Some(&updated) {
+                break;
+            }
+            assert!(
+                start.elapsed() < timeout,
+                "Timed out waiting for updated value to be persisted to disk"
+            );
+        }
+
+        kv_store.delete(index.to_string(), key.to_string()).await;
+        let start = tokio::time::Instant::now();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if !file_path.exists() {
+                break;
+            }
+            assert!(
+                start.elapsed() < timeout,
+                "Timed out waiting for file to be deleted from disk"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_reconfigure_respawns_save_loop() {
+        let dir = temp_store_dir();
+        let index = "recfg";
+        let key = "k1";
+        let config = serde_json::json!({
+            "store_method": "file_based",
+            "file_path": dir.to_string_lossy(),
+            "save_interval_ms": 1000
+        });
+        let kv_store = BuiltinKvStore::new(Some(config));
+
+        // Retune to a much faster cadence; the prior loop is signalled to exit
+        // and a fresh one takes over. A stop sender must remain registered.
+        kv_store.reconfigure(&serde_json::json!({ "save_interval_ms": 5 }));
+        assert!(
+            kv_store
+                .save_loop_stop
+                .lock()
+                .expect("save_loop_stop mutex")
+                .is_some()
+        );
+
+        let data = serde_json::json!({ "v": 1 });
+        kv_store
+            .set(index.to_string(), key.to_string(), data.clone())
+            .await;
+
+        // The respawned loop must still persist writes to disk.
+        let file_path = dir.join(index_file_name(index));
+        let timeout = std::time::Duration::from_secs(5);
+        let start = tokio::time::Instant::now();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if let Ok(bytes) = std::fs::read(&file_path) {
+                let storage = rkyv::from_bytes::<KeyStorage, rkyv::rancor::Error>(&bytes).unwrap();
+                let on_disk: IndexMap<String, Value> = serde_json::from_str(&storage.0).unwrap();
+                if on_disk.get(key) == Some(&data) {
+                    break;
+                }
+            }
+            assert!(
+                start.elapsed() < timeout,
+                "value not persisted after reconfigure respawn"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_reconfigure_reverts_to_boot_interval_when_cleared() {
+        let dir = temp_store_dir();
+        let config = serde_json::json!({
+            "store_method": "file_based",
+            "file_path": dir.to_string_lossy(),
+            "save_interval_ms": 250
+        });
+        let kv_store = BuiltinKvStore::new(Some(config));
+        assert_eq!(kv_store.default_interval, 250);
+
+        // Clearing the knob reverts to the boot cadence (250), NOT the global
+        // default; the loop stays alive.
+        kv_store.reconfigure(&serde_json::json!({}));
+        assert!(
+            kv_store
+                .save_loop_stop
+                .lock()
+                .expect("save_loop_stop mutex")
+                .is_some()
+        );
+        assert_eq!(kv_store.default_interval, 250);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_boot_interval_is_floored() {
+        let dir = temp_store_dir();
+        // A sub-floor value (e.g. hand-edited adapter config bypassing the
+        // schema) is clamped up so it cannot drive a tight save loop.
+        let config = serde_json::json!({
+            "store_method": "file_based",
+            "file_path": dir.to_string_lossy(),
+            "save_interval_ms": 1
+        });
+        let kv_store = BuiltinKvStore::new(Some(config));
+        assert_eq!(kv_store.default_interval, MIN_SAVE_INTERVAL_MS);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_reconfigure_in_memory_is_noop() {
+        let kv_store = BuiltinKvStore::new(None); // in-memory: no save loop
+        kv_store.reconfigure(&serde_json::json!({ "save_interval_ms": 100 }));
+        assert!(
+            kv_store
+                .save_loop_stop
+                .lock()
+                .expect("save_loop_stop mutex")
+                .is_none(),
+            "in-memory store must not spawn a save loop"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_builtin_kv_store_invalid_store_method() {
+        // when this happens it should default to in_memory
+        let config = serde_json::json!({
+            "store_method": "unknown_method"
+        });
+        let kv_store = BuiltinKvStore::new(Some(config));
+        assert!(kv_store.store.read().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_builtin_kv_store_with_config() {
+        let dir = temp_store_dir();
+        let config = serde_json::json!({
+            "store_method": "file_based",
+            "file_path": dir.to_string_lossy(),
+            "save_interval_ms": 5
+        });
+        let kv_store = BuiltinKvStore::new(Some(config));
+        assert!(kv_store.store.read().await.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_builtin_kv_store_set_get_delete() {
+        let kv_store = BuiltinKvStore::new(None);
+        let data = serde_json::json!({"key": "value"});
+        let index = "test";
+        let key = "test_key";
+        // Test set
+        kv_store
+            .set(index.to_string(), key.to_string(), data.clone())
+            .await;
+
+        // Test get
+        let retrieved = kv_store
+            .get(index.to_string(), key.to_string())
+            .await
+            .expect("Item should exist");
+        assert_eq!(retrieved, data);
+
+        // Test delete
+        let deleted = kv_store
+            .delete(index.to_string(), key.to_string())
+            .await
+            .old_value
+            .unwrap_or_else(|| panic!("Item should exist for deletion"));
+        assert_eq!(deleted, data);
+
+        // Ensure item is deleted
+        let should_be_none = kv_store.get(index.to_string(), key.to_string()).await;
+        assert!(should_be_none.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_builtin_kv_store_update_basic_operations() {
+        let kv_store = BuiltinKvStore::new(None);
+        let index = "test";
+        let key = "update:basic";
+
+        // Set initial value
+        let initial = serde_json::json!({"name": "A", "counter": 0});
+        kv_store
+            .set(index.to_string(), key.to_string(), initial.clone())
+            .await;
+
+        // Test Set operation
+        let result = kv_store
+            .update(
+                index.to_string(),
+                key.to_string(),
+                vec![UpdateOp::Set {
+                    path: "name".to_string(),
+                    value: Some(serde_json::json!("B")),
+                }],
+            )
+            .await;
+
+        assert_eq!(result.old_value, Some(initial));
+        assert_eq!(result.new_value["name"], "B");
+        assert_eq!(result.new_value["counter"], 0);
+
+        // Test Increment operation
+        let result = kv_store
+            .update(
+                index.to_string(),
+                key.to_string(),
+                vec![UpdateOp::Increment {
+                    path: "counter".to_string(),
+                    by: 5,
+                }],
+            )
+            .await;
+
+        assert_eq!(result.new_value["counter"], 5);
+
+        // Test Decrement operation
+        let result = kv_store
+            .update(
+                index.to_string(),
+                key.to_string(),
+                vec![UpdateOp::Decrement {
+                    path: "counter".to_string(),
+                    by: 2,
+                }],
+            )
+            .await;
+
+        assert_eq!(result.new_value["counter"], 3);
+
+        // Test Remove operation
+        let result = kv_store
+            .update(
+                index.to_string(),
+                key.to_string(),
+                vec![UpdateOp::Remove {
+                    path: "name".to_string(),
+                }],
+            )
+            .await;
+
+        assert!(result.new_value.get("name").is_none());
+        assert_eq!(result.new_value["counter"], 3);
+
+        // Test Merge operation
+        let result = kv_store
+            .update(
+                index.to_string(),
+                key.to_string(),
+                vec![UpdateOp::Merge {
+                    path: None,
+                    value: serde_json::json!({"name": "C", "extra": "field"}),
+                }],
+            )
+            .await;
+
+        assert_eq!(result.new_value["name"], "C");
+        assert_eq!(result.new_value["counter"], 3);
+        assert_eq!(result.new_value["extra"], "field");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_builtin_kv_store_update_multiple_ops_in_single_call() {
+        let kv_store = BuiltinKvStore::new(None);
+        let index = "test";
+        let key = "update:multi_ops";
+
+        // Set initial value
+        let initial = serde_json::json!({"name": "A", "counter": 0});
+        kv_store
+            .set(index.to_string(), key.to_string(), initial.clone())
+            .await;
+
+        // Apply multiple operations in a single update call
+        let result = kv_store
+            .update(
+                index.to_string(),
+                key.to_string(),
+                vec![
+                    UpdateOp::Set {
+                        path: "name".to_string(),
+                        value: Some(Value::String("Z".to_string())),
+                    },
+                    UpdateOp::Increment {
+                        path: "counter".to_string(),
+                        by: 10,
+                    },
+                    UpdateOp::Set {
+                        path: "status".to_string(),
+                        value: Some(Value::String("active".to_string())),
+                    },
+                ],
+            )
+            .await;
+
+        assert_eq!(result.new_value["name"], "Z");
+        assert_eq!(result.new_value["counter"], 10);
+        assert_eq!(result.new_value["status"], "active");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_update_new_object_with_increment() {
+        let kv_store = BuiltinKvStore::new(None);
+        let index = "test";
+        let key = "update:new_object_with_increment";
+        let result = kv_store
+            .update(
+                index.to_string(),
+                key.to_string(),
+                vec![UpdateOp::Increment {
+                    path: "counter".to_string(),
+                    by: 1,
+                }],
+            )
+            .await;
+        assert_eq!(result.new_value["counter"], 1);
+        assert_eq!(result.old_value, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_builtin_kv_store_update_append_operations() {
+        let kv_store = BuiltinKvStore::new(None);
+        let index = "test";
+        let key = "update:append";
+
+        let initial = serde_json::json!({
+            "events": [{"kind": "start"}],
+            "transcript": "hello",
+            "object": {"nested": true},
+            "user.name": ["A"],
+            "user": {"name": ["B"]}
+        });
+        kv_store
+            .set(index.to_string(), key.to_string(), initial.clone())
+            .await;
+
+        let result = kv_store
+            .update(
+                index.to_string(),
+                key.to_string(),
+                vec![
+                    UpdateOp::append("events", serde_json::json!({"kind": "chunk"})),
+                    UpdateOp::append("transcript", serde_json::json!(" world")),
+                    UpdateOp::append("missing_string", serde_json::json!("created")),
+                    UpdateOp::append("missing_array", serde_json::json!({"kind": "created"})),
+                    UpdateOp::append("object", serde_json::json!("ignored")),
+                    UpdateOp::append("user.name", serde_json::json!("C")),
+                ],
+            )
+            .await;
+
+        assert_eq!(result.old_value, Some(initial));
+        assert_eq!(
+            result.new_value["events"],
+            serde_json::json!([{"kind": "start"}, {"kind": "chunk"}])
+        );
+        assert_eq!(result.new_value["transcript"], "hello world");
+        assert_eq!(result.new_value["missing_string"], "created");
+        assert_eq!(
+            result.new_value["missing_array"],
+            serde_json::json!([{"kind": "created"}])
+        );
+        assert_eq!(
+            result.new_value["object"],
+            serde_json::json!({"nested": true})
+        );
+        assert_eq!(result.new_value["user.name"], serde_json::json!(["A", "C"]));
+        assert_eq!(result.new_value["user"], serde_json::json!({"name": ["B"]}));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_builtin_kv_store_update_append_missing_root() {
+        let kv_store = BuiltinKvStore::new(None);
+        let index = "test";
+
+        let string_result = kv_store
+            .update(
+                index.to_string(),
+                "update:append_root_string".to_string(),
+                vec![UpdateOp::append("", serde_json::json!("hello"))],
+            )
+            .await;
+        assert_eq!(string_result.old_value, None);
+        assert_eq!(string_result.new_value, serde_json::json!("hello"));
+
+        let array_result = kv_store
+            .update(
+                index.to_string(),
+                "update:append_root_array".to_string(),
+                vec![UpdateOp::append("", serde_json::json!({"kind": "chunk"}))],
+            )
+            .await;
+        assert_eq!(array_result.old_value, None);
+        assert_eq!(
+            array_result.new_value,
+            serde_json::json!([{"kind": "chunk"}])
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_builtin_kv_store_update_concurrent_appends() {
+        let kv_store = Arc::new(BuiltinKvStore::new(None));
+        let index = "test";
+        let key = "update:concurrent_appends";
+        kv_store
+            .set(
+                index.to_string(),
+                key.to_string(),
+                serde_json::json!({"chunks": []}),
+            )
+            .await;
+
+        let mut tasks = vec![];
+        for i in 0..100 {
+            let kv_store = Arc::clone(&kv_store);
+            tasks.push(tokio::spawn(async move {
+                kv_store
+                    .update(
+                        index.to_string(),
+                        key.to_string(),
+                        vec![UpdateOp::append("chunks", serde_json::json!(i))],
+                    )
+                    .await;
+            }));
+        }
+        futures::future::join_all(tasks).await;
+
+        let final_value = kv_store
+            .get(index.to_string(), key.to_string())
+            .await
+            .expect("Value should exist");
+        let chunks = final_value["chunks"]
+            .as_array()
+            .expect("chunks should be array");
+
+        assert_eq!(chunks.len(), 100);
+        for i in 0..100 {
+            assert!(chunks.contains(&serde_json::json!(i)));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_builtin_kv_store_update_two_threads_counter_and_name() {
+        let kv_store = Arc::new(BuiltinKvStore::new(None));
+        let index = "test";
+        let key = "update:two_threads";
+
+        let initial = serde_json::json!({"name": "A", "counter": 0});
+        kv_store
+            .set(index.to_string(), key.to_string(), initial.clone())
+            .await;
+
+        let names: Vec<String> = ('A'..='Z').map(|c| c.to_string()).collect();
+
+        let kv_counter = Arc::clone(&kv_store);
+        let counter_handle = tokio::spawn(async move {
+            let mut tasks = vec![];
+            for _ in 0..500 {
+                let task = kv_counter.update(
+                    index.to_string(),
+                    key.to_string(),
+                    vec![UpdateOp::Increment {
+                        path: "counter".to_string(),
+                        by: 2,
+                    }],
+                );
+                tasks.push(task);
+            }
+            futures::future::join_all(tasks).await;
+        });
+
+        let kv_name = Arc::clone(&kv_store);
+        let name_handle = tokio::spawn(async move {
+            for name in names {
+                kv_name
+                    .update(
+                        index.to_string(),
+                        key.to_string(),
+                        vec![UpdateOp::Set {
+                            path: "name".to_string(),
+                            value: Some(Value::String(name)),
+                        }],
+                    )
+                    .await;
+            }
+        });
+
+        // Wait for both spawns to complete
+        let (counter_result, name_result) = tokio::join!(counter_handle, name_handle);
+        counter_result.expect("Counter spawn failed");
+        name_result.expect("Name spawn failed");
+
+        let final_value = kv_store
+            .get(index.to_string(), key.to_string())
+            .await
+            .expect("Value should exist");
+
+        assert_eq!(
+            final_value["counter"], 1000,
+            "Counter should be 1000 after 500 increments of 2"
+        );
+
+        let name = final_value["name"].as_str().unwrap_or("");
+        assert_eq!("Z", name);
+    }
+
+    #[tokio::test()]
+    async fn test_get_set() {
+        let kv_store = Arc::new(BuiltinKvStore::new(None));
+        let index = "test";
+        let key = "test_key";
+        let data = serde_json::json!({"key": "value"});
+        kv_store
+            .set(index.to_string(), key.to_string(), data.clone())
+            .await;
+        let retrieved = kv_store.get(index.to_string(), key.to_string()).await;
+        assert_eq!(retrieved, Some(data));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_builtin_kv_store_update_concurrent_500_calls() {
+        let kv_store = Arc::new(BuiltinKvStore::new(None));
+        let index = "test";
+        let key = "update:concurrent_500";
+
+        // Set initial value
+        let initial = serde_json::json!({"name": "A", "counter": 0});
+        kv_store
+            .set(index.to_string(), key.to_string(), initial.clone())
+            .await;
+
+        let names = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"];
+
+        // Create 500 concurrent update futures
+        let mut tasks = vec![];
+        for i in 0..500 {
+            let kv_store = Arc::clone(&kv_store);
+            let name = names[i % 10].to_string();
+
+            let task = tokio::spawn(async move {
+                kv_store
+                    .update(
+                        index.to_string(),
+                        key.to_string(),
+                        vec![
+                            UpdateOp::Increment {
+                                path: "counter".to_string(),
+                                by: 2,
+                            },
+                            UpdateOp::Set {
+                                path: "name".to_string(),
+                                value: Some(Value::String(name)),
+                            },
+                        ],
+                    )
+                    .await
+            });
+
+            tasks.push(task);
+        }
+
+        // Wait for all tasks to complete
+        for task in tasks {
+            let _ = task.await;
+        }
+
+        // Verify final result
+        let final_value = kv_store
+            .get(index.to_string(), key.to_string())
+            .await
+            .expect("Value should exist");
+
+        let counter = final_value["counter"].as_i64().unwrap_or(0);
+
+        println!(
+            "BuiltinKvStore concurrent test result: counter = {} (expected 1000)",
+            counter
+        );
+        println!("Final name: {}", final_value["name"]);
+
+        // Counter should be exactly 1000 because RwLock serializes the updates
+        assert_eq!(
+            counter, 1000,
+            "Counter should be 1000 after 500 concurrent increments of 2"
+        );
+
+        // Name should be one of A-J
+        let name = final_value["name"].as_str().unwrap_or("");
+        assert!(
+            names.contains(&name),
+            "Name should be one of A-J, got '{}'",
+            name
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_builtin_kv_store_update_concurrent_500_using_join_all() {
+        let kv_store = Arc::new(BuiltinKvStore::new(None));
+        let index = "test";
+        let key = "update:concurrent_join_all";
+
+        // Set initial value
+        let initial = serde_json::json!({"name": "A", "counter": 0});
+        kv_store
+            .set(index.to_string(), key.to_string(), initial.clone())
+            .await;
+
+        let names = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"];
+
+        // Create 500 update futures without spawning
+        let mut futures = vec![];
+        for i in 0..500 {
+            let kv_store = Arc::clone(&kv_store);
+            let name = names[i % 10].to_string();
+
+            let future = async move {
+                kv_store
+                    .update(
+                        index.to_string(),
+                        key.to_string(),
+                        vec![
+                            UpdateOp::Increment {
+                                path: "counter".to_string(),
+                                by: 2,
+                            },
+                            UpdateOp::Set {
+                                path: "name".to_string(),
+                                value: Some(Value::String(name)),
+                            },
+                        ],
+                    )
+                    .await
+            };
+
+            futures.push(future);
+        }
+
+        // Execute all futures concurrently using join_all
+        futures::future::join_all(futures).await;
+
+        // Verify final result
+        let final_value = kv_store
+            .get(index.to_string(), key.to_string())
+            .await
+            .expect("Value should exist");
+
+        let counter = final_value["counter"].as_i64().unwrap_or(0);
+
+        println!(
+            "BuiltinKvStore join_all test result: counter = {} (expected 1000)",
+            counter
+        );
+        println!("Final name: {}", final_value["name"]);
+
+        // Counter should be exactly 1000 because RwLock serializes the updates
+        assert_eq!(
+            counter, 1000,
+            "Counter should be 1000 after 500 concurrent increments of 2"
+        );
+
+        // Name should be one of A-J
+        let name = final_value["name"].as_str().unwrap_or("");
+        assert!(
+            names.contains(&name),
+            "Name should be one of A-J, got '{}'",
+            name
+        );
+    }
+
+    #[tokio::test]
+    async fn test_builtin_kv_lock_acquire_release() {
+        let kv_store = BuiltinKvStore::new(None);
+        let index = "cron_locks";
+        let key = "job:alpha";
+
+        let owner_a = "instance-a";
+        let owner_b = "instance-b";
+
+        let acquired_a = kv_store.try_acquire_lock(index, key, owner_a, 50_000).await;
+        assert!(acquired_a);
+
+        let acquired_b = kv_store.try_acquire_lock(index, key, owner_b, 50_000).await;
+        assert!(!acquired_b);
+
+        let released_wrong_owner = kv_store.release_lock(index, key, owner_b).await;
+        assert!(!released_wrong_owner);
+
+        let released_right_owner = kv_store.release_lock(index, key, owner_a).await;
+        assert!(released_right_owner);
+
+        let acquired_after_release = kv_store.try_acquire_lock(index, key, owner_b, 50_000).await;
+        assert!(acquired_after_release);
+    }
+
+    #[tokio::test]
+    async fn test_builtin_kv_lock_ttl_expiry() {
+        let kv_store = BuiltinKvStore::new(None);
+        let index = "cron_locks";
+        let key = "job:ttl";
+
+        let acquired = kv_store.try_acquire_lock(index, key, "owner-a", 10).await;
+        assert!(acquired);
+
+        let acquired_immediate = kv_store.try_acquire_lock(index, key, "owner-b", 10).await;
+        assert!(!acquired_immediate);
+
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+        let acquired_after_ttl = kv_store.try_acquire_lock(index, key, "owner-b", 10).await;
+        assert!(acquired_after_ttl);
+    }
+
+    #[tokio::test]
+    async fn test_builtin_kv_lock_concurrent_only_one_wins() {
+        let kv_store = Arc::new(BuiltinKvStore::new(None));
+        let index = "cron_locks";
+        let key = "job:race";
+
+        let kv_a = Arc::clone(&kv_store);
+        let kv_b = Arc::clone(&kv_store);
+
+        let (a, b) = tokio::join!(
+            kv_a.try_acquire_lock(index, key, "owner-a", 50_000),
+            kv_b.try_acquire_lock(index, key, "owner-b", 50_000)
+        );
+
+        assert!(a ^ b);
+    }
+
+    #[tokio::test]
+    async fn test_list_preserves_insertion_order() {
+        let kv_store = BuiltinKvStore::new(None);
+        let index = "test_order";
+
+        // Insert items in a specific order
+        let items = vec![
+            ("key_c", serde_json::json!({"name": "Charlie"})),
+            ("key_a", serde_json::json!({"name": "Alice"})),
+            ("key_b", serde_json::json!({"name": "Bob"})),
+            ("key_d", serde_json::json!({"name": "Diana"})),
+            ("key_e", serde_json::json!({"name": "Eve"})),
+        ];
+
+        for (key, value) in &items {
+            kv_store
+                .set(index.to_string(), key.to_string(), value.clone())
+                .await;
+        }
+
+        let listed = kv_store.list(index.to_string()).await;
+        assert_eq!(listed.len(), 5);
+
+        // Values must come back in insertion order
+        let names: Vec<&str> = listed.iter().map(|v| v["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["Charlie", "Alice", "Bob", "Diana", "Eve"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_file_based_preserves_insertion_order() {
+        let dir = temp_store_dir();
+        let config_value = serde_json::json!({
+            "store_method": "file_based",
+            "file_path": dir.to_string_lossy(),
+            "save_interval_ms": 5
+        });
+
+        // Insert items in order
+        {
+            let kv_store = BuiltinKvStore::new(Some(config_value.clone()));
+            let index = "order_test";
+
+            let items = vec![
+                ("z_key", serde_json::json!({"pos": 1})),
+                ("a_key", serde_json::json!({"pos": 2})),
+                ("m_key", serde_json::json!({"pos": 3})),
+            ];
+
+            for (key, value) in &items {
+                kv_store
+                    .set(index.to_string(), key.to_string(), value.clone())
+                    .await;
+            }
+
+            // Wait for persistence
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // Reload from disk and verify order is preserved
+        let kv_store = BuiltinKvStore::new(Some(config_value));
+        let listed = kv_store.list("order_test".to_string()).await;
+        assert_eq!(listed.len(), 3);
+
+        let positions: Vec<i64> = listed.iter().map(|v| v["pos"].as_i64().unwrap()).collect();
+        assert_eq!(positions, vec![1, 2, 3]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ---- Pure utility function tests ----
+
+    #[test]
+    fn encode_index_alphanumeric_passthrough() {
+        assert_eq!(encode_index("simple"), "simple");
+        assert_eq!(encode_index("ABC123"), "ABC123");
+        assert_eq!(encode_index("with-dashes"), "with-dashes");
+        assert_eq!(encode_index("with_underscores"), "with_underscores");
+        assert_eq!(encode_index("with.dots"), "with.dots");
+    }
+
+    #[test]
+    fn encode_index_special_chars_encoded() {
+        assert_eq!(encode_index("with space"), "with%20space");
+        assert_eq!(encode_index("with/slash"), "with%2Fslash");
+        assert_eq!(encode_index("a@b"), "a%40b");
+        assert_eq!(encode_index(""), "");
+    }
+
+    #[test]
+    fn decode_index_valid() {
+        assert_eq!(decode_index("simple"), Some("simple".into()));
+        assert_eq!(decode_index("with%20space"), Some("with space".into()));
+        assert_eq!(decode_index("a%2Fb"), Some("a/b".into()));
+        assert_eq!(decode_index(""), Some("".into()));
+    }
+
+    #[test]
+    fn decode_index_invalid() {
+        assert_eq!(decode_index("%"), None);
+        assert_eq!(decode_index("%2"), None);
+        assert_eq!(decode_index("%ZZ"), None);
+    }
+
+    #[test]
+    fn encode_decode_roundtrip() {
+        for input in ["hello world", "foo/bar", "special!@#", "empty", ""] {
+            let encoded = encode_index(input);
+            let decoded = decode_index(&encoded).unwrap();
+            assert_eq!(decoded, input);
+        }
+    }
+
+    #[test]
+    fn index_file_name_appends_extension() {
+        assert_eq!(index_file_name("test"), "test.bin");
+        assert_eq!(index_file_name("with space"), "with%20space.bin");
+    }
+
+    #[test]
+    fn index_from_path_valid() {
+        let path = Path::new("/dir/test.bin");
+        assert_eq!(index_from_path(path), Some("test".into()));
+        let path = Path::new("/dir/with%20space.bin");
+        assert_eq!(index_from_path(path), Some("with space".into()));
+    }
+
+    #[test]
+    fn index_from_path_invalid() {
+        assert_eq!(index_from_path(Path::new("/dir/test.txt")), None);
+        assert_eq!(index_from_path(Path::new("/dir/test")), None);
+    }
+
+    #[tokio::test]
+    async fn list_keys_with_prefix_filters_correctly() {
+        let store = BuiltinKvStore::new(None);
+        store
+            .set("alpha".into(), "key1".into(), serde_json::json!(1))
+            .await;
+        store
+            .set("alpha-2".into(), "key1".into(), serde_json::json!(2))
+            .await;
+        store
+            .set("beta".into(), "key1".into(), serde_json::json!(3))
+            .await;
+
+        let mut keys = store.list_keys_with_prefix("alpha".into()).await;
+        keys.sort();
+        assert_eq!(keys, vec!["alpha", "alpha-2"]);
+
+        let keys = store.list_keys_with_prefix("gamma".into()).await;
+        assert!(keys.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_groups_returns_all_indices() {
+        let store = BuiltinKvStore::new(None);
+        store
+            .set("idx1".into(), "k".into(), serde_json::json!(1))
+            .await;
+        store
+            .set("idx2".into(), "k".into(), serde_json::json!(2))
+            .await;
+
+        let mut groups = store.list_groups().await;
+        groups.sort();
+        assert_eq!(groups, vec!["idx1", "idx2"]);
+    }
+
+    #[test]
+    fn kv_lock_entry_is_expired() {
+        let entry = KvLockEntry {
+            owner: "o".into(),
+            expires_at_ms: 1000,
+        };
+        assert!(entry.is_expired(1000));
+        assert!(entry.is_expired(1001));
+        assert!(!entry.is_expired(999));
+    }
+}
+
+#[cfg(test)]
+#[path = "kv_memory_tests.rs"]
+mod memory_tests;

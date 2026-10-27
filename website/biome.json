@@ -1,0 +1,54 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.3.10/schema.json",
+  "root": false,
+  "extends": "//",
+  "files": {
+    "includes": [
+      "**/*.ts",
+      "**/*.tsx",
+      "**/*.js",
+      "**/*.jsx",
+      "**/*.json",
+      "**/*.jsonc",
+      "!.next",
+      "!dist",
+      "!public/console-demo",
+      "!content/benchmarks/snapshot.json",
+      "!public/posthog-consent.js"
+    ]
+  },
+  "css": {
+    "parser": {
+      "tailwindDirectives": true,
+      "cssModules": true
+    }
+  },
+  "overrides": [
+    {
+      "includes": ["roadmap/**", "scripts/**", "tests/**"],
+      "javascript": {
+        "formatter": {
+          "quoteStyle": "double"
+        }
+      }
+    },
+    {
+      "includes": ["roadmap/**"],
+      "linter": {
+        "rules": {
+          "a11y": {
+            "useAriaPropsSupportedByRole": "off"
+          },
+          "correctness": {
+            "useUniqueElementIds": "off"
+          },
+          "suspicious": {
+            "noCommentText": "off",
+            "noArrayIndexKey": "off",
+            "noThenProperty": "off"
+          }
+        }
+      }
+    }
+  ]
+}

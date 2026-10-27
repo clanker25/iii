@@ -1,0 +1,123 @@
+from __future__ import annotations
+
+from typing import Any
+
+
+class InvocationError(Exception):
+    """Raised when an invocation dispatched by the SDK fails.
+
+    Inspect ``err.code`` to react to a specific category (e.g.
+    ``'FORBIDDEN'`` for RBAC denials, ``'TIMEOUT'`` for timeouts). Catch
+    this class to handle every rejection. ``except Exception`` continues to
+    work because ``InvocationError`` inherits from ``Exception``.
+
+    Attributes are read-only after construction. ``stacktrace`` is the
+    engine-side trace when the remote handler raised; it may include
+    internal file paths and should not be surfaced to end users. ``str(err)``
+    intentionally never includes the stacktrace.
+    """
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        function_id: str | None = None,
+        stacktrace: str | None = None,
+        invocation_id: str | None = None,
+    ) -> None:
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.message = message
+        self.function_id = function_id
+        self.stacktrace = stacktrace
+        self.invocation_id = invocation_id
+
+
+class RegistrationRejectedError(Exception):
+    """Raised when the engine rejects this worker's registration.
+
+    The engine pushes a ``registrationrejected`` message and closes the
+    connection on a registration collision (e.g. another live worker already
+    owns ``(namespace, worker_name)``). This is fatal: the SDK does not
+    reconnect. Inspect the attributes to identify the conflict.
+    """
+
+    def __init__(
+        self,
+        code: str,
+        namespace: str,
+        worker_name: str,
+        owner_worker_id: str,
+    ) -> None:
+        super().__init__(
+            f"{code}: worker '{worker_name}' rejected in namespace "
+            f"'{namespace}' (owned by '{owner_worker_id}')"
+        )
+        self.code = code
+        self.namespace = namespace
+        self.worker_name = worker_name
+        self.owner_worker_id = owner_worker_id
+
+
+def _wrap_wire_error(
+    error: Any,
+    *,
+    function_id: str | None,
+    invocation_id: str | None,
+) -> InvocationError:
+    """Convert a wire ``ErrorBody``-shaped dict into an ``InvocationError``.
+
+    The ``code`` field distinguishes categories (e.g. ``'FORBIDDEN'``,
+    ``'TIMEOUT'``). Malformed shapes (non-dict, missing fields, non-string
+    values) fall back to ``code='UNKNOWN'`` so no rejection path prints as a
+    raw dict repr.
+    """
+    if isinstance(error, dict):
+        raw_code = error.get("code")
+        code = raw_code if isinstance(raw_code, str) else "UNKNOWN"
+
+        raw_message = error.get("message")
+        message = raw_message if isinstance(raw_message, str) else "<no message>"
+
+        raw_stacktrace = error.get("stacktrace")
+        stacktrace = raw_stacktrace if isinstance(raw_stacktrace, str) else None
+
+        return InvocationError(
+            code=code,
+            message=message,
+            function_id=function_id,
+            stacktrace=stacktrace,
+            invocation_id=invocation_id,
+        )
+
+    return InvocationError(
+        code="UNKNOWN",
+        message=str(error),
+        function_id=function_id,
+        invocation_id=invocation_id,
+    )
+
+
+class ObserveRejection(Exception):
+    """Rejects an observer with a code of its own.
+
+    Raise it from an ``on_observer_added`` hook (``HTTP_ROUTE_CONFLICT``,
+    ``INVALID_CRON_EXPRESSION``, ...); any other exception rejects the
+    observer with ``OBSERVE_REJECTED``. Also what ``ObserverHandle.ready()``
+    raises when the observer turns ``error`` or ``disposed``, with the
+    engine's code (``INVALID_ARGS``, ``FORBIDDEN``, ``UNSUPPORTED``, ...).
+
+    Examples:
+        >>> def on_observer_added(obs):
+        ...     if not is_valid_cron(obs.args["expression"]):
+        ...         raise ObserveRejection("INVALID_CRON_EXPRESSION", "invalid day-of-week field")
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        # Both in `args`, so the error pickles (and unpickles) whole.
+        super().__init__(code, message)
+        self.code = code
+        self.message = message
+
+    def __str__(self) -> str:
+        return f"{self.code}: {self.message}"

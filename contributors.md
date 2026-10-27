@@ -1,0 +1,27 @@
+# Contributors
+
+The following users make all of their contributions to iii under the Apache 2 license and agree to
+[CONTRIBUTING.md](CONTRIBUTING.md) in full.
+- @CryptoQuaternions
+- @MarcusElwin
+- @McHersheys
+- @mikkel-arturo
+- @snvtac
+- @salarkhannn
+- @chrisayl
+- @Atlas1225
+- @Pranjal0410
+- @racso-dev
+- @SeCuReDmE-main-dev
+- @SimonFoobar648
+- @kriptoburak
+- @jeffersongoncalves
+- @tacoda
+- @Tyagiquamar
+- @jarvisaoieong
+- @atirna
+- @1aifanatic
+- @WanderLandWalker
+- @bsodmike
+- @iziang
+- @akshad-exe

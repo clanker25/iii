@@ -1,0 +1,23 @@
+namespace: default
+engine:
+  url: ws://127.0.0.1:49198
+  workers:
+    configuration:
+      adapter:
+        name: fs
+        config:
+          directory: ${III_SDK_CONFIGURATION_DIR}
+    iii-worker-manager:
+      port: 49198
+    iii-stream:
+      port: 3113
+      host: 0.0.0.0
+      adapter:
+        name: kv
+        config:
+          store_method: in_memory
+containers:
+  pubsub:
+    worker: package://api.workers.iii.dev/pubsub
+    version: "0.21.2"
+    config_name: pubsub

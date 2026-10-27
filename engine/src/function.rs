@@ -1,0 +1,620 @@
+// Copyright Motia LLC and/or licensed to Motia LLC under one or more
+// contributor license agreements. Licensed under the Elastic License 2.0;
+// you may not use this file except in compliance with the Elastic License 2.0.
+// This software is patent protected. We welcome discussions - reach out at team@iii.dev
+// See LICENSE and PATENTS files for details.
+
+use std::{
+    borrow::Borrow,
+    hash::{Hash, Hasher},
+    pin::Pin,
+    sync::{Arc, RwLock},
+};
+
+use colored::Colorize;
+use dashmap::DashMap;
+use futures::Future;
+use serde_json::Value;
+use uuid::Uuid;
+
+use crate::protocol::*;
+use crate::workers::worker::rbac_session::Session;
+
+pub enum FunctionResult<T, E> {
+    Success(T),
+    Failure(E),
+    Deferred,
+    NoResult,
+}
+type HandlerFuture = Pin<Box<dyn Future<Output = FunctionResult<Option<Value>, ErrorBody>> + Send>>;
+/// Handler arguments: `(invocation_id, data, session, metadata)`. `metadata` is
+/// the per-invocation sidecar carried alongside the payload (set at fire time
+/// from a trigger's `metadata`, or by an invocation-time caller) — it travels
+/// as a distinct channel rather than being folded into `data`.
+pub type HandlerFn =
+    dyn Fn(Option<Uuid>, Value, Option<Arc<Session>>, Option<Value>) -> HandlerFuture + Send + Sync;
+
+#[derive(Clone)]
+pub struct Function {
+    pub handler: Arc<HandlerFn>,
+    pub _function_id: String,
+    pub _description: Option<String>,
+    pub request_format: Option<Value>,
+    pub response_format: Option<Value>,
+    pub metadata: Option<Value>,
+}
+
+impl AsRef<HandlerFn> for Function {
+    fn as_ref(&self) -> &HandlerFn {
+        self.handler.as_ref()
+    }
+}
+
+impl Function {
+    pub async fn call_handler(
+        self,
+        invocation_id: Option<Uuid>,
+        data: Value,
+        session: Option<Arc<Session>>,
+    ) -> FunctionResult<Option<Value>, ErrorBody> {
+        self.call_handler_with_metadata(invocation_id, data, session, None)
+            .await
+    }
+
+    pub async fn call_handler_with_metadata(
+        self,
+        invocation_id: Option<Uuid>,
+        data: Value,
+        session: Option<Arc<Session>>,
+        metadata: Option<Value>,
+    ) -> FunctionResult<Option<Value>, ErrorBody> {
+        (self.handler)(invocation_id, data, session, metadata).await
+    }
+}
+
+pub trait FunctionHandler {
+    fn handle_function<'a>(
+        &'a self,
+        invocation_id: Option<Uuid>,
+        function_id: String,
+        input: Value,
+        metadata: Option<Value>,
+    ) -> Pin<Box<dyn Future<Output = FunctionResult<Option<Value>, ErrorBody>> + Send + 'a>>;
+}
+
+/// What happened to a function in the registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionChange {
+    Registered,
+    Unregistered,
+}
+
+/// Called synchronously on every register/remove with
+/// `(change, namespace, function_id)`. Must not block.
+pub type FunctionChangeListener = dyn Fn(FunctionChange, &str, &str) + Send + Sync;
+
+// Borrow both key components without changing the registry's stored tuple keys.
+// Also how the observer registry looks up `(namespace, id)` without allocating.
+pub(crate) trait FunctionKey {
+    fn parts(&self) -> (&str, &str);
+}
+
+impl FunctionKey for (String, String) {
+    fn parts(&self) -> (&str, &str) {
+        (&self.0, &self.1)
+    }
+}
+
+impl FunctionKey for (&str, &str) {
+    fn parts(&self) -> (&str, &str) {
+        *self
+    }
+}
+
+impl Hash for dyn FunctionKey + '_ {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.parts().hash(state);
+    }
+}
+
+impl PartialEq for dyn FunctionKey + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.parts() == other.parts()
+    }
+}
+
+impl Eq for dyn FunctionKey + '_ {}
+
+impl<'a> Borrow<dyn FunctionKey + 'a> for (String, String) {
+    fn borrow(&self) -> &(dyn FunctionKey + 'a) {
+        self
+    }
+}
+
+#[derive(Default)]
+pub struct FunctionsRegistry {
+    /// Keyed by `(namespace, function_id)`. The same function id may be
+    /// registered once per namespace; lookups must always supply the namespace
+    /// the caller is scoped to (see [`DEFAULT_NAMESPACE`]).
+    pub functions: Arc<DashMap<(String, String), Function>>,
+    pub(crate) active_scope: Arc<std::sync::Mutex<Option<crate::workers::reload::ScopeBuilder>>>,
+    change_listener: Arc<RwLock<Option<Arc<FunctionChangeListener>>>>,
+    /// The observer registry's listener, kept apart from `change_listener`,
+    /// which `engine::functions-available` replaces on every reload.
+    observer_listener: Arc<RwLock<Option<Arc<FunctionChangeListener>>>>,
+}
+
+impl FunctionsRegistry {
+    /// Constructs a registry with a detached scope cell.
+    ///
+    /// The resulting registry's `active_scope` is a fresh `Arc<Mutex<None>>`
+    /// that is NOT shared with any `Engine`, so `begin_worker_scope` calls on
+    /// an Engine will NOT be observed by functions registered here. This is
+    /// only appropriate for isolated unit tests that do not exercise the
+    /// scope API. Production code must go through [`Engine::new`], which
+    /// constructs the registry via [`FunctionsRegistry::with_scope`] so the
+    /// scope cell is shared.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn with_scope(
+        scope: Arc<std::sync::Mutex<Option<crate::workers::reload::ScopeBuilder>>>,
+    ) -> Self {
+        Self {
+            functions: Arc::new(DashMap::new()),
+            active_scope: scope,
+            change_listener: Arc::new(RwLock::new(None)),
+            observer_listener: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    /// Installs the listener told about every register/remove (replacing any
+    /// previous one). The engine uses it to fire `engine::functions-available`.
+    pub fn set_change_listener(&self, listener: Arc<FunctionChangeListener>) {
+        if let Ok(mut slot) = self.change_listener.write() {
+            *slot = Some(listener);
+        }
+    }
+
+    /// Installs the observer registry's listener. Told about every change
+    /// before `change_listener`, so observers settle first.
+    pub(crate) fn set_observer_listener(&self, listener: Arc<FunctionChangeListener>) {
+        if let Ok(mut slot) = self.observer_listener.write() {
+            *slot = Some(listener);
+        }
+    }
+
+    fn notify_change(&self, change: FunctionChange, namespace: &str, function_id: &str) {
+        for slot in [&self.observer_listener, &self.change_listener] {
+            let listener = slot.read().ok().and_then(|slot| slot.clone());
+            if let Some(listener) = listener {
+                listener(change, namespace, function_id);
+            }
+        }
+    }
+
+    /// Registers `function` under [`DEFAULT_NAMESPACE`].
+    ///
+    /// Convenience wrapper over [`Self::register_function_ns`] for the many
+    /// builtin/engine-internal workers that are not namespace-aware.
+    pub fn register_function(&self, function_id: String, function: Function) {
+        self.register_function_ns(DEFAULT_NAMESPACE, function_id, function);
+    }
+
+    pub fn register_function_ns(&self, namespace: &str, function_id: String, function: Function) {
+        tracing::info!(
+            "{} Function {} in namespace {}",
+            "[REGISTERED]".green(),
+            function_id.purple(),
+            namespace.purple()
+        );
+        let key = (namespace.to_string(), function_id.clone());
+        if self.functions.contains_key(&key) {
+            tracing::warn!(
+                "Function {} is already registered in namespace {}. Overwriting.",
+                function_id.purple(),
+                namespace.purple()
+            );
+        }
+        self.functions.insert(key, function);
+        self.notify_change(FunctionChange::Registered, namespace, &function_id);
+
+        // `function_ids` holds bare ids, not `(ns, id)`. Scopes only ever
+        // capture in-process/builtin workers, which register into
+        // DEFAULT_NAMESPACE, so a bare id is unambiguous for the scope's own
+        // consumers. A non-default id can only land here via the process-wide
+        // `active_scope` race documented on `Engine::begin_worker_scope` (a WS
+        // `RegisterFunction` landing inside a builtin's scope window). That is
+        // pre-existing and guarded downstream: `remove_worker_registrations`
+        // skips ids present in `function_owners`, which every WS registration
+        // populates.
+        if let Ok(mut scope) = self.active_scope.lock()
+            && let Some(builder) = scope.as_mut()
+        {
+            builder.function_ids.push(function_id);
+        }
+    }
+
+    pub fn remove(&self, namespace: &str, function_id: &str) {
+        let removed = self
+            .functions
+            .remove(&(namespace, function_id) as &dyn FunctionKey)
+            .is_some();
+        if removed {
+            self.notify_change(FunctionChange::Unregistered, namespace, function_id);
+        }
+        // Prunes by bare id across namespaces — see the note in
+        // `register_function_ns`; the scope only holds default-ns builtin ids
+        // outside the documented race.
+        if let Ok(mut scope) = self.active_scope.lock()
+            && let Some(builder) = scope.as_mut()
+        {
+            builder.function_ids.retain(|id| id != function_id);
+        }
+        tracing::info!(
+            "{} Function {} in namespace {}",
+            "[UNREGISTERED]".red(),
+            function_id.purple(),
+            namespace.purple()
+        );
+    }
+
+    pub fn get(&self, namespace: &str, function_id: &str) -> Option<Function> {
+        self.with_function(namespace, function_id, |function| function.cloned())
+    }
+
+    pub(crate) fn get_handler(&self, namespace: &str, function_id: &str) -> Option<Arc<HandlerFn>> {
+        self.with_function(namespace, function_id, |function| {
+            function.map(|function| Arc::clone(&function.handler))
+        })
+    }
+
+    /// Read a descriptor synchronously; the callback must not re-enter the registry.
+    pub(crate) fn with_function<T>(
+        &self,
+        namespace: &str,
+        function_id: &str,
+        read: impl FnOnce(Option<&Function>) -> T,
+    ) -> T {
+        tracing::debug!(
+            "Searching for function {} in namespace {}",
+            function_id,
+            namespace
+        );
+        let entry = self
+            .functions
+            .get(&(namespace, function_id) as &dyn FunctionKey);
+        read(entry.as_deref())
+    }
+
+    /// Every namespace that has `function_id` registered, sorted. Used to build
+    /// the "did you mean" hint when a lookup misses in the caller's namespace.
+    pub fn namespaces_for(&self, function_id: &str) -> Vec<String> {
+        let mut namespaces: Vec<String> = self
+            .functions
+            .iter()
+            .filter(|entry| entry.key().1 == function_id)
+            .map(|entry| entry.key().0.clone())
+            .collect();
+        namespaces.sort();
+        namespaces
+    }
+
+    pub fn iter(&self) -> dashmap::iter::Iter<'_, (String, String), Function> {
+        self.functions.iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    /// Helper: create a dummy function with a simple handler
+    fn make_function(id: &str) -> Function {
+        Function {
+            handler: Arc::new(|_invocation_id, _input, _session, _metadata| {
+                Box::pin(async { FunctionResult::Success(Some(serde_json::json!({"ok": true}))) })
+            }),
+            _function_id: id.to_string(),
+            _description: Some("test function".to_string()),
+            request_format: None,
+            response_format: None,
+            metadata: None,
+        }
+    }
+
+    // =========================================================================
+    // FunctionResult variants
+    // =========================================================================
+
+    #[test]
+    fn function_result_success_variant() {
+        let result: FunctionResult<i32, String> = FunctionResult::Success(42);
+        match result {
+            FunctionResult::Success(v) => assert_eq!(v, 42),
+            _ => panic!("expected Success"),
+        }
+    }
+
+    #[test]
+    fn function_result_failure_variant() {
+        let result: FunctionResult<i32, String> = FunctionResult::Failure("err".to_string());
+        match result {
+            FunctionResult::Failure(e) => assert_eq!(e, "err"),
+            _ => panic!("expected Failure"),
+        }
+    }
+
+    #[test]
+    fn function_result_deferred_variant() {
+        let result: FunctionResult<i32, String> = FunctionResult::Deferred;
+        match result {
+            FunctionResult::Deferred => {}
+            _ => panic!("expected Deferred"),
+        }
+    }
+
+    #[test]
+    fn function_result_no_result_variant() {
+        let result: FunctionResult<i32, String> = FunctionResult::NoResult;
+        match result {
+            FunctionResult::NoResult => {}
+            _ => panic!("expected NoResult"),
+        }
+    }
+
+    // =========================================================================
+    // Namespaces
+    // =========================================================================
+
+    #[test]
+    fn same_function_id_coexists_across_namespaces() {
+        let reg = FunctionsRegistry::new();
+        reg.register_function_ns(
+            "orders",
+            "state::get".to_string(),
+            make_function("orders_get"),
+        );
+        reg.register_function_ns(
+            "analytics",
+            "state::get".to_string(),
+            make_function("analytics_get"),
+        );
+
+        assert_eq!(
+            reg.get("orders", "state::get").unwrap()._function_id,
+            "orders_get"
+        );
+        assert_eq!(
+            reg.get("analytics", "state::get").unwrap()._function_id,
+            "analytics_get"
+        );
+        assert_eq!(
+            reg.namespaces_for("state::get"),
+            vec!["analytics".to_string(), "orders".to_string()]
+        );
+    }
+
+    #[test]
+    fn register_function_defaults_to_default_namespace() {
+        let reg = FunctionsRegistry::new();
+        reg.register_function("my_fn".to_string(), make_function("my_fn"));
+        assert!(reg.get(DEFAULT_NAMESPACE, "my_fn").is_some());
+    }
+
+    // =========================================================================
+    // FunctionsRegistry
+    // =========================================================================
+
+    #[test]
+    fn registry_new_is_empty() {
+        let reg = FunctionsRegistry::new();
+        assert!(reg.get(DEFAULT_NAMESPACE, "anything").is_none());
+    }
+
+    #[test]
+    fn registry_default_is_empty() {
+        let reg = FunctionsRegistry::default();
+        assert!(reg.get(DEFAULT_NAMESPACE, "anything").is_none());
+    }
+
+    #[test]
+    fn registry_register_and_get() {
+        let reg = FunctionsRegistry::new();
+        let func = make_function("my_fn");
+        reg.register_function("my_fn".to_string(), func);
+        let retrieved = reg.get(DEFAULT_NAMESPACE, "my_fn");
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap()._function_id, "my_fn");
+    }
+
+    #[test]
+    fn registry_get_nonexistent_returns_none() {
+        let reg = FunctionsRegistry::new();
+        assert!(reg.get(DEFAULT_NAMESPACE, "does_not_exist").is_none());
+    }
+
+    #[test]
+    fn registry_remove_function() {
+        let reg = FunctionsRegistry::new();
+        reg.register_function("fn_to_remove".to_string(), make_function("fn_to_remove"));
+        assert!(reg.get(DEFAULT_NAMESPACE, "fn_to_remove").is_some());
+        reg.remove(DEFAULT_NAMESPACE, "fn_to_remove");
+        assert!(reg.get(DEFAULT_NAMESPACE, "fn_to_remove").is_none());
+    }
+
+    #[test]
+    fn registry_remove_nonexistent_does_not_panic() {
+        let reg = FunctionsRegistry::new();
+        reg.remove(DEFAULT_NAMESPACE, "no_such_fn"); // should not panic
+    }
+
+    #[test]
+    fn registry_notifies_listener_on_register_and_effective_remove() {
+        let reg = FunctionsRegistry::new();
+        let seen: Arc<std::sync::Mutex<Vec<(FunctionChange, String, String)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        reg.set_change_listener(Arc::new(move |change, ns: &str, id: &str| {
+            sink.lock()
+                .unwrap()
+                .push((change, ns.to_string(), id.to_string()));
+        }));
+
+        reg.register_function("fn1".to_string(), make_function("fn1"));
+        reg.remove(DEFAULT_NAMESPACE, "fn1");
+        // Removing an id that is not registered is not a change.
+        reg.remove(DEFAULT_NAMESPACE, "fn1");
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                (
+                    FunctionChange::Registered,
+                    DEFAULT_NAMESPACE.to_string(),
+                    "fn1".to_string()
+                ),
+                (
+                    FunctionChange::Unregistered,
+                    DEFAULT_NAMESPACE.to_string(),
+                    "fn1".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn registry_iter() {
+        let reg = FunctionsRegistry::new();
+        reg.register_function("fn1".to_string(), make_function("fn1"));
+        reg.register_function("fn2".to_string(), make_function("fn2"));
+
+        let mut keys: Vec<(String, String)> = reg.iter().map(|entry| entry.key().clone()).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                (DEFAULT_NAMESPACE.to_string(), "fn1".to_string()),
+                (DEFAULT_NAMESPACE.to_string(), "fn2".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn registry_overwrite_existing_function() {
+        let reg = FunctionsRegistry::new();
+        let func1 = Function {
+            handler: Arc::new(|_, _, _, _| Box::pin(async { FunctionResult::Success(None) })),
+            _function_id: "fn".to_string(),
+            _description: Some("version 1".to_string()),
+            request_format: None,
+            response_format: None,
+            metadata: None,
+        };
+        let func2 = Function {
+            handler: Arc::new(|_, _, _, _| Box::pin(async { FunctionResult::Success(None) })),
+            _function_id: "fn".to_string(),
+            _description: Some("version 2".to_string()),
+            request_format: None,
+            response_format: None,
+            metadata: None,
+        };
+        reg.register_function("fn".to_string(), func1);
+        reg.register_function("fn".to_string(), func2);
+        let retrieved = reg.get(DEFAULT_NAMESPACE, "fn").unwrap();
+        assert_eq!(retrieved._description, Some("version 2".to_string()));
+    }
+
+    #[test]
+    fn function_metadata_and_formats() {
+        let func = Function {
+            handler: Arc::new(|_, _, _, _| Box::pin(async { FunctionResult::Success(None) })),
+            _function_id: "fn".to_string(),
+            _description: None,
+            request_format: Some(json!({"type": "object"})),
+            response_format: Some(json!({"type": "string"})),
+            metadata: Some(json!({"version": 1})),
+        };
+        assert!(func._description.is_none());
+        assert_eq!(func.request_format, Some(json!({"type": "object"})));
+        assert_eq!(func.response_format, Some(json!({"type": "string"})));
+        assert_eq!(func.metadata, Some(json!({"version": 1})));
+    }
+
+    // =========================================================================
+    // Function::call_handler
+    // =========================================================================
+
+    #[tokio::test]
+    async fn call_handler_returns_success() {
+        let func = make_function("test");
+        let result = func.call_handler(None, json!({}), None).await;
+        match result {
+            FunctionResult::Success(Some(val)) => {
+                assert_eq!(val, json!({"ok": true}));
+            }
+            _ => panic!("expected Success with value"),
+        }
+    }
+
+    #[tokio::test]
+    async fn call_handler_with_invocation_id() {
+        let invocation_id = Uuid::new_v4();
+        let func = Function {
+            handler: Arc::new(move |inv_id, _input, _session, _metadata| {
+                Box::pin(async move {
+                    if inv_id.is_some() {
+                        FunctionResult::Success(Some(json!({"has_id": true})))
+                    } else {
+                        FunctionResult::Success(Some(json!({"has_id": false})))
+                    }
+                })
+            }),
+            _function_id: "test_with_id".to_string(),
+            _description: None,
+            request_format: None,
+            response_format: None,
+            metadata: None,
+        };
+        let result = func
+            .call_handler(Some(invocation_id), json!({}), None)
+            .await;
+        match result {
+            FunctionResult::Success(Some(val)) => {
+                assert_eq!(val["has_id"], true);
+            }
+            _ => panic!("expected Success"),
+        }
+    }
+
+    #[tokio::test]
+    async fn call_handler_failure() {
+        let func = Function {
+            handler: Arc::new(|_, _, _, _| {
+                Box::pin(async {
+                    FunctionResult::Failure(ErrorBody {
+                        code: "test_error".to_string(),
+                        message: "something failed".to_string(),
+                        stacktrace: None,
+                    })
+                })
+            }),
+            _function_id: "failing_fn".to_string(),
+            _description: None,
+            request_format: None,
+            response_format: None,
+            metadata: None,
+        };
+        let result = func.call_handler(None, json!({}), None).await;
+        match result {
+            FunctionResult::Failure(e) => {
+                assert_eq!(e.code, "test_error");
+                assert_eq!(e.message, "something failed");
+            }
+            _ => panic!("expected Failure"),
+        }
+    }
+}

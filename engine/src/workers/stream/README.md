@@ -1,0 +1,262 @@
+# iii-stream
+
+> **Deprecated.** iii-stream is deprecated (iii-stream) and will be removed in an upcoming release.
+> Behavior is unchanged for now. Migration guide:
+> https://iii.dev/docs/upgrading/migrate-from-streams
+
+Durable streams for real-time data subscriptions. Streams organize data hierarchically: `stream_name` > `group_id` > `item_id`. Clients subscribe via WebSocket and receive real-time updates when items change.
+
+When a worker triggers `stream::set`, the engine:
+1. Persists the data via the configured adapter (Redis or KvStore)
+2. Publishes a notification to all WebSocket clients subscribed to that stream and group
+3. Evaluates registered `stream` triggers and fires matching handlers
+
+`iii-stream` is engine-owned. Configure it under `engine.workers.iii-stream` in a managed
+`worker-compose.yaml`.
+
+## Skills
+
+Install the `iii-stream` agent skill for Claude Code, Cursor, and 30+ other agents:
+
+```bash
+npx skills add iii-hq/iii --full-depth --skill iii-stream
+```
+
+## Sample Configuration
+
+```yaml
+engine:
+  workers:
+    iii-stream:
+      port: ${STREAM_PORT:3112}
+      host: 0.0.0.0
+      adapter:
+        name: redis
+        config:
+          redis_url: ${REDIS_URL:redis://localhost:6379}
+```
+
+## Configuration
+
+| Field | Type | Description |
+|---|---|---|
+| `port` | number | The port to listen on. Defaults to `3112`. |
+| `host` | string | The host to listen on. Defaults to `0.0.0.0`. |
+| `auth_function` | string | Function ID to authenticate WebSocket connections. |
+| `adapter` | Adapter | Adapter for stream storage and real-time delivery. |
+
+## Runtime configuration (hot reload)
+
+`iii-stream` registers its configuration with the builtin `configuration` worker
+under the id **`iii-stream`**, so the fields above can be read and changed at
+runtime (e.g. `configuration::set { id: "iii-stream", value: { ... } }`) without
+restarting the engine. The `engine.workers` block is the **seed** used on first boot
+only; afterwards the configuration entry is the runtime source of truth and a
+runtime edit survives engine restarts. Values are validated against the schema
+at set time, and `${VAR:default}` placeholders are expanded on read.
+
+Each field applies on its own tier:
+
+- **`auth_function`** applies to new connections immediately — no rebind. (It is
+  consulted only when a client connects, so existing connections are unaffected.)
+- **`host`/`port`** trigger a **listener rebind**: the new address is bound, the
+  WebSocket server is respawned on it, and the old listener is torn down. Live
+  connections on the old address are dropped (clients reconnect). The rebind is
+  gated — a value that fails to bind keeps the previous server running. Note that
+  changing **only the host on the same port** between overlapping interfaces (e.g.
+  `0.0.0.0` ↔ `127.0.0.1`) won't rebind: the new address can't bind while the old
+  listener still holds the port, so the change is logged and the previous server
+  kept. Change the port too, or restart, to move between overlapping interfaces.
+- **`adapter`** triggers a **full backend hot-swap**: the new pub/sub backend is
+  built, swapped in, and its event pump restarted. New connections use it; the
+  swap is gated (a value that fails to build the backend keeps the previous one).
+  Existing connections remain bound to the **previous** backend until they close,
+  so they no longer receive new events — prefer a quiet moment to repoint the
+  adapter in a multi-instance deployment.
+
+## Adapters
+
+### redis
+
+Uses Redis as the backend. Stores stream data in Redis and uses Redis Pub/Sub for real-time delivery.
+
+```yaml
+name: redis
+config:
+  redis_url: ${REDIS_URL:redis://localhost:6379}
+```
+
+### kv
+
+Built-in key-value store. Supports in-memory or file-based persistence. No external dependencies required.
+
+```yaml
+name: kv
+config:
+  store_method: file_based
+  file_path: ./data/streams_store.db
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `store_method` | string | `in_memory` (lost on restart) or `file_based` (persisted to disk). |
+| `file_path` | string | Directory path for file-based storage. |
+
+## Functions
+
+### `stream::set`
+
+Sets a value in the stream. Notifies all WebSocket subscribers and fires `stream` triggers.
+
+Parameters: `stream_name` (string), `group_id` (string), `item_id` (string), `data` (any)
+
+Returns: `old_value` (any), `new_value` (any)
+
+### `stream::get`
+
+Gets a value from the stream.
+
+Parameters: `stream_name` (string), `group_id` (string), `item_id` (string)
+
+Returns: `value` (any)
+
+### `stream::delete`
+
+Deletes a value from the stream.
+
+Parameters: `stream_name` (string), `group_id` (string), `item_id` (string)
+
+Returns: `old_value` (any)
+
+### `stream::list`
+
+Retrieves all items in a group.
+
+Parameters: `stream_name` (string), `group_id` (string)
+
+Returns: `group` (any[])
+
+### `stream::list_groups`
+
+Lists all groups in a stream.
+
+Parameters: `stream_name` (string)
+
+Returns: `groups` (string[])
+
+### `stream::list_all`
+
+Lists all streams with their group metadata.
+
+Returns: `stream` (object[]), `count` (number)
+
+### `stream::send`
+
+Sends a custom event to all subscribers of a stream group (without persisting).
+
+Parameters: `stream_name` (string), `group_id` (string), `type` (string), `data` (any), `id` (string, optional)
+
+### `stream::update`
+
+Atomically updates an item using a list of operations (`set`, `merge`, `increment`, `decrement`, `append`, `remove`).
+
+Parameters: `stream_name` (string), `group_id` (string), `item_id` (string), `ops` (UpdateOp[])
+
+Returns: `old_value` (any), `new_value` (any)
+
+## Authentication
+
+Define a function that receives request data (`headers`, `path`, `query_params`, `addr`) and returns `{ context: ... }`. Set it in config:
+
+```yaml
+- name: iii-stream
+  config:
+    auth_function: onAuth
+```
+
+**TypeScript:**
+```typescript
+iii.registerFunction('onAuth', (input) => ({
+  context: { name: 'John Doe' },
+}))
+```
+
+**Python:**
+```python
+def on_auth(input):
+    return {'context': {'name': 'John Doe'}}
+
+iii.register_function("onAuth", on_auth)
+```
+
+## Trigger Types
+
+### `stream`
+
+Fires when an item changes (via `stream::set`, `stream::update`, or `stream::delete`).
+
+| Config Field | Type | Description |
+|---|---|---|
+| `stream_name` | string | Required. Only changes on this stream fire the handler. |
+| `group_id` | string | If set, only changes within this group fire the handler. |
+| `item_id` | string | If set, only changes to this specific item fire the handler. |
+| `condition_function_id` | string | Function ID for conditional execution. |
+
+Payload fields: `type` (`create`/`update`/`delete`), `timestamp`, `streamName`, `groupId`, `id`, `event` (object with `type` and `data`).
+
+### `stream:join` and `stream:leave`
+
+Fire when a client connects or disconnects via WebSocket.
+
+Payload fields: `subscription_id`, `stream_name`, `group_id`, `id` (optional), `context` (from auth).
+
+```typescript
+const fn = iii.registerFunction('onJoin', (input) => {
+  console.log(`Joined ${input.stream_name}/${input.group_id}`, input.context)
+  return {}
+})
+
+iii.registerTrigger({
+  type: 'stream:join',
+  function_id: fn.id,
+  config: {},
+})
+```
+
+## Usage Example: Real-Time Presence
+
+```typescript
+import { registerWorker, TriggerAction } from 'iii-sdk'
+
+const iii = registerWorker('ws://localhost:49134')
+
+// Set presence
+iii.trigger({
+  function_id: 'stream::set',
+  payload: {
+    stream_name: 'presence',
+    group_id: 'room-1',
+    item_id: 'user-123',
+    data: { name: 'Alice', online: true, lastSeen: new Date().toISOString() },
+  },
+  action: TriggerAction.Void(),
+})
+
+// Get a user
+const user = await iii.trigger({
+  function_id: 'stream::get',
+  payload: { stream_name: 'presence', group_id: 'room-1', item_id: 'user-123' },
+})
+
+// List all members in a room
+const roomMembers = await iii.trigger({
+  function_id: 'stream::list',
+  payload: { stream_name: 'presence', group_id: 'room-1' },
+})
+```
+
+## Client Subscriptions
+
+Browser and client subscriptions use the Browser SDK (`iii-browser-sdk`), which subscribes to `stream` changes over a single engine WebSocket and re-renders on each change event. Connections are gated by the [iii-worker-manager](https://workers.iii.dev/workers/iii-worker-manager) RBAC listener. See the [Linkly frontend tutorial](https://iii.dev/docs/tutorials/linkly/frontend) for the end-to-end pattern.
+
+Connecting directly to the stream port (`ws://host:3112/stream/<stream_name>/<group_id>/`) is deprecated in favor of the Browser SDK.

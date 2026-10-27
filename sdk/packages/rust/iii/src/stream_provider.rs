@@ -1,0 +1,34 @@
+// The trait signatures name the deprecated legacy `Stream*Input` models.
+#![allow(deprecated)]
+
+use async_trait::async_trait;
+use iii_helpers::stream::{
+    StreamDeleteInput, StreamDeleteResult, StreamGetInput, StreamListGroupsInput, StreamListInput,
+    StreamSetInput, StreamSetResult, StreamUpdateInput, StreamUpdateResult,
+};
+use serde_json::Value;
+
+use crate::error::Error;
+
+/// Custom stream-provider trait. Implementors override the engine's built-in
+/// stream storage for a specific stream name when registered through
+/// `create_stream` in the `helpers` submodule.
+#[deprecated(
+    note = "IStream is deprecated (iii-stream) and will be removed in an upcoming release. Behavior is unchanged for now. Migration guide: https://iii.dev/docs/upgrading/migrate-from-streams"
+)]
+// async_trait injects #[must_use] on boxed Future-returning trait methods.
+// Rust 1.99 Clippy now recognizes that Future is already must_use. Keep this
+// compatibility exception on the affected trait, not the crate or its impls.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait generates redundant must_use on boxed futures"
+)]
+#[async_trait]
+pub trait IStream: Send + Sync + 'static {
+    async fn get(&self, input: StreamGetInput) -> Result<Option<Value>, Error>;
+    async fn set(&self, input: StreamSetInput) -> Result<Option<StreamSetResult>, Error>;
+    async fn delete(&self, input: StreamDeleteInput) -> Result<StreamDeleteResult, Error>;
+    async fn list(&self, input: StreamListInput) -> Result<Vec<Value>, Error>;
+    async fn list_groups(&self, input: StreamListGroupsInput) -> Result<Vec<String>, Error>;
+    async fn update(&self, input: StreamUpdateInput) -> Result<Option<StreamUpdateResult>, Error>;
+}

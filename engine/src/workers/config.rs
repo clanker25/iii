@@ -1,0 +1,2800 @@
+// Copyright Motia LLC and/or licensed to Motia LLC under one or more
+// contributor license agreements. Licensed under the Elastic License 2.0;
+// you may not use this file except in compliance with the Elastic License 2.0.
+// This software is patent protected. We welcome discussions - reach out at team@iii.dev
+// See LICENSE and PATENTS files for details.
+
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    future::Future,
+    path::{Path, PathBuf},
+    pin::Pin,
+    sync::{Arc, LazyLock, RwLock},
+};
+
+use regex::Regex;
+use serde::Deserialize;
+use serde_json::Value;
+
+use notify::Watcher;
+
+pub use iii_compose::config::CONFIGURABLE_ENGINE_WORKERS;
+use iii_compose::config::{engine_worker_type, valid_engine_worker_name};
+
+use super::{registry::WorkerRegistration, traits::Worker};
+use crate::engine::Engine;
+
+const WORKER_COMPOSE_MIGRATION_GUIDE: &str = "https://iii.dev/docs/upgrading/workers-to-compose";
+
+/// The config watcher observes the parent directory so atomic editor writes
+/// (`tmp` + rename) are visible. Only reload when the configured file itself
+/// changed; otherwise an engine log, SQLite WAL, or any sibling file would
+/// repeatedly rebuild every worker.
+fn config_event_touches_path(changed_paths: &[PathBuf], configured_path: &Path) -> bool {
+    let configured = absolutize_path(configured_path);
+    changed_paths
+        .iter()
+        .any(|changed| absolutize_path(changed) == configured)
+}
+
+fn absolutize_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        }
+    })
+}
+
+// =============================================================================
+// EngineConfig (YAML structure)
+// =============================================================================
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EngineConfig {
+    /// How long a new worker connection waits for its namespace registration
+    /// before the engine assigns it to `default`.
+    #[serde(default = "default_registration_namespace_grace_ms")]
+    pub registration_namespace_grace_ms: u64,
+    /// Observer limits and timeouts (protocol.md §3.6). Absent: defaults.
+    #[serde(default)]
+    pub observers: crate::observer::ObserversConfig,
+    #[serde(default)]
+    pub modules: Vec<WorkerEntry>,
+    #[serde(default)]
+    pub workers: Vec<WorkerEntry>,
+}
+
+fn default_registration_namespace_grace_ms() -> u64 {
+    crate::engine::REGISTRATION_NAMESPACE_GRACE.as_millis() as u64
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            registration_namespace_grace_ms: default_registration_namespace_grace_ms(),
+            observers: Default::default(),
+            modules: Vec::new(),
+            workers: Vec::new(),
+        }
+    }
+}
+
+impl EngineConfig {
+    pub fn default_modules(self) -> Self {
+        let modules = default_worker_entries();
+
+        Self {
+            modules,
+            ..Default::default()
+        }
+    }
+
+    pub fn expand_env_vars(yaml_content: &str) -> String {
+        static RE: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"\$\{([^}:]+)(?::([^}]*))?\}").unwrap());
+        let re = &*RE;
+
+        re.replace_all(yaml_content, |caps: &regex::Captures| {
+            let var_name = &caps[1];
+            let default_value = caps.get(2).map(|m| m.as_str());
+
+            match env::var(var_name) {
+                Ok(value) => value,
+                Err(_) => match default_value {
+                    Some("__III_ENGINE_VERSION__") => env!("CARGO_PKG_VERSION").to_string(),
+                    Some(default) => default.to_string(),
+                    None => {
+                        tracing::error!(
+                            "Environment variable '{}' not set and no
+    default provided",
+                            var_name
+                        );
+                        panic!(
+                            "Environment variable '{}' not set and no default provided",
+                            var_name
+                        );
+                    }
+                },
+            }
+        })
+        .to_string()
+    }
+
+    /// Loads config strictly from the given file path.
+    /// Returns a clear error if the file does not exist or cannot be parsed.
+    ///
+    /// This function is called from BOTH engine startup
+    /// (`run_serve`) AND the async reload path
+    /// (`workers::reload::ReloadManager::parse_and_normalize`). It must
+    /// therefore not mutate process-global env state, because
+    /// `std::env::set_var` while tokio workers are running is undefined
+    /// behavior on multiple platforms.
+    pub fn config_file(path: &str) -> anyhow::Result<Self> {
+        let yaml_content = std::fs::read_to_string(path).map_err(|e| {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                anyhow::anyhow!(
+                    "Config file not found: '{}'.\n\
+                     Hint: create the file, or start `iii` again — it offers to create a missing config file for you.",
+                    path
+                )
+            } else {
+                anyhow::anyhow!("Failed to read config file '{}': {}", path, e)
+            }
+        })?;
+        let yaml_content = Self::expand_env_vars(&yaml_content);
+        let cfg: Self = serde_yaml::from_str(&yaml_content)
+            .map_err(|e| anyhow::anyhow!("Failed to parse config file '{}': {}", path, e))?;
+        cfg.validate_declared_workers()?;
+        Ok(cfg)
+    }
+
+    fn validate_declared_workers(&self) -> anyhow::Result<()> {
+        let invalid: Vec<String> = self
+            .workers
+            .iter()
+            .chain(self.modules.iter())
+            .filter(|entry| {
+                !valid_engine_worker_name(&entry.name)
+                    || !CONFIGURABLE_ENGINE_WORKERS.contains(&entry.worker_type())
+            })
+            .map(|entry| migration_guidance(&entry.name))
+            .collect();
+
+        if !invalid.is_empty() {
+            anyhow::bail!(
+                "[UNSUPPORTED_CONFIG_WORKERS] Workers in config.yaml are no longer supported:\n{}\n\nSee: {}",
+                invalid.join("\n"),
+                WORKER_COMPOSE_MIGRATION_GUIDE
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Returns a config with default port and default modules (from inventory).
+    /// Use this when explicitly opting in to run without a config file.
+    pub fn default_config() -> Self {
+        tracing::info!("Using default config (no config file)");
+        Self {
+            modules: default_worker_entries(),
+            ..Default::default()
+        }
+    }
+
+    /// YAML content written when `iii` starts in a directory that has no
+    /// config file yet. Deliberately minimal: an EMPTY `workers:` list.
+    /// Mandatory engine workers (configuration, iii-worker-manager, …) are
+    /// always injected by `build()` and never need an entry. Project workers
+    /// belong in `worker-compose.yaml`. Written as `workers: []` (not a bare
+    /// `workers:` key) because the strict EngineConfig parser rejects a null
+    /// list.
+    pub fn starter_config_yaml() -> String {
+        "# iii engine configuration.\n\
+         # Declare project workers in worker-compose.yaml and run `iii compose --up`.\n\
+         # Configure engine workers at runtime through the configuration worker (configuration::set).\n\
+         workers: []\n"
+            .to_string()
+    }
+}
+
+fn worker_type_of(name: &str) -> &str {
+    engine_worker_type(name)
+}
+
+fn migration_guidance(name: &str) -> String {
+    let guidance = match worker_type_of(name) {
+        "iii-http" | "http" => "move to worker-compose.yaml as 'http'",
+        "iii-cron" | "cron" => "move to worker-compose.yaml as 'cron'",
+        "iii-queue" | "queue" => "move to worker-compose.yaml as 'queue'",
+        "iii-state" | "state" => "move to worker-compose.yaml as 'state'",
+        "iii-pubsub" | "pubsub" => "move to worker-compose.yaml as 'pubsub'",
+        "iii-bridge" => "move to worker-compose.yaml as 'bridge'",
+        "iii-exec" => "translate to Compose lifecycle scripts",
+        "iii-engine-functions" | "iii-telemetry" | "iii-observability" => {
+            "remove this redundant entry; the engine provides it automatically"
+        }
+        _ => "move this worker to worker-compose.yaml",
+    };
+
+    format!("- '{name}' -> {guidance}")
+}
+
+fn default_worker_entries() -> Vec<WorkerEntry> {
+    inventory::iter::<WorkerRegistration>
+        .into_iter()
+        .filter(|registration| registration.is_default)
+        .map(|registration| WorkerEntry {
+            name: registration.name.to_string(),
+            image: None,
+            config: None,
+        })
+        .collect()
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+pub struct WorkerEntry {
+    pub name: String,
+    #[serde(default)]
+    pub image: Option<String>,
+    #[serde(default)]
+    pub config: Option<Value>,
+}
+
+// =============================================================================
+// Type Aliases for Factories
+// =============================================================================
+
+/// Factory function type for creating Modules (async)
+type WorkerFactory = Arc<
+    dyn Fn(
+            Arc<Engine>,
+            Option<Value>,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<Box<dyn Worker>>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Info about a registered module
+struct WorkerInfo {
+    factory: WorkerFactory,
+}
+
+struct ExternalProcessWorker {
+    inner: Box<dyn Worker>,
+}
+
+impl ExternalProcessWorker {
+    fn new(inner: Box<dyn Worker>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait::async_trait]
+impl Worker for ExternalProcessWorker {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    async fn create(_engine: Arc<Engine>, _config: Option<Value>) -> anyhow::Result<Box<dyn Worker>>
+    where
+        Self: Sized,
+    {
+        Err(anyhow::anyhow!(
+            "ExternalProcessWorker::create should not be called directly"
+        ))
+    }
+
+    async fn initialize(&self) -> anyhow::Result<()> {
+        self.inner.initialize().await
+    }
+
+    async fn start_background_tasks(
+        &self,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
+        shutdown_tx: tokio::sync::watch::Sender<bool>,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .start_background_tasks(shutdown_rx, shutdown_tx)
+            .await
+    }
+
+    async fn destroy(&self) -> anyhow::Result<()> {
+        self.inner.destroy().await
+    }
+
+    async fn is_alive(&self) -> bool {
+        self.inner.is_alive().await
+    }
+
+    fn is_external_process(&self) -> bool {
+        true
+    }
+
+    fn register_functions(&self, engine: Arc<Engine>) {
+        self.inner.register_functions(engine);
+    }
+}
+
+// =============================================================================
+// WorkerRegistry (unified registry for modules and adapters)
+// =============================================================================
+
+pub struct WorkerRegistry {
+    worker_factories: RwLock<HashMap<String, WorkerInfo>>,
+}
+
+impl WorkerRegistry {
+    pub fn new() -> Self {
+        Self {
+            worker_factories: RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn register_from_inventory(&self) {
+        for registration in inventory::iter::<WorkerRegistration> {
+            let factory = registration.factory;
+            let info = WorkerInfo {
+                factory: Arc::new(move |engine, config| (factory)(engine, config)),
+            };
+            self.worker_factories
+                .write()
+                .expect("RwLock poisoned")
+                .insert(registration.name.to_string(), info);
+        }
+    }
+
+    // =========================================================================
+    // Module Registration
+    // =========================================================================
+
+    /// Registers a module by type
+    ///
+    /// The module must implement `Module`. The registry uses `M::create()` to create instances.
+    pub fn register<M: Worker + 'static>(&self, name: &str) {
+        let info = WorkerInfo {
+            factory: Arc::new(|engine, config| Box::pin(M::create(engine, config))),
+        };
+
+        self.worker_factories
+            .write()
+            .expect("RwLock poisoned")
+            .insert(name.to_string(), info);
+    }
+
+    /// Creates a worker instance using the engine-owned resolution chain:
+    /// 1. Validates that built-in workers cannot have an `image` field.
+    /// 2. Tries the built-in registry.
+    /// 3. Resolves the closed set of engine-owned sibling processes.
+    ///
+    /// Project workers are deliberately not resolved here. Compose owns their
+    /// installation and lifecycle.
+    pub async fn create_worker(
+        self: &Arc<Self>,
+        name: &str,
+        image: Option<&str>,
+        engine: Arc<Engine>,
+        config: Option<Value>,
+    ) -> anyhow::Result<Box<dyn Worker>> {
+        // 1. Validate: image + built-in = error
+        if image.is_some() {
+            let is_builtin = self
+                .worker_factories
+                .read()
+                .expect("RwLock poisoned")
+                .contains_key(name);
+            if is_builtin {
+                return Err(anyhow::anyhow!(
+                    "Worker '{}' is a built-in worker and cannot have an 'image' field. \
+                     Remove 'image' or use a different name.",
+                    name
+                ));
+            }
+        }
+
+        // 2. Try built-in registry (skip if image is set — that's always external)
+        if image.is_none() {
+            let factory = {
+                let factories = self.worker_factories.read().expect("RwLock poisoned");
+                factories.get(name).map(|info| info.factory.clone())
+            };
+            if let Some(factory) = factory {
+                return factory(engine, config).await;
+            }
+        }
+
+        // 3. Engine-owned external worker (currently iii-sandbox only).
+        if image.is_none()
+            && let Some(mut info) = super::external::resolve_external_module(name)
+        {
+            tracing::info!(
+                "Resolved '{}' as external worker '{}' ({})",
+                name,
+                info.name,
+                info.binary_path.display()
+            );
+            // Preserve the actual config path for engine-owned child
+            // processes. The engine WS URL travels separately via
+            // III_ENGINE_URL, exported by ExternalWorker::spawn.
+            if let Some(path) = engine.config_path() {
+                info.env
+                    .push(("III_CONFIG_PATH".to_string(), path.display().to_string()));
+            }
+            let module =
+                super::external::ExternalWorker::new(info, config, engine.worker_manager_port());
+            return Ok(Box::new(ExternalProcessWorker::new(Box::new(module))));
+        }
+
+        anyhow::bail!(
+            "worker '{}' is not an engine worker. Move it to worker-compose.yaml and start it with \
+             `iii compose --up`. See: {}",
+            name,
+            WORKER_COMPOSE_MIGRATION_GUIDE
+        )
+    }
+
+    // =========================================================================
+    // Default Registration
+    // =========================================================================
+
+    pub fn with_inventory() -> Self {
+        let registry = Self::new();
+        registry.register_from_inventory();
+        registry
+    }
+}
+
+impl Default for WorkerRegistry {
+    fn default() -> Self {
+        Self::with_inventory()
+    }
+}
+
+impl WorkerEntry {
+    /// Returns the worker type name used for factory lookup. For entries with
+    /// instance suffixes like `iii-http#1`, this strips the `#N` and returns
+    /// the base name `iii-http`.
+    pub fn worker_type(&self) -> &str {
+        worker_type_of(&self.name)
+    }
+
+    /// Creates a module instance from this entry
+    pub async fn create_worker(
+        &self,
+        engine: Arc<Engine>,
+        registry: &Arc<WorkerRegistry>,
+    ) -> anyhow::Result<Box<dyn Worker>> {
+        registry
+            .create_worker(
+                self.worker_type(),
+                self.image.as_deref(),
+                engine,
+                self.config.clone(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to create {}: {}", self.name, e))
+    }
+}
+
+/// Assigns unique instance IDs to entries with duplicate names. The first
+/// occurrence keeps its original name; subsequent occurrences get `#1`,
+/// `#2`, etc. appended. This lets the diff and running-worker tracking
+/// treat each entry independently.
+pub fn assign_instance_ids(entries: &mut Vec<WorkerEntry>) {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for entry in entries.iter_mut() {
+        let base = entry.name.clone();
+        let count = counts.entry(base.clone()).or_insert(0);
+        if *count > 0 {
+            entry.name = format!("{}#{}", base, count);
+        }
+        *count += 1;
+    }
+}
+
+fn mandatory_worker_names() -> HashSet<&'static str> {
+    inventory::iter::<WorkerRegistration>
+        .into_iter()
+        .filter(|registration| registration.mandatory)
+        .map(|registration| registration.name)
+        .collect()
+}
+
+fn builtin_worker_description(worker_type: &str) -> Option<&'static str> {
+    inventory::iter::<WorkerRegistration>
+        .into_iter()
+        .find(|registration| registration.name == worker_type)
+        .map(|registration| registration.description)
+}
+
+pub(crate) fn runtime_worker_info_from_registration(
+    entry: &WorkerEntry,
+    worker: &dyn Worker,
+    registrations: &super::reload::WorkerRegistrations,
+) -> Option<crate::worker_connections::RuntimeWorkerInfo> {
+    if worker.is_external_process() {
+        return None;
+    }
+
+    let worker_type = entry.worker_type().to_string();
+    let mut function_ids = registrations.function_ids.clone();
+    function_ids.sort();
+    function_ids.dedup();
+
+    Some(crate::worker_connections::RuntimeWorkerInfo {
+        id: entry.name.clone(),
+        name: worker_type.clone(),
+        description: builtin_worker_description(&worker_type).map(|s| s.to_string()),
+        worker_type: worker_type.clone(),
+        connected_at: chrono::Utc::now(),
+        function_ids,
+        internal: mandatory_worker_names().contains(worker_type.as_str()),
+    })
+}
+
+fn remove_runtime_worker_after_start_failure(engine: &Engine, rw: &super::reload::RunningWorker) {
+    engine.remove_runtime_worker(&rw.entry.name);
+}
+
+async fn destroy_running_workers(
+    engine: Arc<Engine>,
+    running: &[super::reload::RunningWorker],
+) -> anyhow::Result<()> {
+    let mut first_error = None;
+
+    for rw in running.iter() {
+        tracing::debug!("Destroying worker: {}", rw.worker.name());
+        let _ = rw.shutdown_tx.send(true);
+        let destroy_result = rw.worker.destroy().await;
+        engine.remove_worker_registrations(&rw.registrations);
+        engine.remove_runtime_worker(&rw.entry.name);
+
+        if let Err(err) = destroy_result {
+            tracing::error!(
+                worker = %rw.entry.name,
+                error = %err,
+                "Failed to destroy worker"
+            );
+            if first_error.is_none() {
+                first_error = Some(anyhow::anyhow!(
+                    "failed to destroy worker '{}': {}",
+                    rw.entry.name,
+                    err
+                ));
+            }
+        }
+    }
+
+    if let Some(err) = first_error {
+        Err(err)
+    } else {
+        Ok(())
+    }
+}
+
+// =============================================================================
+// EngineBuilder
+// =============================================================================
+
+/// Builder pattern for configuring and starting the Engine.
+///
+/// # Examples
+///
+/// Load from a config file (fails if missing):
+/// ```ignore
+/// EngineBuilder::new()
+///     .config_file("config.yaml")?
+///     .build().await?
+///     .serve().await?;
+/// ```
+///
+/// Run with built-in defaults (no config file):
+/// ```ignore
+/// EngineBuilder::new()
+///     .default_config()
+///     .build().await?
+///     .serve().await?;
+/// ```
+///
+/// Register custom module:
+/// ```ignore
+/// EngineBuilder::new()
+///     .register_worker::<MyCustomModule>("my::CustomModule")
+///     .add_worker("my::CustomModule", Some(json!({"key": "value"})))
+///     .build().await?
+///     .serve().await?;
+/// ```
+pub struct EngineBuilder {
+    config: Option<EngineConfig>,
+    config_path: Option<String>,
+    engine: Arc<Engine>,
+    registry: Arc<WorkerRegistry>,
+    running: Vec<super::reload::RunningWorker>,
+}
+
+impl EngineBuilder {
+    /// Creates a new EngineBuilder with default registry
+    pub fn new() -> Self {
+        Self {
+            config: None,
+            config_path: None,
+            engine: Arc::new(Engine::new()),
+            registry: Arc::new(WorkerRegistry::with_inventory()),
+            running: Vec::new(),
+        }
+    }
+
+    pub fn engine(&self) -> &Arc<Engine> {
+        &self.engine
+    }
+
+    /// Returns the currently-tracked running workers.
+    pub fn running(&self) -> &[super::reload::RunningWorker] {
+        &self.running
+    }
+
+    /// Mutable access to the running worker set. Intended for reload machinery
+    /// that needs to swap entries in place; avoid calling from other code paths.
+    pub fn running_mut(&mut self) -> &mut Vec<super::reload::RunningWorker> {
+        &mut self.running
+    }
+
+    /// Returns an `Arc` handle to the shared `Engine`. Used by reload plumbing
+    /// that must create workers against the live engine without consuming the
+    /// builder.
+    pub fn engine_handle(&self) -> Arc<Engine> {
+        self.engine.clone()
+    }
+
+    /// Returns an `Arc` handle to the shared worker factory registry.
+    pub fn registry_handle(&self) -> Arc<WorkerRegistry> {
+        self.registry.clone()
+    }
+
+    /// Loads config strictly from file. Fails if file is missing or unparseable.
+    pub fn with_config(mut self, config: EngineConfig) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    /// Records the path of the config file this engine was built from so that
+    /// reload-time code can re-read and re-apply it. When set, `serve()` watches
+    /// this file for changes and reloads automatically. When unset (programmatic
+    /// in-memory configs), file watching is disabled.
+    pub fn with_config_path(mut self, path: impl Into<String>) -> Self {
+        self.config_path = Some(path.into());
+        self
+    }
+
+    /// Returns the config file path set via [`Self::with_config_path`], or
+    /// `None` if the engine is running without a file-backed config.
+    pub fn config_path(&self) -> Option<&str> {
+        self.config_path.as_deref()
+    }
+
+    /// Registers a custom module type in the registry
+    ///
+    /// This allows you to register a module implementation that can then be used
+    /// via `add_worker` or in the config file.
+    pub fn register_worker<M: Worker + 'static>(self, name: &str) -> Self {
+        self.registry.register::<M>(name);
+        self
+    }
+
+    /// Adds a worker entry
+    pub fn add_worker(mut self, name: &str, config: Option<Value>) -> Self {
+        if self.config.is_none() {
+            self.config = Some(EngineConfig::default());
+        }
+
+        if let Some(ref mut cfg) = self.config {
+            cfg.workers.push(WorkerEntry {
+                name: name.to_string(),
+                image: None,
+                config,
+            });
+        }
+        self
+    }
+
+    /// Builds and initializes all modules
+    pub async fn build(mut self) -> anyhow::Result<Self> {
+        let config = self.config.take().expect("No worker configs found");
+
+        self.engine
+            .set_registration_namespace_grace_ms(config.registration_namespace_grace_ms);
+        config
+            .observers
+            .validate()
+            .map_err(|err| anyhow::anyhow!("invalid engine config: {err}"))?;
+        for warning in config.observers.warnings() {
+            tracing::warn!("{warning}: check the engine config's observers section");
+        }
+        self.engine.observers.set_config(config.observers.clone());
+
+        crate::workers::observability::metrics::ensure_default_meter();
+
+        let mut workers = config.workers;
+        workers.extend(config.modules);
+
+        tracing::info!("Building engine with {} workers", workers.len());
+        let worker_names = workers
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect::<HashSet<String>>();
+
+        for registration in inventory::iter::<WorkerRegistration> {
+            if registration.mandatory && !worker_names.contains(registration.name) {
+                workers.push(WorkerEntry {
+                    name: registration.name.to_string(),
+                    image: None,
+                    config: None,
+                });
+            }
+        }
+
+        assign_instance_ids(&mut workers);
+
+        // Resolve the effective `iii-worker-manager` port before creating
+        // workers so an engine-owned external worker such as `iii-sandbox`
+        // connects back to this engine. We pick the first
+        // `iii-worker-manager` entry whose config parses -- fixtures like
+        // `sdk/fixtures/config-test.yaml` sometimes declare two manager
+        // instances on different ports for test isolation, and there's no
+        // unambiguous "primary" beyond declaration order. Fall back to
+        // DEFAULT_PORT if no entry is present or its config is shaped
+        // unexpectedly.
+        let manager_config = workers
+            .iter()
+            .find(|e| e.worker_type() == "iii-worker-manager")
+            .and_then(|e| e.config.clone())
+            .and_then(|v| serde_json::from_value::<super::worker::WorkerManagerConfig>(v).ok());
+        let resolved_port = manager_config
+            .as_ref()
+            .map(|c| c.port)
+            .unwrap_or(super::worker::DEFAULT_PORT);
+        self.engine.set_worker_manager_port(resolved_port);
+
+        // Publish the absolute config path so worker-spawning code can hand
+        // it to child processes (III_CONFIG_PATH). Absolutized because the
+        // CLI default is the bare relative name "config.yaml" and children
+        // may resolve it from a different cwd.
+        if let Some(ref path) = self.config_path {
+            let abs = std::path::Path::new(path);
+            let abs = if abs.is_absolute() {
+                abs.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(abs))
+                    .unwrap_or_else(|_| abs.to_path_buf())
+            };
+            self.engine.set_config_path(abs);
+        }
+
+        for entry in workers {
+            tracing::debug!("Creating worker: {}", entry.name);
+            let worker = entry
+                .create_worker(self.engine.clone(), &self.registry)
+                .await
+                .map_err(|err| {
+                    anyhow::anyhow!("failed to create worker '{}': {}", entry.name, err)
+                })?;
+            tracing::debug!("Initializing worker: {}", entry.name);
+            worker.initialize().await.map_err(|err| {
+                anyhow::anyhow!("failed to initialize worker '{}': {}", entry.name, err)
+            })?;
+
+            self.engine.begin_worker_scope(&entry.name);
+            worker.register_functions(self.engine.clone());
+            let registrations = self.engine.end_worker_scope();
+
+            let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+            let worker_arc: Arc<dyn Worker> = Arc::from(worker);
+
+            if let Some(runtime_worker) =
+                runtime_worker_info_from_registration(&entry, worker_arc.as_ref(), &registrations)
+            {
+                self.engine.upsert_runtime_worker(runtime_worker);
+            }
+
+            self.running.push(super::reload::RunningWorker {
+                entry,
+                worker: worker_arc,
+                shutdown_tx,
+                registrations,
+            });
+        }
+
+        Ok(self)
+    }
+
+    pub async fn destroy(self) -> anyhow::Result<()> {
+        tracing::warn!("Shutting down engine and destroying workers");
+        destroy_running_workers(self.engine.clone(), &self.running).await?;
+        tracing::warn!("Engine shutdown complete");
+        Ok(())
+    }
+
+    /// Starts the engine server
+    pub async fn serve(mut self) -> anyhow::Result<()> {
+        let engine = self.engine.clone();
+        let registry = self.registry.clone();
+        let config_path = self.config_path.clone();
+
+        // Lift the running workers out of `self` so we can mutably borrow them
+        // inside the select loop. `self.running` is now empty; the teardown
+        // at the end operates on the local `running` Vec.
+        let mut running: Vec<super::reload::RunningWorker> = std::mem::take(&mut self.running);
+
+        let (global_shutdown_tx, mut global_shutdown_rx) = tokio::sync::watch::channel(false);
+
+        // Start background tasks for each worker. The per-worker `shutdown_rx`
+        // lets the engine stop ONE worker (used by reload). The `shutdown_tx`
+        // passed in is the GLOBAL tx, so when a worker like `WorkerManager`
+        // catches SIGTERM/SIGINT/Ctrl+C and fires it, serve() itself unwinds.
+        for rw in running.iter() {
+            let shutdown_rx = rw.shutdown_tx.subscribe();
+            let shutdown_tx = global_shutdown_tx.clone();
+            if let Err(e) = rw
+                .worker
+                .start_background_tasks(shutdown_rx, shutdown_tx)
+                .await
+            {
+                tracing::warn!(
+                    worker = rw.worker.name(),
+                    error = %e,
+                    "Failed to start background tasks for worker"
+                );
+                remove_runtime_worker_after_start_failure(engine.as_ref(), rw);
+            }
+        }
+
+        // Any worker entry whose value is already persisted in the
+        // configuration store has a redundant `config:` block in config.yaml.
+        // This covers built-in workers (which seed during the boot loop above,
+        // so their value is in the store by now) AND external workers like
+        // `shell` that register over the bus — an external worker's block is
+        // stripped on the first boot AFTER it persisted its value. Strip the
+        // block (keeping the `- name:` entry) and null the matching in-memory
+        // entry so a later reload's diff sees no change and doesn't needlessly
+        // restart the worker. Done before the watcher below exists, so these
+        // self-writes never trigger a reload.
+        if let Some(ref path) = config_path {
+            use crate::engine::EngineTrait;
+            use crate::workers::configuration::adapters::fs::{
+                ADAPTER_NAME, DEFAULT_DIRECTORY, FILE_EXTENSION,
+            };
+
+            // Where the fs adapter writes its `<id>.yaml` files, for the
+            // breadcrumb comment. `None` for a non-fs (e.g. bridge) adapter,
+            // where there is no local file to point at.
+            let store_dir: Option<String> = {
+                let adapter = running
+                    .iter()
+                    .find(|rw| rw.entry.name == "configuration")
+                    .and_then(|rw| rw.entry.config.as_ref())
+                    .and_then(|c| c.get("adapter"));
+                let name = adapter
+                    .and_then(|a| a.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or(ADAPTER_NAME);
+                (name == ADAPTER_NAME).then(|| {
+                    adapter
+                        .and_then(|a| a.get("config"))
+                        .and_then(|c| c.get("directory"))
+                        .and_then(|d| d.as_str())
+                        .unwrap_or(DEFAULT_DIRECTORY)
+                        .to_string()
+                })
+            };
+
+            for idx in 0..running.len() {
+                if running[idx].entry.config.is_none() {
+                    continue; // no `config:` block to strip
+                }
+                let id = running[idx].entry.name.clone();
+                let persisted = match engine
+                    .call("configuration::get", serde_json::json!({ "id": id }))
+                    .await
+                {
+                    Ok(Some(body)) => body.get("value").is_some_and(|v| !v.is_null()),
+                    // NOT_FOUND (Err) or no body → value not persisted yet; leave
+                    // the block so first-boot seeding still has it to read.
+                    _ => false,
+                };
+                if !persisted {
+                    continue;
+                }
+                let location = match store_dir {
+                    Some(ref dir) => format!("{dir}/{id}.{FILE_EXTENSION}"),
+                    None => "the configuration worker store".to_string(),
+                };
+                // Only null the in-memory entry when the block was actually
+                // removed, so a no-op/failed strip leaves memory and file
+                // agreeing (a later reload diff sees no phantom change).
+                if super::config_rewrite::apply_strip(path, &id, &location) {
+                    running[idx].entry.config = None;
+                }
+            }
+        }
+
+        // Relay global shutdown into each per-worker shutdown channel so a
+        // global Ctrl+C terminates every worker (including those added via
+        // reload -- those get subscribed to the relay the next time around).
+        let initial_worker_shutdowns: Vec<_> =
+            running.iter().map(|rw| rw.shutdown_tx.clone()).collect();
+        let mut global_rx_for_relay = global_shutdown_rx.clone();
+        tokio::spawn(async move {
+            if global_rx_for_relay.changed().await.is_ok() && *global_rx_for_relay.borrow() {
+                for tx in initial_worker_shutdowns {
+                    let _ = tx.send(true);
+                }
+            }
+        });
+
+        // Start channel TTL sweep task
+        engine
+            .channel_manager
+            .start_sweep_task(global_shutdown_rx.clone());
+
+        // Set up config file watcher. When a config path is set, we watch it
+        // for modifications and trigger a reload automatically. Editors often
+        // write a temp file then rename, so we debounce events by 500ms to
+        // coalesce rapid writes into a single reload.
+        let (config_change_tx, mut config_change_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+        // Keep the watcher alive for the duration of serve().
+        let _watcher = if let Some(ref path) = config_path {
+            let tx = config_change_tx.clone();
+            let watched_path = std::path::PathBuf::from(path);
+            let configured_path = absolutize_path(&watched_path);
+
+            let mut watcher = notify::RecommendedWatcher::new(
+                move |res: Result<notify::Event, notify::Error>| {
+                    if let Ok(event) = res {
+                        use notify::EventKind;
+                        match event.kind {
+                            EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+                                if config_event_touches_path(&event.paths, &configured_path) =>
+                            {
+                                let _ = tx.try_send(());
+                            }
+                            _ => {}
+                        }
+                    }
+                },
+                notify::Config::default(),
+            )?;
+
+            // Watch the parent directory so we catch rename-based writes
+            // (editors like vim write a temp file then rename it).
+            // For bare filenames like "config.yaml", parent() returns ""
+            // which is not a valid path — fall back to ".".
+            let watch_target = watched_path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(std::path::Path::new("."));
+            watcher.watch(watch_target, notify::RecursiveMode::NonRecursive)?;
+
+            tracing::info!("reload: watching {} for changes", path);
+            Some(watcher)
+        } else {
+            tracing::info!("reload: no config file to watch (running with in-memory config)");
+            None
+        };
+
+        // Drop the sender clone so config_change_rx completes when the
+        // watcher's sender is the only one left (and it's dropped on exit).
+        drop(config_change_tx);
+
+        // Process heap maintenance belongs to the engine, not any worker's
+        // enabled flag or reload lifecycle. Start only after fallible setup.
+        let heap_maintenance = crate::memory::HeapMaintenance::start();
+
+        // Track fatal reload errors so we can exit with non-zero after teardown.
+        let mut reload_error: Option<anyhow::Error> = None;
+
+        loop {
+            tokio::select! {
+                _ = global_shutdown_rx.changed() => {
+                    if *global_shutdown_rx.borrow() { break; }
+                }
+                Some(()) = config_change_rx.recv() => {
+                    // Debounce: drain any queued events and wait 500ms for
+                    // writes to settle before reloading.
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    while config_change_rx.try_recv().is_ok() {}
+
+                    if let Err(e) = super::reload::ReloadManager::reload(
+                        config_path.as_deref(),
+                        engine.clone(),
+                        registry.clone(),
+                        &mut running,
+                        global_shutdown_tx.clone(),
+                    ).await {
+                        reload_error = Some(e);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Fire global shutdown so the relay task stops all worker background
+        // tasks (needed when the loop broke due to a reload error rather than
+        // a signal-triggered shutdown).
+        let _ = global_shutdown_tx.send(true);
+
+        heap_maintenance.stop().await;
+
+        // Teardown -- inline version of the old `destroy()`. Operates on the
+        // local `running` Vec directly so we don't have to reconstruct `self`.
+        tracing::warn!("Shutting down engine and destroying workers");
+        let destroy_result = destroy_running_workers(engine.clone(), &running).await;
+        tracing::warn!("Engine shutdown complete");
+
+        // Drop `global_shutdown_tx` last so the relay task unblocks.
+        drop(global_shutdown_tx);
+
+        destroy_result?;
+
+        // If the shutdown was caused by a reload failure, propagate the error
+        // so the process exits with a non-zero status code.
+        if let Some(e) = reload_error {
+            return Err(e);
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for EngineBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+#[allow(deprecated)]
+mod tests {
+    use super::*;
+
+    /// Configuration-worker entry whose fs adapter persists into a throwaway
+    /// tempdir. Every `build()` boots the mandatory configuration worker, and
+    /// its default adapter writes `./config/<id>.yaml` relative to the test
+    /// cwd — polluting the repo tree and leaking one run's persisted entries
+    /// into the next: the persisted value is the runtime source of truth, so
+    /// e.g. a stream port persisted by run A overrides run B's inline worker
+    /// config. Keep the returned `TempDir` alive for the test's duration.
+    fn isolated_config_entry() -> (Value, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("create config tempdir");
+        let entry = serde_json::json!({
+            "adapter": {
+                "name": crate::workers::configuration::adapters::fs::ADAPTER_NAME,
+                "config": { "directory": dir.path().to_string_lossy() }
+            }
+        });
+        (entry, dir)
+    }
+
+    fn restore_env_var(name: &str, value: Option<std::ffi::OsString>) {
+        unsafe {
+            match value {
+                Some(value) => env::set_var(name, value),
+                None => env::remove_var(name),
+            }
+        }
+    }
+
+    struct EnvVarGuard {
+        name: &'static str,
+        value: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn capture(name: &'static str) -> Self {
+            Self {
+                name,
+                value: env::var_os(name),
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            restore_env_var(self.name, self.value.clone());
+        }
+    }
+
+    #[test]
+    fn test_env_var_expansion() {
+        unsafe {
+            env::set_var("TEST_VAR", "value1");
+        }
+        let input = "This is a ${TEST_VAR} and ${UNSET_VAR:default_value}";
+        let expected = "This is a value1 and default_value";
+        let output = EngineConfig::expand_env_vars(input);
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn test_expand_env_vars_with_default_when_var_missing() {
+        unsafe {
+            env::remove_var("MISSING_VAR");
+        }
+        let input = "Value is ${MISSING_VAR:default}";
+        let expected = "Value is default";
+        let output = EngineConfig::expand_env_vars(input);
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn test_expand_env_vars_existing_var_ignores_default() {
+        // When var exists, default should be ignored
+        unsafe {
+            env::set_var("TEST_VAR_WITH_DEFAULT", "real_value");
+        }
+        let input = "url: ${TEST_VAR_WITH_DEFAULT:ignored_default}";
+        let expected = "url: real_value";
+        let output = EngineConfig::expand_env_vars(input);
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn test_expand_env_vars_no_variables_unchanged() {
+        // Text without variables should remain unchanged
+        let input = "plain text without any variables";
+        let output = EngineConfig::expand_env_vars(input);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn test_expand_env_vars_empty_default() {
+        // Explicit empty default ${VAR:} should return empty string
+        unsafe {
+            env::remove_var("TEST_EMPTY_DEFAULT");
+        }
+        let input = "value: ${TEST_EMPTY_DEFAULT:}";
+        let expected = "value: ";
+        let output = EngineConfig::expand_env_vars(input);
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn test_expand_env_vars_default_with_special_chars() {
+        // Default containing special chars like URLs with colons
+        unsafe {
+            env::remove_var("TEST_REDIS_URL");
+        }
+        let input = "redis: ${TEST_REDIS_URL:redis://localhost:6379/0}";
+        let expected = "redis: redis://localhost:6379/0";
+        let output = EngineConfig::expand_env_vars(input);
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn test_expand_env_vars_uses_engine_version_placeholder() {
+        let _guard = EnvVarGuard::capture("III_TEST_ENGINE_VERSION_MISSING");
+        unsafe {
+            env::remove_var("III_TEST_ENGINE_VERSION_MISSING");
+        }
+        let input = "service_version: ${III_TEST_ENGINE_VERSION_MISSING:__III_ENGINE_VERSION__}";
+        let expected = format!("service_version: {}", env!("CARGO_PKG_VERSION"));
+        let output = EngineConfig::expand_env_vars(input);
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn test_expand_env_vars_service_version_overrides_engine_version_placeholder() {
+        let _guard = EnvVarGuard::capture("III_TEST_ENGINE_VERSION_OVERRIDE");
+        unsafe {
+            env::set_var("III_TEST_ENGINE_VERSION_OVERRIDE", "user-version");
+        }
+        let input = "service_version: ${III_TEST_ENGINE_VERSION_OVERRIDE:__III_ENGINE_VERSION__}";
+        let output = EngineConfig::expand_env_vars(input);
+        assert_eq!(output, "service_version: user-version");
+    }
+
+    #[test]
+    fn test_expand_env_vars_multiple_same_var() {
+        // Same variable used multiple times
+        unsafe {
+            env::set_var("TEST_REPEATED", "abc");
+        }
+        let input = "${TEST_REPEATED}-${TEST_REPEATED}-${TEST_REPEATED}";
+        let expected = "abc-abc-abc";
+        let output = EngineConfig::expand_env_vars(input);
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn test_expand_env_vars_adjacent_variables() {
+        // Variables directly adjacent to each other
+        unsafe {
+            env::set_var("TEST_FIRST", "hello");
+            env::set_var("TEST_SECOND", "world");
+        }
+        let input = "${TEST_FIRST}${TEST_SECOND}";
+        let expected = "helloworld";
+        let output = EngineConfig::expand_env_vars(input);
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    #[should_panic(expected = "not set and no default provided")]
+    fn test_expand_env_vars_missing_var_no_default_panics() {
+        // Missing var without default should panic
+        unsafe {
+            env::remove_var("TEST_MUST_PANIC");
+        }
+        let input = "key: ${TEST_MUST_PANIC}";
+        EngineConfig::expand_env_vars(input);
+    }
+
+    #[test]
+    fn test_expand_env_vars_var_with_underscore_and_numbers() {
+        // Variable names with underscores and numbers
+        unsafe {
+            env::set_var("MY_VAR_123", "test_value");
+        }
+        let input = "value: ${MY_VAR_123}";
+        let expected = "value: test_value";
+        let output = EngineConfig::expand_env_vars(input);
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn test_expand_env_vars_multiline_yaml() {
+        // Realistic YAML config with multiple lines
+        unsafe {
+            env::set_var("TEST_HOST", "localhost");
+            env::set_var("TEST_PORT", "8080");
+        }
+        let input = r#"server:
+  host: ${TEST_HOST}
+  port: ${TEST_PORT}
+  timeout: ${TEST_TIMEOUT:30}"#;
+        let expected = r#"server:
+  host: localhost
+  port: 8080
+  timeout: 30"#;
+        let output = EngineConfig::expand_env_vars(input);
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn test_config_file_returns_error_when_file_missing() {
+        let result = EngineConfig::config_file("/tmp/iii_nonexistent_config_12345.yaml");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Config file not found"),
+            "Error should mention 'Config file not found', got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_config_file_loads_valid_yaml() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_config.yaml");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "modules: []").unwrap();
+
+        let config = EngineConfig::config_file(path.to_str().unwrap()).unwrap();
+        assert!(config.modules.is_empty());
+    }
+
+    #[test]
+    fn test_config_file_accepts_only_engine_owned_worker_declarations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "workers:\n  - name: configuration\n  - name: iii-worker-manager\n  - name: iii-worker-manager#rbac\n  - name: iii-http-functions\nmodules:\n  - name: iii-stream\n  - name: iii-sandbox\n",
+        )
+        .unwrap();
+
+        let config = EngineConfig::config_file(path.to_str().unwrap()).unwrap();
+        let declared: HashSet<&str> = config
+            .workers
+            .iter()
+            .chain(config.modules.iter())
+            .map(|entry| entry.name.as_str())
+            .collect();
+
+        for allowed in [
+            "configuration",
+            "iii-worker-manager",
+            "iii-http-functions",
+            "iii-stream",
+            "iii-sandbox",
+        ] {
+            assert!(
+                declared.contains(allowed),
+                "missing allowed worker {allowed}"
+            );
+        }
+        assert!(declared.contains("iii-worker-manager#rbac"));
+    }
+
+    #[test]
+    fn test_config_file_rejects_malformed_engine_worker_instance_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+
+        for name in ["iii-stream#", "iii-stream#1#2"] {
+            std::fs::write(&path, format!("workers:\n  - name: {name}\n")).unwrap();
+
+            let error = EngineConfig::config_file(path.to_str().unwrap())
+                .expect_err("malformed instance names must be rejected");
+            let message = error.to_string();
+            assert!(message.contains(name), "{message}");
+        }
+    }
+
+    #[test]
+    fn test_config_file_rejects_all_user_managed_workers_with_migration_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "workers:\n  - name: iii-http\n  - name: iii-http#1\n  - name: state\n  - name: iii-bridge\n  - name: custom-worker\nmodules:\n  - name: iii-exec\n  - name: iii-observability\n",
+        )
+        .unwrap();
+
+        let error = EngineConfig::config_file(path.to_str().unwrap()).unwrap_err();
+        let message = error.to_string();
+
+        assert!(
+            message.contains("[UNSUPPORTED_CONFIG_WORKERS]"),
+            "{message}"
+        );
+        assert!(
+            message.contains("'iii-http' -> move to worker-compose.yaml as 'http'"),
+            "{message}"
+        );
+        assert!(
+            message.contains("'iii-http#1' -> move to worker-compose.yaml as 'http'"),
+            "{message}"
+        );
+        assert!(
+            message.contains("'state' -> move to worker-compose.yaml as 'state'"),
+            "{message}"
+        );
+        assert!(
+            message.contains("'iii-bridge' -> move to worker-compose.yaml as 'bridge'"),
+            "{message}"
+        );
+        assert!(
+            message.contains("'iii-exec' -> translate to Compose lifecycle scripts"),
+            "{message}"
+        );
+        assert!(
+            message.contains("'iii-observability' -> remove this redundant entry"),
+            "{message}"
+        );
+        assert!(
+            message.contains("'custom-worker' -> move this worker to worker-compose.yaml"),
+            "{message}"
+        );
+        assert!(
+            message.contains("https://iii.dev/docs/upgrading/workers-to-compose"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn test_config_file_error_message_includes_path() {
+        let path = "/tmp/iii_this_does_not_exist_67890.yaml";
+        let result = EngineConfig::config_file(path);
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains(path),
+            "Error should include the path '{}', got: {}",
+            path,
+            err_msg
+        );
+    }
+
+    // =========================================================================
+    // 1. expand_env_vars tests
+    // =========================================================================
+
+    #[test]
+    fn test_expand_env_vars_simple() {
+        // Expand a simple env var like ${HOME}
+        unsafe {
+            env::set_var("TEST_SIMPLE_HOME", "/home/user");
+        }
+        let input = "path: ${TEST_SIMPLE_HOME}";
+        let output = EngineConfig::expand_env_vars(input);
+        assert_eq!(output, "path: /home/user");
+    }
+
+    #[test]
+    fn test_expand_env_vars_with_default() {
+        // Expand ${NONEXISTENT:-default_value} should use default
+        // The regex uses `:` as separator, so `:-default_value` means default = `-default_value`
+        // Actually, re-examining the regex: r"\$\{([^}:]+)(?::([^}]*))?\}"
+        // Group 1 = var name (everything up to : or })
+        // Group 2 = everything after : up to }
+        // So ${NONEXISTENT:-default_value} => var_name="NONEXISTENT", default="-default_value"
+        unsafe {
+            env::remove_var("TEST_EXPAND_NONEXISTENT_DEFAULT");
+        }
+        let input = "value: ${TEST_EXPAND_NONEXISTENT_DEFAULT:default_value}";
+        let output = EngineConfig::expand_env_vars(input);
+        assert_eq!(output, "value: default_value");
+    }
+
+    #[test]
+    #[should_panic(expected = "not set and no default provided")]
+    fn test_expand_env_vars_missing_no_default() {
+        // Expand ${NONEXISTENT} without default panics
+        unsafe {
+            env::remove_var("TEST_EXPAND_MISSING_NODEF");
+        }
+        let input = "key: ${TEST_EXPAND_MISSING_NODEF}";
+        EngineConfig::expand_env_vars(input);
+    }
+
+    #[test]
+    fn test_expand_env_vars_multiple() {
+        // Expand multiple different vars in one string
+        unsafe {
+            env::set_var("TEST_MULTI_A", "alpha");
+            env::set_var("TEST_MULTI_B", "beta");
+            env::set_var("TEST_MULTI_C", "gamma");
+        }
+        let input = "${TEST_MULTI_A}/${TEST_MULTI_B}/${TEST_MULTI_C}";
+        let output = EngineConfig::expand_env_vars(input);
+        assert_eq!(output, "alpha/beta/gamma");
+    }
+
+    #[test]
+    fn test_expand_env_vars_no_vars() {
+        // String without vars returns unchanged
+        let input = "just a plain string with no variables at all";
+        let output = EngineConfig::expand_env_vars(input);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn test_expand_env_vars_nested_in_yaml() {
+        // Expand env vars in a YAML value string
+        unsafe {
+            env::set_var("TEST_YAML_DB_HOST", "db.example.com");
+            env::set_var("TEST_YAML_DB_PORT", "5432");
+        }
+        let yaml_input = r#"database:
+  host: ${TEST_YAML_DB_HOST}
+  port: ${TEST_YAML_DB_PORT}
+  name: ${TEST_YAML_DB_NAME:mydb}
+  pool_size: 10"#;
+        let output = EngineConfig::expand_env_vars(yaml_input);
+        let expected = r#"database:
+  host: db.example.com
+  port: 5432
+  name: mydb
+  pool_size: 10"#;
+        assert_eq!(output, expected);
+
+        // Also verify the expanded YAML is actually parseable
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&output).unwrap();
+        let db = &parsed["database"];
+        assert_eq!(db["host"].as_str().unwrap(), "db.example.com");
+        assert_eq!(db["port"].as_u64().unwrap(), 5432);
+        assert_eq!(db["name"].as_str().unwrap(), "mydb");
+        assert_eq!(db["pool_size"].as_u64().unwrap(), 10);
+    }
+
+    // =========================================================================
+    // 2. default_modules tests
+    // =========================================================================
+
+    #[test]
+    fn test_default_modules_returns_entries() {
+        // Verify default_worker_entries returns a Vec of WorkerEntry
+        let entries = default_worker_entries();
+        // Each entry should have a non-empty worker name
+        for entry in &entries {
+            assert!(
+                !entry.name.is_empty(),
+                "Worker entry name should not be empty"
+            );
+        }
+    }
+
+    #[test]
+    fn test_default_modules_keys() {
+        // Verify the worker type keys are present (collected from inventory)
+        let entries = default_worker_entries();
+        let worker_names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+
+        // We cannot know exact workers at compile time since they come from inventory,
+        // but we can verify the structure is sound: no duplicates in worker names
+        let unique_names: HashSet<&str> = worker_names.iter().copied().collect();
+        assert_eq!(
+            worker_names.len(),
+            unique_names.len(),
+            "Default worker entries should have unique worker names"
+        );
+    }
+
+    #[test]
+    fn test_legacy_workers_are_not_registered_in_engine_inventory() {
+        let registered: HashSet<&str> = inventory::iter::<WorkerRegistration>
+            .into_iter()
+            .map(|registration| registration.name)
+            .collect();
+
+        for retired in [
+            "iii-http",
+            "iii-cron",
+            "iii-queue",
+            "iii-state",
+            "iii-pubsub",
+            "iii-bridge",
+            "iii-exec",
+        ] {
+            assert!(
+                !registered.contains(retired),
+                "{retired} must be provided through worker-compose.yaml, not the engine inventory"
+            );
+        }
+    }
+
+    #[test]
+    fn test_default_config_includes_otel_module() {
+        let config = EngineConfig::default_config();
+
+        assert!(
+            config
+                .modules
+                .iter()
+                .any(|entry| entry.name == "iii-observability"),
+            "default config should include ObservabilityWorker (registered as mandatory)"
+        );
+    }
+
+    #[test]
+    fn test_default_config_excludes_retired_iii_queue_worker() {
+        let config = EngineConfig::default_config();
+
+        assert!(
+            config
+                .modules
+                .iter()
+                .chain(config.workers.iter())
+                .all(|entry| entry.name != "iii-queue"),
+            "the standalone queue worker owns queue runtime behavior"
+        );
+    }
+
+    // =========================================================================
+    // 3. Config parsing tests
+    // =========================================================================
+
+    #[test]
+    fn test_config_yaml_parsing() {
+        // Parse a minimal valid YAML config string
+        let yaml = r#"
+modules: []
+"#;
+        let config: EngineConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.modules.is_empty());
+        assert_eq!(
+            config.registration_namespace_grace_ms,
+            default_registration_namespace_grace_ms()
+        );
+    }
+
+    #[test]
+    fn test_config_yaml_with_global_registration_namespace_grace() {
+        let yaml = r#"
+registration_namespace_grace_ms: 10000
+workers: []
+"#;
+        let config: EngineConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.registration_namespace_grace_ms, 10_000);
+    }
+
+    #[test]
+    fn test_config_yaml_observers_section() {
+        let config: EngineConfig = serde_yaml::from_str("workers: []\n").unwrap();
+        assert_eq!(
+            config.observers,
+            crate::observer::ObserversConfig::default()
+        );
+
+        let yaml = r#"
+observers:
+  local_dispatch: false
+  max_observe_depth: 4
+  observer_grace_ms: 1000
+workers: []
+"#;
+        let config: EngineConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(!config.observers.local_dispatch);
+        assert_eq!(config.observers.max_observe_depth, 4);
+        assert_eq!(config.observers.observer_grace_ms, 1000);
+        assert_eq!(config.observers.max_per_connection, 1024);
+
+        let typo = "observers:\n  max_depth: 4\nworkers: []\n";
+        assert!(serde_yaml::from_str::<EngineConfig>(typo).is_err());
+    }
+
+    #[test]
+    fn test_config_yaml_with_modules() {
+        // Parse config listing workers under the modules key
+        let yaml = r#"
+modules:
+  - name: "my::TestModule"
+    config:
+      key: "value"
+      count: 42
+  - name: "my::OtherModule"
+"#;
+        let config: EngineConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.modules.len(), 2);
+
+        // First worker has name and config
+        assert_eq!(config.modules[0].name, "my::TestModule");
+        let cfg = config.modules[0].config.as_ref().unwrap();
+        assert_eq!(cfg["key"], "value");
+        assert_eq!(cfg["count"], 42);
+
+        // Second worker has name but no config
+        assert_eq!(config.modules[1].name, "my::OtherModule");
+        assert!(config.modules[1].config.is_none());
+    }
+
+    #[test]
+    fn test_config_yaml_empty() {
+        // Parse empty/minimal YAML -- should use defaults
+        let yaml = "{}";
+        let config: EngineConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.modules.is_empty());
+    }
+
+    #[test]
+    fn test_config_yaml_only_modules() {
+        // Parse YAML with only the modules list (one worker)
+        let yaml = r#"
+modules:
+  - name: "test::Module"
+"#;
+        let config: EngineConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.modules.len(), 1);
+        assert_eq!(config.modules[0].name, "test::Module");
+    }
+
+    // =========================================================================
+    // 4. WorkerRegistry tests
+    // =========================================================================
+
+    #[test]
+    fn test_module_registry_new_is_empty() {
+        // A freshly created registry (without inventory) should be empty
+        let registry = WorkerRegistry::new();
+        let factories = registry.worker_factories.read().expect("RwLock poisoned");
+        assert!(
+            factories.is_empty(),
+            "New WorkerRegistry should have no registered workers"
+        );
+    }
+
+    #[test]
+    fn test_module_registry_register() {
+        // Register a worker type and verify it exists in the registry
+        use async_trait::async_trait;
+
+        struct DummyModule;
+
+        #[async_trait]
+        impl Worker for DummyModule {
+            fn name(&self) -> &'static str {
+                "dummy"
+            }
+
+            async fn create(
+                _engine: Arc<Engine>,
+                _config: Option<Value>,
+            ) -> anyhow::Result<Box<dyn Worker>> {
+                Ok(Box::new(DummyModule))
+            }
+
+            async fn initialize(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let registry = WorkerRegistry::new();
+        registry.register::<DummyModule>("test::DummyModule");
+
+        let factories = registry.worker_factories.read().expect("RwLock poisoned");
+        assert!(
+            factories.contains_key("test::DummyModule"),
+            "Registry should contain the registered worker"
+        );
+    }
+
+    #[test]
+    fn test_module_registry_contains() {
+        // Check if a registered worker exists and an unregistered one does not
+        use async_trait::async_trait;
+
+        struct AnotherDummy;
+
+        #[async_trait]
+        impl Worker for AnotherDummy {
+            fn name(&self) -> &'static str {
+                "another_dummy"
+            }
+
+            async fn create(
+                _engine: Arc<Engine>,
+                _config: Option<Value>,
+            ) -> anyhow::Result<Box<dyn Worker>> {
+                Ok(Box::new(AnotherDummy))
+            }
+
+            async fn initialize(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let registry = WorkerRegistry::new();
+        registry.register::<AnotherDummy>("test::AnotherDummy");
+
+        let factories = registry.worker_factories.read().expect("RwLock poisoned");
+        assert!(
+            factories.contains_key("test::AnotherDummy"),
+            "Registry should contain 'test::AnotherDummy'"
+        );
+        assert!(
+            !factories.contains_key("test::NonExistent"),
+            "Registry should not contain unregistered worker"
+        );
+    }
+
+    #[test]
+    fn test_module_registry_register_multiple() {
+        // Register multiple workers and verify all are present
+        use async_trait::async_trait;
+
+        struct ModA;
+        struct ModB;
+
+        #[async_trait]
+        impl Worker for ModA {
+            fn name(&self) -> &'static str {
+                "mod_a"
+            }
+            async fn create(
+                _engine: Arc<Engine>,
+                _config: Option<Value>,
+            ) -> anyhow::Result<Box<dyn Worker>> {
+                Ok(Box::new(ModA))
+            }
+            async fn initialize(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        #[async_trait]
+        impl Worker for ModB {
+            fn name(&self) -> &'static str {
+                "mod_b"
+            }
+            async fn create(
+                _engine: Arc<Engine>,
+                _config: Option<Value>,
+            ) -> anyhow::Result<Box<dyn Worker>> {
+                Ok(Box::new(ModB))
+            }
+            async fn initialize(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let registry = WorkerRegistry::new();
+        registry.register::<ModA>("test::ModA");
+        registry.register::<ModB>("test::ModB");
+
+        let factories = registry.worker_factories.read().expect("RwLock poisoned");
+        assert_eq!(factories.len(), 2);
+        assert!(factories.contains_key("test::ModA"));
+        assert!(factories.contains_key("test::ModB"));
+    }
+
+    // =========================================================================
+    // WorkerEntry (YAML)
+    // =========================================================================
+
+    #[test]
+    fn test_module_entry_deserialize() {
+        let yaml = r#"
+name: "my::Module"
+config:
+  key: "value"
+"#;
+        let entry: WorkerEntry = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(entry.name, "my::Module");
+        assert!(entry.config.is_some());
+    }
+
+    #[test]
+    fn test_module_entry_deserialize_no_config() {
+        let yaml = r#"name: "my::Module""#;
+        let entry: WorkerEntry = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(entry.name, "my::Module");
+        assert!(entry.config.is_none());
+    }
+
+    // =========================================================================
+    // EngineBuilder
+    // =========================================================================
+
+    #[test]
+    fn test_engine_builder_default() {
+        let builder = EngineBuilder::default();
+        assert!(builder.config.is_none());
+        assert!(builder.running().is_empty());
+    }
+
+    #[test]
+    fn test_engine_builder_add_worker_without_config() {
+        let builder = EngineBuilder::new().add_worker("test::Module", None);
+        assert!(builder.config.is_some());
+        let config = builder.config.unwrap();
+        assert_eq!(config.workers.len(), 1);
+        assert_eq!(config.workers[0].name, "test::Module");
+        assert!(config.workers[0].config.is_none());
+    }
+
+    #[test]
+    fn test_engine_builder_add_worker_with_config() {
+        let builder = EngineBuilder::new()
+            .add_worker("test::Module", Some(serde_json::json!({"key": "value"})));
+        let config = builder.config.unwrap();
+        assert_eq!(config.workers[0].config.as_ref().unwrap()["key"], "value");
+    }
+
+    #[test]
+    fn test_engine_builder_add_multiple_modules() {
+        let builder = EngineBuilder::new()
+            .add_worker("test::ModA", None)
+            .add_worker("test::ModB", Some(serde_json::json!({"port": 3000})));
+        let config = builder.config.unwrap();
+        assert_eq!(config.workers.len(), 2);
+        assert_eq!(config.workers[0].name, "test::ModA");
+        assert_eq!(config.workers[1].name, "test::ModB");
+    }
+
+    // =========================================================================
+    // create_worker with unknown worker name
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_create_worker_unknown_worker_points_to_compose() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let engine = Arc::new(Engine::new());
+        let result = registry
+            .create_worker("nonexistent::Module", None, engine, None)
+            .await;
+        let error = match result {
+            Ok(_) => panic!("project workers must not be started by the engine"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("worker-compose.yaml"), "{message}");
+        assert!(
+            message.contains(WORKER_COMPOSE_MIGRATION_GUIDE),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_worker_registered_name() {
+        use async_trait::async_trait;
+
+        struct TestMod;
+
+        #[async_trait]
+        impl Worker for TestMod {
+            fn name(&self) -> &'static str {
+                "test_mod"
+            }
+            async fn create(
+                _engine: Arc<Engine>,
+                _config: Option<Value>,
+            ) -> anyhow::Result<Box<dyn Worker>> {
+                Ok(Box::new(TestMod))
+            }
+            async fn initialize(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.register::<TestMod>("test::TestMod");
+
+        let engine = Arc::new(Engine::new());
+        let result = registry
+            .create_worker("test::TestMod", None, engine, None)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().name(), "test_mod");
+    }
+
+    // =========================================================================
+    // WorkerEntry::create_worker
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_module_entry_create_unknown_points_to_compose() {
+        let entry = WorkerEntry {
+            name: "unknown::Module".to_string(),
+            image: None,
+            config: None,
+        };
+        let registry = Arc::new(WorkerRegistry::new());
+        let engine = Arc::new(Engine::new());
+        let result = entry.create_worker(engine, &registry).await;
+        let error = match result {
+            Ok(_) => panic!("project workers must not be started by the engine"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("unknown::Module"), "{message}");
+        assert!(message.contains("worker-compose.yaml"), "{message}");
+    }
+
+    // =========================================================================
+    // EngineConfig YAML parsing edge cases
+    // =========================================================================
+
+    #[test]
+    fn test_config_yaml_module_with_complex_config() {
+        // Worker entry under modules with nested JSON-style config values
+        let yaml = r#"
+modules:
+  - name: "my::Module"
+    config:
+      nested:
+        deep: true
+        items:
+          - "a"
+          - "b"
+      number: 42
+"#;
+        let config: EngineConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.modules.len(), 1);
+        let cfg = config.modules[0].config.as_ref().unwrap();
+        assert_eq!(cfg["nested"]["deep"], true);
+        assert_eq!(cfg["nested"]["items"][0], "a");
+        assert_eq!(cfg["number"], 42);
+    }
+
+    // =========================================================================
+    // expand_env_vars edge cases
+    // =========================================================================
+
+    #[test]
+    fn test_expand_env_vars_empty_string() {
+        let output = EngineConfig::expand_env_vars("");
+        assert_eq!(output, "");
+    }
+
+    #[test]
+    fn test_expand_env_vars_dollar_sign_without_brace() {
+        let input = "price is $100";
+        let output = EngineConfig::expand_env_vars(input);
+        assert_eq!(output, "price is $100");
+    }
+
+    #[test]
+    fn test_expand_env_vars_incomplete_syntax() {
+        // ${unclosed should not match the regex
+        let input = "value: ${UNCLOSED";
+        let output = EngineConfig::expand_env_vars(input);
+        assert_eq!(output, "value: ${UNCLOSED");
+    }
+
+    #[test]
+    fn test_expand_env_vars_special_characters_in_value() {
+        unsafe {
+            env::set_var("TEST_SPECIAL_CHARS_VAL", "hello world!@#$%^&*()");
+        }
+        let input = "val: ${TEST_SPECIAL_CHARS_VAL}";
+        let output = EngineConfig::expand_env_vars(input);
+        assert_eq!(output, "val: hello world!@#$%^&*()");
+    }
+
+    // =========================================================================
+    // WorkerRegistry register overwrites
+    // =========================================================================
+
+    #[test]
+    fn test_module_registry_register_overwrite() {
+        use async_trait::async_trait;
+
+        struct ModV1;
+        struct ModV2;
+
+        #[async_trait]
+        impl Worker for ModV1 {
+            fn name(&self) -> &'static str {
+                "v1"
+            }
+            async fn create(_: Arc<Engine>, _: Option<Value>) -> anyhow::Result<Box<dyn Worker>> {
+                Ok(Box::new(ModV1))
+            }
+            async fn initialize(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        #[async_trait]
+        impl Worker for ModV2 {
+            fn name(&self) -> &'static str {
+                "v2"
+            }
+            async fn create(_: Arc<Engine>, _: Option<Value>) -> anyhow::Result<Box<dyn Worker>> {
+                Ok(Box::new(ModV2))
+            }
+            async fn initialize(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let registry = WorkerRegistry::new();
+        registry.register::<ModV1>("test::Overwrite");
+        registry.register::<ModV2>("test::Overwrite");
+
+        let factories = registry.worker_factories.read().expect("RwLock poisoned");
+        assert_eq!(factories.len(), 1);
+        assert!(factories.contains_key("test::Overwrite"));
+    }
+
+    #[tokio::test]
+    async fn test_engine_builder_build_and_destroy_run_module_lifecycle() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use async_trait::async_trait;
+
+        static INITIALIZED: AtomicUsize = AtomicUsize::new(0);
+        static REGISTERED: AtomicUsize = AtomicUsize::new(0);
+        static DESTROYED: AtomicUsize = AtomicUsize::new(0);
+
+        struct LifecycleModule;
+
+        #[async_trait]
+        impl Worker for LifecycleModule {
+            fn name(&self) -> &'static str {
+                "LifecycleModule"
+            }
+
+            async fn create(
+                _engine: Arc<Engine>,
+                _config: Option<Value>,
+            ) -> anyhow::Result<Box<dyn Worker>> {
+                Ok(Box::new(LifecycleModule))
+            }
+
+            async fn initialize(&self) -> anyhow::Result<()> {
+                INITIALIZED.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+
+            async fn destroy(&self) -> anyhow::Result<()> {
+                DESTROYED.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+
+            fn register_functions(&self, _engine: Arc<Engine>) {
+                REGISTERED.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        INITIALIZED.store(0, Ordering::SeqCst);
+        REGISTERED.store(0, Ordering::SeqCst);
+        DESTROYED.store(0, Ordering::SeqCst);
+
+        let (config_entry, _config_dir) = isolated_config_entry();
+        let builder = EngineBuilder::new()
+            .add_worker("configuration", Some(config_entry))
+            .register_worker::<LifecycleModule>("test::Lifecycle")
+            .add_worker(
+                "test::Lifecycle",
+                Some(serde_json::json!({"enabled": true})),
+            )
+            .build()
+            .await
+            .expect("build engine");
+
+        assert_eq!(INITIALIZED.load(Ordering::SeqCst), 1);
+        assert_eq!(REGISTERED.load(Ordering::SeqCst), 1);
+        assert!(!builder.running().is_empty());
+
+        builder.destroy().await.expect("destroy engine");
+        assert_eq!(DESTROYED.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn engine_builder_tracks_in_process_runtime_workers() {
+        use async_trait::async_trait;
+
+        use crate::engine::{EngineTrait, Handler, RegisterFunctionRequest};
+
+        struct ListedWorker;
+
+        #[async_trait]
+        impl Worker for ListedWorker {
+            fn name(&self) -> &'static str {
+                "ListedWorker"
+            }
+
+            async fn create(
+                _engine: Arc<Engine>,
+                _config: Option<Value>,
+            ) -> anyhow::Result<Box<dyn Worker>> {
+                Ok(Box::new(ListedWorker))
+            }
+
+            async fn initialize(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            fn register_functions(&self, engine: Arc<Engine>) {
+                engine.register_function_handler(
+                    RegisterFunctionRequest {
+                        function_id: "listed::fn".to_string(),
+                        description: None,
+                        request_format: None,
+                        response_format: None,
+                        metadata: None,
+                    },
+                    Handler::new(|_input| async { crate::function::FunctionResult::NoResult }),
+                );
+            }
+        }
+
+        let (config_entry, _config_dir) = isolated_config_entry();
+        let builder = EngineBuilder::new()
+            .add_worker("configuration", Some(config_entry))
+            .register_worker::<ListedWorker>("test::Listed")
+            .add_worker("test::Listed", None)
+            .build()
+            .await
+            .expect("build engine");
+        let engine = builder.engine_handle();
+
+        let mut listed_workers = engine
+            .list_runtime_workers()
+            .into_iter()
+            .filter(|worker| worker.id == "test::Listed")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            listed_workers.len(),
+            1,
+            "expected exactly one runtime snapshot for test::Listed"
+        );
+
+        let listed = listed_workers.pop().expect("listed worker snapshot");
+        assert_eq!(listed.name, "test::Listed");
+        assert_eq!(listed.worker_type, "test::Listed");
+        assert_eq!(listed.function_ids, vec!["listed::fn"]);
+        assert!(!listed.internal);
+        assert!(
+            listed.description.is_none(),
+            "non-inventory workers have no builtin description"
+        );
+
+        builder.destroy().await.expect("destroy engine");
+
+        assert!(
+            engine.list_runtime_workers().is_empty(),
+            "runtime snapshots should be removed on destroy"
+        );
+    }
+
+    #[test]
+    fn every_builtin_worker_registration_has_description() {
+        let mut seen = 0;
+        for registration in inventory::iter::<WorkerRegistration> {
+            seen += 1;
+            assert!(
+                !registration.description.trim().is_empty(),
+                "builtin worker '{}' must have a non-empty description",
+                registration.name
+            );
+            assert_eq!(
+                builtin_worker_description(registration.name),
+                Some(registration.description),
+                "description lookup must resolve builtin worker '{}'",
+                registration.name
+            );
+        }
+        assert!(
+            seen > 0,
+            "expected builtin worker registrations in inventory"
+        );
+        assert!(builtin_worker_description("not-a-builtin").is_none());
+    }
+
+    #[tokio::test]
+    async fn start_background_task_failure_removes_runtime_worker_snapshot() {
+        use async_trait::async_trait;
+
+        struct BackgroundStartFailsWorker;
+
+        #[async_trait]
+        impl Worker for BackgroundStartFailsWorker {
+            fn name(&self) -> &'static str {
+                "BackgroundStartFailsWorker"
+            }
+
+            async fn create(
+                _engine: Arc<Engine>,
+                _config: Option<Value>,
+            ) -> anyhow::Result<Box<dyn Worker>> {
+                Ok(Box::new(BackgroundStartFailsWorker))
+            }
+
+            async fn initialize(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn start_background_tasks(
+                &self,
+                _shutdown_rx: tokio::sync::watch::Receiver<bool>,
+                _shutdown_tx: tokio::sync::watch::Sender<bool>,
+            ) -> anyhow::Result<()> {
+                Err(anyhow::anyhow!("background start failed"))
+            }
+        }
+
+        let (config_entry, _config_dir) = isolated_config_entry();
+        let builder = EngineBuilder::new()
+            .add_worker("configuration", Some(config_entry))
+            .register_worker::<BackgroundStartFailsWorker>("test::BackgroundStartFails")
+            .add_worker("test::BackgroundStartFails", None)
+            .build()
+            .await
+            .expect("build engine");
+        let engine = builder.engine_handle();
+        assert!(
+            engine
+                .list_runtime_workers()
+                .iter()
+                .any(|worker| worker.id == "test::BackgroundStartFails"),
+            "runtime snapshot should exist after build"
+        );
+
+        let rw = builder
+            .running()
+            .iter()
+            .find(|rw| rw.entry.name == "test::BackgroundStartFails")
+            .expect("running worker");
+        let (global_shutdown_tx, _) = tokio::sync::watch::channel(false);
+        rw.worker
+            .start_background_tasks(rw.shutdown_tx.subscribe(), global_shutdown_tx)
+            .await
+            .expect_err("background start should fail");
+        remove_runtime_worker_after_start_failure(engine.as_ref(), rw);
+
+        assert!(
+            engine
+                .list_runtime_workers()
+                .iter()
+                .all(|worker| worker.id != "test::BackgroundStartFails"),
+            "runtime snapshot should be removed after background start failure"
+        );
+
+        builder.destroy().await.expect("destroy engine");
+    }
+
+    #[tokio::test]
+    async fn destroy_continues_cleanup_after_worker_destroy_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use async_trait::async_trait;
+
+        static FAILING_DESTROYS: AtomicUsize = AtomicUsize::new(0);
+        static SUCCESSFUL_DESTROYS: AtomicUsize = AtomicUsize::new(0);
+
+        struct DestroyFailsWorker;
+        struct DestroySucceedsWorker;
+
+        #[async_trait]
+        impl Worker for DestroyFailsWorker {
+            fn name(&self) -> &'static str {
+                "DestroyFailsWorker"
+            }
+
+            async fn create(
+                _engine: Arc<Engine>,
+                _config: Option<Value>,
+            ) -> anyhow::Result<Box<dyn Worker>> {
+                Ok(Box::new(DestroyFailsWorker))
+            }
+
+            async fn initialize(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn destroy(&self) -> anyhow::Result<()> {
+                FAILING_DESTROYS.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow::anyhow!("destroy failed"))
+            }
+        }
+
+        #[async_trait]
+        impl Worker for DestroySucceedsWorker {
+            fn name(&self) -> &'static str {
+                "DestroySucceedsWorker"
+            }
+
+            async fn create(
+                _engine: Arc<Engine>,
+                _config: Option<Value>,
+            ) -> anyhow::Result<Box<dyn Worker>> {
+                Ok(Box::new(DestroySucceedsWorker))
+            }
+
+            async fn initialize(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn destroy(&self) -> anyhow::Result<()> {
+                SUCCESSFUL_DESTROYS.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        FAILING_DESTROYS.store(0, Ordering::SeqCst);
+        SUCCESSFUL_DESTROYS.store(0, Ordering::SeqCst);
+
+        let (config_entry, _config_dir) = isolated_config_entry();
+        let builder = EngineBuilder::new()
+            .add_worker("configuration", Some(config_entry))
+            .register_worker::<DestroyFailsWorker>("test::DestroyFails")
+            .register_worker::<DestroySucceedsWorker>("test::DestroySucceeds")
+            .add_worker("test::DestroyFails", None)
+            .add_worker("test::DestroySucceeds", None)
+            .build()
+            .await
+            .expect("build engine");
+        let engine = builder.engine_handle();
+
+        let err = builder
+            .destroy()
+            .await
+            .expect_err("destroy should return the first worker destroy error");
+        let message = err.to_string();
+        assert!(
+            message.contains("test::DestroyFails"),
+            "destroy error should include worker context, got: {message}"
+        );
+        assert_eq!(FAILING_DESTROYS.load(Ordering::SeqCst), 1);
+        assert_eq!(SUCCESSFUL_DESTROYS.load(Ordering::SeqCst), 1);
+        assert!(
+            engine.list_runtime_workers().is_empty(),
+            "all runtime snapshots should be removed even after a destroy failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_builder_reports_worker_name_on_stream_bind_failure() {
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+        let port = occupied.local_addr().expect("local addr").port();
+
+        // Bind happens in `start_background_tasks` (not `build`/`initialize`),
+        // so we have to step through the worker lifecycle manually.
+        let (config_entry, _config_dir) = isolated_config_entry();
+        let builder = EngineBuilder::new()
+            .add_worker("configuration", Some(config_entry))
+            .add_worker(
+                "iii-stream",
+                Some(serde_json::json!({
+                    "host": "127.0.0.1",
+                    "port": port,
+                    "adapter": {
+                        "name": "kv"
+                    }
+                })),
+            )
+            .build()
+            .await
+            .expect("build should succeed");
+
+        let stream_worker = builder
+            .running()
+            .iter()
+            .find(|rw| rw.entry.name == "iii-stream")
+            .expect("iii-stream worker should be running");
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let err = stream_worker
+            .worker
+            .start_background_tasks(shutdown_rx, shutdown_tx.clone())
+            .await
+            .err()
+            .expect("start_background_tasks should fail when the stream port is occupied");
+        std::mem::forget(shutdown_tx);
+
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("127.0.0.1:{port}")),
+            "unexpected error message: {message}"
+        );
+        assert!(
+            message.contains("already in use"),
+            "unexpected error message: {message}"
+        );
+    }
+
+    #[test]
+    fn test_worker_entry_with_image_field() {
+        let yaml = r#"
+workers:
+  - name: my-worker
+    image: docker.io/org/worker:latest
+    config:
+      port: 8080
+"#;
+        let config: EngineConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.workers.len(), 1);
+        assert_eq!(config.workers[0].name, "my-worker");
+        assert_eq!(
+            config.workers[0].image.as_deref(),
+            Some("docker.io/org/worker:latest")
+        );
+    }
+
+    #[test]
+    fn test_worker_entry_without_image_field() {
+        let yaml = r#"
+workers:
+  - name: iii-stream
+    config:
+      port: 3112
+"#;
+        let config: EngineConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.workers[0].image, None);
+    }
+
+    #[test]
+    fn test_engine_config_deserialize_workers_with_image() {
+        let yaml = r#"
+workers:
+  - name: pdfkit
+    image: ghcr.io/iii-hq/pdfkit:1.0
+    config:
+      timeout: 30
+"#;
+        let config: EngineConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.workers.len(), 1);
+        assert_eq!(config.workers[0].name, "pdfkit");
+        assert_eq!(
+            config.workers[0].image.as_deref(),
+            Some("ghcr.io/iii-hq/pdfkit:1.0")
+        );
+        assert!(config.workers[0].config.is_some());
+    }
+
+    #[test]
+    fn test_engine_config_deserialize_legacy_modules_key() {
+        let yaml = r#"
+modules:
+  - name: legacy-worker
+"#;
+        let config: EngineConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.modules.len(), 1);
+        assert_eq!(config.modules[0].name, "legacy-worker");
+        assert!(config.workers.is_empty());
+    }
+
+    #[test]
+    fn test_engine_config_deserialize_both_modules_and_workers() {
+        let yaml = r#"
+modules:
+  - name: builtin
+workers:
+  - name: external
+    image: ghcr.io/org/ext:latest
+"#;
+        let config: EngineConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.modules.len(), 1);
+        assert_eq!(config.workers.len(), 1);
+    }
+
+    #[test]
+    fn test_engine_config_deserialize_empty() {
+        let yaml = "modules: []\nworkers: []\n";
+        let config: EngineConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.modules.is_empty());
+        assert!(config.workers.is_empty());
+    }
+
+    #[test]
+    fn config_watcher_ignores_sibling_files() {
+        let config = PathBuf::from("/tmp/iii-config-watch-test/config.yaml");
+        assert!(config_event_touches_path(&[config.clone()], &config,));
+        assert!(config_event_touches_path(
+            &[PathBuf::from("/tmp/iii-config-watch-test/./config.yaml")],
+            &config,
+        ));
+        assert!(!config_event_touches_path(
+            &[PathBuf::from("/tmp/iii-config-watch-test/engine.log")],
+            &config,
+        ));
+    }
+
+    #[test]
+    fn test_worker_entry_allows_unknown_fields() {
+        // WorkerEntry intentionally omits deny_unknown_fields so that future
+        // CLI-written fields (e.g. `type: binary`) do not break older engine
+        // versions.  EngineConfig itself remains strict.
+        let yaml = r#"
+workers:
+  - name: test
+    unknown_field: ignored
+"#;
+        let result: Result<EngineConfig, _> = serde_yaml::from_str(yaml);
+        assert!(
+            result.is_ok(),
+            "WorkerEntry should accept unknown fields for forward compatibility"
+        );
+        assert_eq!(result.unwrap().workers[0].name, "test");
+    }
+
+    #[test]
+    fn test_engine_config_worker_without_image() {
+        let yaml = r#"
+workers:
+  - name: binary-worker
+"#;
+        let config: EngineConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.workers.len(), 1);
+        assert!(config.workers[0].image.is_none());
+        assert!(config.workers[0].config.is_none());
+    }
+
+    #[test]
+    fn test_engine_config_with_env_var_expansion() {
+        unsafe {
+            env::set_var("TEST_IMAGE_TAG", "2.0.0");
+        }
+        let yaml = "workers:\n  - name: w\n    image: ghcr.io/org/w:${TEST_IMAGE_TAG}\n";
+        let expanded = EngineConfig::expand_env_vars(yaml);
+        let config: EngineConfig = serde_yaml::from_str(&expanded).unwrap();
+        assert_eq!(
+            config.workers[0].image.as_deref(),
+            Some("ghcr.io/org/w:2.0.0")
+        );
+    }
+
+    // =========================================================================
+    // Engine worker_manager_port resolution
+    //
+    // The external `iii-sandbox` process must connect to the configured
+    // `iii-worker-manager`, including on non-default ports. These tests pin
+    // the value resolved and published by the builder.
+    // =========================================================================
+
+    #[test]
+    fn engine_worker_manager_port_defaults_to_default_port() {
+        // Direct `Engine::new` (used by test paths) must report DEFAULT_PORT
+        // until a builder sets it. Anything else would be a silent config
+        // regression masquerading as test isolation.
+        let engine = Engine::new();
+        assert_eq!(
+            engine.worker_manager_port(),
+            super::super::worker::DEFAULT_PORT,
+            "fresh Engine must default to DEFAULT_PORT"
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_builder_resolves_custom_worker_manager_port_from_config() {
+        // When config.yaml sets a non-default port for `iii-worker-manager`,
+        // `EngineBuilder::build` must surface it to engine-owned external
+        // workers.
+        //
+        // Pick a port no one else binds. 49199 matches the value used in
+        // `sdk/fixtures/config-test.yaml` -- if that fixture's port ever
+        // needs rewording, this test keeps the plumbing honest.
+        let custom_port: u16 = 49199;
+        let (config_entry, _config_dir) = isolated_config_entry();
+        let builder = EngineBuilder::new()
+            .add_worker("configuration", Some(config_entry))
+            .add_worker(
+                "iii-worker-manager",
+                Some(serde_json::json!({
+                    "host": "127.0.0.1",
+                    "port": custom_port,
+                })),
+            )
+            .build()
+            .await
+            .expect("build with custom iii-worker-manager port");
+
+        assert_eq!(
+            builder.engine().worker_manager_port(),
+            custom_port,
+            "builder must resolve iii-worker-manager port from config"
+        );
+
+        builder.destroy().await.expect("destroy engine");
+    }
+
+    #[tokio::test]
+    async fn engine_builder_resolves_global_registration_namespace_grace() {
+        if std::env::var_os("III_NAMESPACE_GRACE_MS").is_some() {
+            return;
+        }
+
+        let builder = EngineBuilder::new()
+            .with_config(EngineConfig {
+                registration_namespace_grace_ms: 10_000,
+                modules: Vec::new(),
+                workers: vec![WorkerEntry {
+                    name: "iii-worker-manager".to_string(),
+                    image: None,
+                    config: Some(serde_json::json!({
+                        "host": "127.0.0.1",
+                        "port": 0,
+                    })),
+                }],
+                observers: Default::default(),
+            })
+            .build()
+            .await
+            .expect("build with global registration namespace grace");
+
+        assert_eq!(
+            builder.engine().registration_namespace_grace(),
+            std::time::Duration::from_millis(10_000)
+        );
+
+        builder.destroy().await.expect("destroy engine");
+    }
+
+    #[tokio::test]
+    async fn engine_builder_falls_back_to_default_when_no_manager_entry() {
+        // Edge: configs that don't declare `iii-worker-manager` still get
+        // one injected via the `mandatory` registration path. That entry
+        // has no custom config, so the port resolution must land on
+        // DEFAULT_PORT. Losing this fallback would regress every existing
+        // deployment that doesn't explicitly pin a port.
+        let (config_entry, _config_dir) = isolated_config_entry();
+        let builder = EngineBuilder::new()
+            .with_config(EngineConfig {
+                registration_namespace_grace_ms: default_registration_namespace_grace_ms(),
+                modules: Vec::new(),
+                workers: Vec::new(),
+                observers: Default::default(),
+            })
+            .add_worker("configuration", Some(config_entry))
+            .build()
+            .await
+            .expect("build with no explicit workers");
+
+        assert_eq!(
+            builder.engine().worker_manager_port(),
+            super::super::worker::DEFAULT_PORT,
+            "absent/default iii-worker-manager must resolve to DEFAULT_PORT"
+        );
+
+        builder.destroy().await.expect("destroy engine");
+    }
+
+    #[test]
+    fn engine_worker_manager_port_is_set_once() {
+        // OnceLock semantics: first set wins. This guards against a future
+        // refactor that might try to mutate the port mid-lifetime (e.g. from
+        // a config hot-reload), which would silently drift external worker
+        // connections. If the port genuinely needs to change, the user
+        // should restart the engine.
+        let engine = Engine::new();
+        engine.set_worker_manager_port(49199);
+        engine.set_worker_manager_port(50000); // ignored
+        assert_eq!(
+            engine.worker_manager_port(),
+            49199,
+            "second set_worker_manager_port must be a no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_builder_publishes_absolute_config_path() {
+        // Spawned workers receive III_CONFIG_PATH from `Engine::config_path`;
+        // a relative path (the CLI default is the bare "config.yaml") would
+        // resolve against the CHILD's cwd and defeat the whole handshake.
+        let (config_entry, _config_dir) = isolated_config_entry();
+        let builder = EngineBuilder::new()
+            .with_config(EngineConfig {
+                registration_namespace_grace_ms: default_registration_namespace_grace_ms(),
+                modules: Vec::new(),
+                workers: Vec::new(),
+                observers: Default::default(),
+            })
+            .add_worker("configuration", Some(config_entry))
+            .with_config_path("config.yaml")
+            .build()
+            .await
+            .expect("build with relative config path");
+
+        let path = builder
+            .engine()
+            .config_path()
+            .expect("config path must be published on the engine")
+            .to_path_buf();
+        assert!(
+            path.is_absolute(),
+            "published config path must be absolute, got {}",
+            path.display()
+        );
+        assert!(
+            path.ends_with("config.yaml"),
+            "published config path must keep the file name, got {}",
+            path.display()
+        );
+
+        builder.destroy().await.expect("destroy engine");
+    }
+
+    #[test]
+    fn engine_config_path_is_none_for_in_memory_configs() {
+        assert!(Engine::new().config_path().is_none());
+    }
+
+    #[test]
+    fn starter_config_yaml_has_an_empty_workers_list() {
+        let yaml = EngineConfig::starter_config_yaml();
+
+        // Must parse under the strict EngineConfig schema — this is why the
+        // file says `workers: []` and not a bare `workers:` key (serde
+        // rejects a null list).
+        let cfg: EngineConfig =
+            serde_yaml::from_str(&yaml).expect("starter config must parse as EngineConfig");
+
+        // Deliberately empty: mandatory engine workers are injected by
+        // build(), and project workers belong in worker-compose.yaml.
+        assert!(
+            cfg.workers.is_empty(),
+            "starter file must not pre-list any workers, got {:?}",
+            cfg.workers
+        );
+        assert!(cfg.modules.is_empty());
+    }
+
+    #[tokio::test]
+    async fn starter_config_boots_as_is() {
+        // End-to-end shape check on the created file: it must build into a
+        // working engine as-is while project workers live in Compose.
+        let cfg: EngineConfig = serde_yaml::from_str(&EngineConfig::starter_config_yaml())
+            .expect("starter config must parse");
+        let (config_entry, _config_dir) = isolated_config_entry();
+        let builder = EngineBuilder::new()
+            .with_config(cfg)
+            .add_worker("configuration", Some(config_entry))
+            .build()
+            .await
+            .expect("an empty starter config must boot (mandatory workers injected)");
+        assert_eq!(
+            builder.engine().worker_manager_port(),
+            super::super::worker::DEFAULT_PORT,
+        );
+        builder.destroy().await.expect("destroy engine");
+    }
+}

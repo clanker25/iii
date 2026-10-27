@@ -1,0 +1,97 @@
+{
+  "name": "iii-sdk",
+  "version": "0.25.0",
+  "private": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "index.js",
+  "author": "III",
+  "license": "Apache-2.0",
+  "type": "module",
+  "description": "III SDK for Node.js",
+  "keywords": [
+    "iii",
+    "sdk"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "docs:json": "typedoc",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "test:watch": "vitest"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
+    },
+    "./stream": {
+      "types": "./dist/stream.d.ts",
+      "import": "./dist/stream.mjs",
+      "require": "./dist/stream.cjs"
+    },
+    "./state": {
+      "types": "./dist/state.d.ts",
+      "import": "./dist/state.mjs",
+      "require": "./dist/state.cjs"
+    },
+    "./helpers": {
+      "types": "./dist/helpers.d.ts",
+      "import": "./dist/helpers.mjs",
+      "require": "./dist/helpers.cjs"
+    },
+    "./channel": {
+      "types": "./dist/channel.d.ts",
+      "import": "./dist/channel.mjs",
+      "require": "./dist/channel.cjs"
+    },
+    "./trigger": {
+      "types": "./dist/trigger.d.ts",
+      "import": "./dist/trigger.mjs",
+      "require": "./dist/trigger.cjs"
+    },
+    "./runtime": {
+      "types": "./dist/runtime.d.ts",
+      "import": "./dist/runtime.mjs",
+      "require": "./dist/runtime.cjs"
+    },
+    "./errors": {
+      "types": "./dist/errors.d.ts",
+      "import": "./dist/errors.mjs",
+      "require": "./dist/errors.cjs"
+    },
+    "./internal": {
+      "types": "./dist/internal.d.ts",
+      "import": "./dist/internal.mjs",
+      "require": "./dist/internal.cjs"
+    },
+    "./engine": {
+      "types": "./dist/engine.d.ts",
+      "import": "./dist/engine.mjs",
+      "require": "./dist/engine.cjs"
+    },
+    "./protocol": {
+      "types": "./dist/protocol.d.ts",
+      "import": "./dist/protocol.mjs",
+      "require": "./dist/protocol.cjs"
+    }
+  },
+  "dependencies": {
+    "@iii-dev/helpers": "workspace:*",
+    "@opentelemetry/api": "^1.9.0",
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@opentelemetry/context-async-hooks": "^2.11.0",
+    "@opentelemetry/instrumentation": "^0.222.0",
+    "@opentelemetry/sdk-trace-base": "^2.11.0",
+    "@types/ws": "^8.18.1",
+    "@vitest/coverage-v8": "^4.1.12",
+    "tsdown": "^0.21.4",
+    "typedoc": "^0.28.20",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.12"
+  }
+}

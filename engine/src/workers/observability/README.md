@@ -1,0 +1,449 @@
+# iii-observability
+
+Full OpenTelemetry observability for III Engine: distributed tracing, structured logs, performance
+metrics, alert rules, and trace sampling — all queryable via built-in functions.
+
+`iii-observability` is injected by the engine. Do not declare it in `config.yaml`,
+`engine.workers`, or project `containers:`. Configure its registered runtime configuration entry
+through `configuration::set`.
+
+## Skills
+
+Install the `iii-observability` agent skill for Claude Code, Cursor, and 30+ other agents:
+
+```bash
+npx skills add iii-hq/iii --full-depth --skill iii-observability
+```
+
+## Sample Configuration
+
+```json
+{
+  "function_id": "configuration::set",
+  "payload": {
+    "id": "iii-observability",
+    "value": {
+      "enabled": true,
+      "service_name": "my-service",
+      "service_version": "1.0.0",
+      "exporter": "memory",
+      "metrics_enabled": true,
+      "logs_enabled": true,
+      "memory_max_spans": 1000,
+      "sampling_ratio": 1.0,
+      "alerts": [
+        {
+          "name": "high-error-rate",
+          "metric": "iii.invocations.error",
+          "threshold": 10,
+          "operator": "greaterthan",
+          "window_seconds": 60,
+          "action": { "type": "log" }
+        }
+      ]
+    }
+  }
+}
+```
+
+## Configure
+
+The full configuration surface is registered with the builtin `configuration`
+worker under the id **`iii-observability`**. The stored entry is the runtime
+source of truth. Change it through the console or `configuration::set
+{ "id": "iii-observability", "value": { ... } }`; the worker is internal and
+cannot be configured as an engine worker declaration.
+
+With the default file-backed adapter the entry persists at
+`./config/iii-observability.yaml` and is read again at every
+engine start — *before* logging/tracing init — so even restart-tier fields
+edited at runtime apply on the next start. `${VAR:default}` placeholders work
+in string fields and are expanded on read.
+
+Values are validated against the JSON schema at `configuration::set` time
+(unknown fields rejected, ratios bounded to `0..=1`, counts ≥ 1). Two
+caveats:
+
+- Alert `operator` values use the canonical schema names (`greaterthan`, `lessthan`, ...).
+- After a schema tightening, a previously-stored out-of-range value makes
+  the boot-time schema refresh fail with `SCHEMA_INVALID` (warn-and-continue);
+  reads still work and out-of-range values are clamped on read.
+
+### Hot Reload
+
+`configuration:updated` events are applied per field tier:
+
+| Tier | Fields | Effect |
+|---|---|---|
+| Live | `logs_console_output`, `logs_sampling_ratio`, `logs_enabled` (ingest gate), `enabled` (ingest gate) | Immediate — read per use |
+| Limits | `memory_max_spans`, `logs_max_count`, `metrics_max_count`, `metrics_retention_seconds` | Immediate — enforced on the next insert / 60s sweep |
+| Swap | `sampling_ratio`, `sampling.*`, `alerts`, `collapse_spans`, `level` | Immediate — compiled artifact rebuilt and swapped (alert states of surviving rules keep cooldown/firing continuity) |
+| Task rebuild | `logs_exporter`, `logs_batch_size`, `logs_flush_interval_ms`, `logs_retention_seconds`, and `logs_enabled` on a false→true transition | The background task restarts with the new settings. A `logs_enabled` false→true toggle revives the log store and respawns the log-trigger subscriber, OTLP logs exporter, and retention task — so the `log` trigger fan-out and OTLP log export reactivate without an engine restart |
+| Restart-only | `exporter`, `endpoint` (trace **and** logs exporters), `service_name`/`service_version`/`service_namespace` (trace resource **and** logs exporter identity), `format`, `metrics_enabled`, `metrics_exporter`, `enabled` (pipeline construction) | Logged as a warning; applied at the next engine start via the persisted entry. `endpoint`/`service_name`/`service_version` are restart-tier for **all** signals so logs and traces always move to the new collector/identity together, never split mid-edit |
+
+Known limitation: an engine config-file reload that destroys and recreates
+this worker shuts down the OTLP trace/metric providers without rebuilding
+them (they are process-global set-once state) — OTLP export then requires an
+engine restart. Memory-backed stores are unaffected.
+
+## Configuration
+
+| Field                       | Type        | Description                                                                                                                                                                  |
+| --------------------------- | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`                   | boolean     | Whether OpenTelemetry tracing export is enabled. Defaults to `false`. Env: `OTEL_ENABLED`.                                                                                   |
+| `service_name`              | string      | Service name in traces and metrics. Defaults to `"iii"`. Env: `OTEL_SERVICE_NAME`.                                                                                           |
+| `service_version`           | string      | Service version (`service.version` OTEL attribute). Env: `SERVICE_VERSION`.                                                                                                  |
+| `service_namespace`         | string      | Service namespace (`service.namespace` OTEL attribute). Env: `SERVICE_NAMESPACE`.                                                                                            |
+| `exporter`                  | string      | Trace exporter: `memory`, `otlp`, or `both`. Use `both` when traces should remain queryable in iii while also being exported. Defaults to `otlp`. Env: `OTEL_EXPORTER_TYPE`. |
+| `endpoint`                  | string      | OTLP collector base endpoint. Defaults to `"http://localhost:4317"`. Env: `OTEL_EXPORTER_OTLP_ENDPOINT`.                                                                     |
+| `sampling_ratio`            | number      | Global trace sampling ratio (`0.0`–`1.0`), applied to engine spans and worker ingestion before local storage/OTLP export. Defaults to `1.0`. Env: `OTEL_TRACES_SAMPLER_ARG`.                                                                                |
+| `memory_max_spans`          | number      | Max spans to keep in memory. Defaults to `1000`. Env: `OTEL_MEMORY_MAX_SPANS`.                                                                                               |
+| `live_spans`                | boolean     | Mirror spans into the in-memory store at start as pending snapshots (see [Live (pending) spans](#live-pending-spans)). Defaults to `true` for `exporter: memory`, `false` otherwise — set it to opt in with `both` in production. Ignored for `otlp`-only. Restart-tier. Env: `OTEL_LIVE_SPANS`. |
+| `metrics_enabled`           | boolean     | Whether metrics collection is enabled. Defaults to `false`. Env: `OTEL_METRICS_ENABLED`.                                                                                     |
+| `metrics_exporter`          | string      | Metrics exporter: `memory` or `otlp`. Defaults to `memory`. Env: `OTEL_METRICS_EXPORTER`.                                                                                    |
+| `metrics_retention_seconds` | number      | How long to retain metrics in memory. Defaults to `3600`. Env: `OTEL_METRICS_RETENTION_SECONDS`.                                                                             |
+| `metrics_max_count`         | number      | Max metric data points in memory. Defaults to `10000`. Env: `OTEL_METRICS_MAX_COUNT`.                                                                                        |
+| `logs_enabled`              | boolean     | Whether structured log storage is enabled.                                                                                                                                   |
+| `logs_exporter`             | string      | Logs exporter: `memory`, `otlp`, or `both`. Use `both` when logs should remain queryable in iii while also being exported. Defaults to `memory`. Env: `OTEL_LOGS_EXPORTER`.  |
+| `logs_max_count`            | number      | Max log entries in memory. Defaults to `1000`.                                                                                                                               |
+| `logs_retention_seconds`    | number      | How long to retain logs in memory. Defaults to `3600`.                                                                                                                       |
+| `logs_sampling_ratio`       | number      | Fraction of logs to retain (`0.0`–`1.0`). Defaults to `1.0`.                                                                                                                 |
+| `logs_console_output`       | boolean     | Print ingested logs to the console. Defaults to `true`.                                                                                                                      |
+| `level`                     | string      | Minimum log level: `trace`, `debug`, `info`, `warn`, `error`. Defaults to `info`.                                                                                            |
+| `format`                    | string      | Log output format: `default` or `json`. Defaults to `default`.                                                                                                               |
+| `alerts`                    | AlertRule[] | Alert rules evaluated against metrics.                                                                                                                                       |
+| `trace_storage.enabled`     | boolean     | Persist completed spans to SQLite (`traces.sqlite3`). Defaults to `true`.                                                                                                     |
+| `trace_storage.directory`   | string      | Directory for the archive and its WAL sidecars. Defaults to `./data/observability/traces`.                                                                                    |
+| `trace_storage.max_disk_bytes` | number   | Physical cap on the archive directory; oldest traces are evicted at 90% and the file shrunk toward 80%. No committed SQLite image exceeds the cap plus a tolerance of max(1%, 8 MiB); see [Archive capacity](#archive-capacity) for spans that can never fit, transients and readers. Defaults to `1073741824` (1 GiB), minimum 64 MiB.                         |
+| `trace_storage.retention_seconds` | number | Age limit for archived traces; `0` disables it. Defaults to `2592000` (30 days).                                                                                             |
+| `trace_storage.memory_max_bytes` | number | Hard cap on the in-memory hot cache (an RSS estimate). Oldest spans are evicted first — including finalized spans the archive has not written yet, which are counted in `known_dropped_spans` and turn `completeness` to `partial`. Defaults to `268435456` (256 MiB), minimum 16 MiB. |
+| `trace_storage.memory_low_watermark_ratio` | number | Fraction of `memory_max_bytes` the cache shrinks to under pressure (`0.5`–`0.95`). Defaults to `0.75`.                                                                  |
+| `trace_storage.pending_max_age_seconds` | number | Age after which a live (pending) snapshot that never closed is dropped from the hot cache. Defaults to `3600`.                                                            |
+| `trace_storage.max_attribute_bytes` | number | Cap on one attribute value (span, event or link) at ingest. Longer values are cut on a char boundary and end in `…[truncated N bytes]`; a cut `iii.payload.json` also sets `iii.payload.truncated`. `0` disables. Defaults to `65536`. |
+
+### OTLP Transport
+
+Traces and metrics export over OTLP/gRPC by default. `https://` endpoints use TLS with system roots,
+while `http://` endpoints use cleartext transport.
+
+To export traces and metrics with OTLP/HTTP protobuf instead of gRPC, set the standard OpenTelemetry
+protocol environment variable before starting the engine:
+
+```bash
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+```
+
+Signal-specific protocol variables override the global value:
+
+```bash
+export OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=grpc
+export OTEL_EXPORTER_OTLP_METRICS_PROTOCOL=http/protobuf
+```
+
+When HTTP/protobuf is selected, iii treats `endpoint` as the collector base URL and appends the
+signal path when needed:
+
+- traces: `/v1/traces`
+- metrics: `/v1/metrics`
+
+The logs exporter sends OTLP logs over HTTP and posts to `/v1/logs`.
+
+Collectors that require authentication or routing headers can use the standard OTLP headers
+environment variables:
+
+```bash
+export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer $OTLP_TOKEN"
+```
+
+Use signal-specific headers when one signal needs different values:
+
+- `OTEL_EXPORTER_OTLP_TRACES_HEADERS`
+- `OTEL_EXPORTER_OTLP_METRICS_HEADERS`
+- `OTEL_EXPORTER_OTLP_LOGS_HEADERS`
+
+The logs exporter reads `OTEL_EXPORTER_OTLP_LOGS_HEADERS` first and falls back to
+`OTEL_EXPORTER_OTLP_HEADERS`. Keep tokens in environment variables or a secret manager; do not
+commit them to config files.
+
+To keep the iii console useful while exporting to an external collector, use `exporter: both` for
+traces and `logs_exporter: both` for logs.
+
+### Alert Rule Fields
+
+| Field              | Type        | Description                                                                                             |
+| ------------------ | ----------- | ------------------------------------------------------------------------------------------------------- |
+| `name`             | string      | Required. Unique alert rule name.                                                                       |
+| `metric`           | string      | Required. Metric name to monitor (e.g., `iii.invocations.error`).                                       |
+| `threshold`        | number      | Required. Threshold value.                                                                              |
+| `operator`         | string      | Comparison operator: `greaterthan`, `greaterthanorequal`, `lessthan`, `lessthanorequal`, `equal`, `notequal`. Defaults to `greaterthan`. |
+| `window_seconds`   | number      | Time window in seconds for metric evaluation. Defaults to `60`.                                         |
+| `cooldown_seconds` | number      | Minimum interval between alert fires. Defaults to `60`.                                                 |
+| `enabled`          | boolean     | Whether the alert rule is active. Defaults to `true`.                                                   |
+| `action`           | AlertAction | `{ "type": "log" }`, `{ "type": "webhook", "url": "..." }`, or `{ "type": "function", "path": "..." }`. |
+
+### Archive capacity
+
+- Every commit attributes the pages it used (new plus reused free pages,
+  minus pages freed by replaced versions) to the traces it wrote, in
+  `trace_meta.image_bytes`; a commit of several traces shares them by an
+  estimate of each trace's row cost (payload, attribute rows and their index
+  entries). Capacity decisions use these sizes, never an archive-wide ratio. Archives from before the column gain it on
+  open (0 = not measured; `approx_bytes` is used until the trace is written
+  again).
+- Durable rows are never deleted to make room for their own trace. Before
+  anything is evicted, a trace's new spans are judged against the room it
+  could ever have beside its own rows. With no other trace in the archive
+  that is the room left now, an exact bound. Otherwise the sizes of the
+  others are only attributed (or unknown), so nothing is dropped on them:
+  the bound is the cap plus tolerance minus a lower bound of the trace's own
+  rows and the fixed overhead (schema pages, `-shm`), and the spans are
+  judged again, exactly, once the others are gone. Rows that never fit are
+  dropped and counted in `known_dropped_spans` (`completeness: partial`);
+  the longest prefix that fits is written; rows that fit only once others
+  leave wait. Later spans of
+  the same trace are judged on their own. Of two dirty versions of a span,
+  the newest is archived.
+- Nothing is evicted for spans that would not fit even with every
+  unprotected trace gone (protected = traces in the batch and live traces).
+  When no unprotected trace is left, the bytes in use are remembered as a
+  floor for the protected traces holding them, plus their attributed change
+  since. It holds while they stay protected and keep their rows (retention
+  keeps it; new limits, `clear`, a floor trace losing its protection or rows
+  of one being deleted drop it). A group of the only trace in the floor is
+  judged against it, so spans that can never fit beside their live trace
+  are dropped without evicting anything. Known limitation: without a floor
+  sizes come from attribution, and a protected trace whose share of shared
+  commits is underestimated, whose size is unknown (written by an older
+  version), or the group's own rows (left out until measured) can make the
+  first eviction for a group that still does not fit useless; that
+  unprotected history is lost uncounted, once per set of protected traces,
+  and the eviction measures the floor.
+- Large new spans (lower bound above a quarter of the cap and at most 64 MiB)
+  are measured once in a private scratch database under the system temporary
+  directory (mode 0600, 2 MiB page cache, removed right after, outside the
+  cap; on tmpfs it is memory for one measurement). The measurement is kept
+  for retries of the same rows. If the scratch cannot be used (missing or
+  full TMPDIR) it is skipped for 10 minutes with one warning, and such spans
+  are measured by a trial in the archive itself, with nothing evicted for
+  them; larger spans always are.
+- A trace that fits beside its own rows but not now (for example while a
+  live trace holds the space) stays dirty and is retried with backoff (1 s
+  doubling to 60 s); when nothing fits at all the whole archive backs off (up
+  to 30 s). A storage error (for example EFBIG/ENOSPC writing one large
+  trace) defers only the traces that hit it. `flush` ignores the backoffs;
+  new limits and `clear` reset them; retention retries deferred traces at
+  once, keeping their measurements and the floor. A periodic pass does at most
+  32 batches or 1 s of work before serving control requests; a longer backlog
+  is progress, not degradation.
+- `flush` returns `Ok` once every span ingested before the call is durable or
+  counted as dropped; it returns an error if capacity or storage left some
+  dirty (archive `degraded`) or its 4 s budget ran out (not degraded). The
+  budget is checked between batches, and `flush`, `retain`, `clear` and
+  `shutdown` wait 5 s for the writer: one large batch (a measurement,
+  eviction and trial of a span near 64 MiB) or a kernel I/O stall (slow
+  fsync, journal commit, writeback) can exceed that. The call then returns
+  a timeout error while the writer finishes the work; nothing is lost.
+- The cap counts the pages in use plus the `-shm` index. Freed pages return
+  to the filesystem in checkpointed steps of 1024 pages, so retention or
+  eviction adds about one step of WAL on top of the main file instead of a
+  WAL as large as the space being freed. A reader holding a snapshot pins the
+  WAL: the return pauses until the reader finishes.
+- The full-VACUUM fallback (for files whose pages do not return) runs at most
+  once per 10 minutes. Archive warnings (capacity, drops, scratch and VACUUM
+  failures) are limited to one log line per minute with a suppressed count.
+
+### Advanced Sampling
+
+```yaml
+sampling:
+  default: 1.0
+  parent_based: true
+  rules:
+    - operation: "api.*"
+      rate: 0.1
+  rate_limit:
+    max_traces_per_second: 100
+```
+
+Worker spans received over OTLP are sampled per trace before local storage
+and collector export, where the trace is rooted in the worker:
+
+- A local root (no parent) gets the configured policy: rules, one rate-limit
+  token per trace, default ratio. The W3C sampled bit SDKs set on exported
+  spans (the Node SDK sends flags `0x101` on every span) is not a decision
+  and never bypasses these policies.
+- A span whose parent the SDK marks remote (OTLP flags `0x300` together with
+  a `parentSpanId`) carries the caller's decision: its sampled bit, set or
+  not, is presented to the sampler as an incoming `traceparent` would be, so
+  parent-based samplers (`parent_based: true`, and rules/rate limits, which
+  always run parent-based) follow it and a plain `sampling_ratio` keeps
+  deciding by trace id.
+- Every other span follows its trace. A root anywhere in the same request
+  decides first; a trace already in the hot cache was sampled in. With
+  per-operation rules a child that arrives before its root waits for it, up
+  to 2 s, 4,096 spans and 32 MiB of estimated raw span data in total (held
+  spans are not yet truncated to `max_attribute_bytes`; the decoded request
+  itself is not counted), then is decided by its own span (rules are
+  evaluated on the root, as the engine does). Without such rules the first
+  span seen decides.
+- Verdicts are remembered for the 16,384 most recent traces and reset when
+  sampling changes. A root final whose verdict was forgotten keeps it while
+  the root's live start snapshot, stored since the last sampling change, is
+  in the hot cache; otherwise it is decided again. Engine spans under a worker's traceparent follow the
+  engine's own sampler (`ParentBased`, unchanged): it trusts the worker's
+  sampled flag, so with `parent_based: true` and default 0 a worker-rooted
+  trace keeps its engine spans while the worker's local root is sampled out.
+
+## Functions
+
+### Logging
+
+| Function             | Description                   |
+| -------------------- | ----------------------------- |
+| `engine::log::info`  | Log an informational message. |
+| `engine::log::warn`  | Log a warning message.        |
+| `engine::log::error` | Log an error message.         |
+| `engine::log::debug` | Log a debug message.          |
+| `engine::log::trace` | Log a trace-level message.    |
+
+All logging functions accept: `message` (string, required), `data` (object), `trace_id` (string),
+`span_id` (string), `service_name` (string). Without `trace_id`, the record takes the trace and span
+the call runs in (the `traceparent` its caller sent), so a log line a handler writes is correlated
+with that handler's trace. Each call stores one record (instrumentation scope `iii`).
+
+### Logs API
+
+| Function              | Description                                                                                                                             |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `engine::logs::list`  | Query stored log entries. Filters: `start_time`, `end_time`, `trace_id`, `span_id`, `severity_min`, `severity_text`, `offset`, `limit`. |
+| `engine::logs::clear` | Clear all stored log entries from memory.                                                                                               |
+
+### Traces API
+
+| Function                 | Description                                                                                                                                                                                                                                                                               |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `engine::traces::list`   | List one compact summary per trace. Child spans contribute aggregate status/counts and can be searched with `search_all_spans`; `attribute_projection` returns only requested arbitrary attributes. Supports the standard trace filters, sort, `offset`, and `limit`.                       |
+| `engine::traces::spans`  | List full stored span records, including attributes, events, and links. Accepts the same filters and pagination as the former span-list contract; use this only for detail/timeline consumers that need complete span payloads. `include_events: false` drops each span's events and links, which carry the invocation payloads, for a view that only draws spans.                                                             |
+| `engine::traces::tree`   | Retrieve a trace as a hierarchical span tree. Parameters: `trace_id` (required).                                                                                                                                                                                                          |
+| `engine::traces::clear`  | Clear all stored trace spans from memory.                                                                                                                                                                                                                                                 |
+
+### Live (pending) spans
+
+With the `memory` exporter (the local-dev default), spans are additionally mirrored into the
+in-memory store the moment they **start**. This is on by default for `memory` only; a `both`
+setup — the production shape that also exports OTLP — opts in explicitly with `live_spans: true`
+(or `OTEL_LIVE_SPANS=true`), and `otlp`-only can never mirror (engine finals don't land in the
+memory store there, so pending snapshots would never be replaced). A live snapshot is marked
+`pending: true` with `end_time_unix_nano: 0` and carries the attributes known at creation (span
+macro fields plus baggage-stamped `iii.*` attributes); attributes recorded later, like
+`otel.status_code`, are absent, so pending spans read `status: "unset"`. When the span closes, the
+final span **replaces the snapshot in place** — same storage position, one entry per span id.
+
+This is what lets live trace views show in-progress work: engine-side parent spans (`trigger <fn>`,
+`enqueue`, builtin `call <fn>`) become visible while the work under them is still running, traces
+appear in list views as soon as they start, and the trace triggers tick on span
+start as well as close. Worker (SDK) spans still arrive only when they close — they are ingested
+over OTLP, which has no notion of an unfinished span.
+
+Consumers of the Traces API should treat `pending: true` (or `end_time_unix_nano == 0`) as
+"still running": duration filters and sorts already measure such spans as duration-so-far, and
+`engine::metrics::list` excludes them from latency statistics. The `pending` field is only
+serialized when true, so the wire shape of finished spans is unchanged.
+
+**OTEL compliance:** pending snapshots exist ONLY in the in-memory store (and the query views and
+trace-trigger ticks fed from it). The OTLP export path (both the engine exporter and the SDK-span forwarder) is
+untouched and only ever ships complete spans — `end_time_unix_nano` is semantically required on the
+OTLP wire, and nothing partial ever reaches it. Spans that never close (e.g. a leaked guard) remain
+pending until buffer eviction; they are a dev-store artifact, not exported data.
+
+### Metrics API
+
+| Function                | Description                                                                                                                                                 |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `engine::metrics::list` | List metrics with aggregated statistics. Returns engine counters (invocations, workers, performance), SDK metrics, and optional time-bucketed aggregations. |
+| `engine::rollups::list` | List metric rollup aggregations (1-minute, 5-minute, 1-hour windows).                                                                                       |
+
+### Other APIs
+
+| Function                   | Description                                                                         |
+| -------------------------- | ----------------------------------------------------------------------------------- |
+| `engine::baggage::get`     | Get a baggage value from the current trace context.                                 |
+| `engine::baggage::set`     | Set a baggage value in the current trace context.                                   |
+| `engine::baggage::get_all` | Get all baggage key-value pairs.                                                    |
+| `engine::sampling::rules`  | List all active sampling rules.                                                     |
+| `engine::health::check`    | Check engine health status. Returns `status`, `components`, `timestamp`, `version`. |
+| `engine::alerts::list`     | List all configured alert rules and their current state.                            |
+| `engine::alerts::evaluate` | Manually trigger evaluation of all alert rules.                                     |
+
+## Trigger Type: `log`
+
+Register a function to react to log entries as they are produced.
+
+| Config Field | Type   | Description                                                                                                  |
+| ------------ | ------ | ------------------------------------------------------------------------------------------------------------ |
+| `level`      | string | Log level to subscribe to: `info`, `warn`, `error`, `debug`, or `trace`. When omitted, fires for all levels. |
+
+### Sample Code
+
+```typescript
+const fn = iii.registerFunction("monitoring::onError", async (logEntry) => {
+  await sendAlert({
+    message: logEntry.body,
+    severity: logEntry.severity_text,
+    traceId: logEntry.trace_id,
+  });
+  return {};
+});
+
+iii.registerTrigger({
+  type: "log",
+  function_id: fn.id,
+  config: { level: "error" },
+});
+```
+
+Log entry payload fields: `timestamp_unix_nano`, `observed_timestamp_unix_nano`, `severity_number`,
+`severity_text`, `body`, `attributes`, `trace_id`, `span_id`, `resource`, `service_name`,
+`instrumentation_scope_name`, `instrumentation_scope_version`.
+
+## Trigger Type: `trace`
+
+Register a function to react to span activity in the in-memory trace store, so any client — a worker
+or the web console — can refresh reactively instead of polling. The trigger is a **coalesced "traces
+changed" tick**, not a per-span feed: span activity is debounced (~300ms) and the handler receives
+the distinct affected trace ids for the window. With `live_spans` on, the tick also fires when spans
+**start** (pending snapshots land in the store), not just when they close. Re-read details via
+`engine::traces::list` / `engine::traces::spans` / `engine::traces::tree`. Requires the memory exporter (`exporter: memory` or
+`both`); in OTLP-only mode engine spans never land in the store, so the trigger only ever sees
+OTLP-ingested SDK spans there.
+
+Engine-internal spans and the trigger's **own delivery spans** are excluded from firing it —
+delivering a trigger via `engine.call` is itself instrumented as a span, so without this exclusion
+the trigger would re-fire on its own output (an unbounded feedback loop). This is why a span trigger
+differs from the `log` trigger, whose delivery produces spans, not logs.
+
+| Config Field   | Type   | Description                                                                                                                                               |
+| -------------- | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `service_name` | string | Only fire for activity from this service. When omitted, fires for any service. Compared case-insensitively.                                               |
+| `status`       | string | Only fire when a span with this status (`ok`, `error`, or `unset`) landed in the window. When omitted, fires for any status. Compared case-insensitively. |
+
+Both filters are ANDed; omit both to fire on any span activity.
+
+### Sample Code
+
+```typescript
+const fn = iii.registerFunction("devtools::onTracesChanged", async ({ trace_ids }) => {
+  // A "refetch soon" beat — re-read the traces you care about.
+  await refreshTraceViews(trace_ids);
+  return {};
+});
+
+iii.registerTrigger({
+  type: "trace",
+  function_id: fn.id,
+  config: {}, // or { status: 'error' }
+});
+```
+
+Handler payload: `{ "trace_ids": string[] }` — the distinct trace ids with span activity in the
+coalesced window.

@@ -1,0 +1,282 @@
+locals {
+  # 'unsafe-inline' required for inline GTM/Tailwind scripts in index.html.
+  # 'unsafe-eval' required by the Tailwind CDN runtime (`new Function()`).
+  csp = join("; ", [
+    "default-src 'self'",
+    "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://www.googletagmanager.com https://cdn.tailwindcss.com https://esm.sh https://cdn.cr-relay.com",
+    "style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com",
+    "img-src 'self' data: https:",
+    "font-src 'self' data:",
+    "connect-src 'self' https://www.google-analytics.com https://analytics.google.com https://www.googletagmanager.com https://api.cr-relay.com https://api.mailmodo.com https://${var.search_api_origin} https://api.github.com https://discord.com",
+    # 'self': the landing page embeds its own /console-demo/index.html.
+    "frame-src 'self' https://www.googletagmanager.com",
+    "form-action 'self' https://api.mailmodo.com",
+    "object-src 'none'",
+    "base-uri 'self'",
+    # 'self', not 'none': /console-demo/* is framed by the landing page.
+    "frame-ancestors 'self'",
+    "upgrade-insecure-requests",
+  ])
+}
+
+resource "aws_cloudfront_origin_access_control" "site" {
+  name                              = "iii-website-prod-oac"
+  description                       = "OAC for iii.dev website S3 origin"
+  origin_access_control_origin_type = "s3"
+  signing_behavior                  = "always"
+  signing_protocol                  = "sigv4"
+}
+
+# Pretty-URL → *.html route map read by the redirects function at the edge.
+# Terraform owns the store; the key/value DATA is owned by deploy-website.yml,
+# which syncs it from website/*.html on every content deploy. That decoupling is
+# the whole point of this resource: adding a page no longer needs a `terraform
+# apply` to republish the function (MOT-3669).
+resource "aws_cloudfront_key_value_store" "routes" {
+  name    = "iii-website-prod-routes"
+  comment = "Pretty-URL → .html map for the redirects function; data synced by deploy-website.yml, not Terraform"
+}
+
+resource "aws_cloudfront_function" "redirects" {
+  name    = "iii-website-prod-redirects"
+  runtime = "cloudfront-js-2.0"
+  comment = "viewer-request (default behavior only): www->apex, pretty-URL rewrite via KVS, real 404"
+  publish = true
+  code    = file("${path.module}/cloudfront_functions/redirects.js")
+
+  key_value_store_associations = [aws_cloudfront_key_value_store.routes.arn]
+}
+
+resource "aws_cloudfront_response_headers_policy" "site" {
+  name    = "iii-website-prod-security-headers"
+  comment = "HSTS + CSP + security headers for iii.dev"
+
+  security_headers_config {
+    content_type_options {
+      override = true
+    }
+
+    # SAMEORIGIN, not DENY: the landing page embeds /console-demo/index.html
+    # in an iframe, and this policy rides every S3-origin response. DENY made
+    # the browser refuse to render the site's own demo. Third-party embedding
+    # stays blocked.
+    frame_options {
+      frame_option = "SAMEORIGIN"
+      override     = true
+    }
+
+    referrer_policy {
+      referrer_policy = "strict-origin-when-cross-origin"
+      override        = true
+    }
+
+    # preload is a ONE-WAY DOOR — would apply forever to cloud.iii.dev and any
+    # *.iii.dev wildcard subdomain. Audit every subdomain first.
+    strict_transport_security {
+      access_control_max_age_sec = 31536000
+      include_subdomains         = true
+      preload                    = false
+      override                   = true
+    }
+
+    xss_protection {
+      mode_block = true
+      protection = true
+      override   = true
+    }
+  }
+
+  custom_headers_config {
+    items {
+      header   = var.csp_report_only ? "Content-Security-Policy-Report-Only" : "Content-Security-Policy"
+      value    = local.csp
+      override = true
+    }
+  }
+}
+
+locals {
+  cache_policy_optimized_id    = "658327ea-f89d-4fab-a63d-7e88639e58f6" # CachingOptimized
+  cache_policy_disabled_id     = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad" # CachingDisabled
+  origin_request_cors_s3_id    = "88a5eaf4-2fd4-4709-b370-b4c650ea3fcf" # CORS-S3Origin
+  origin_request_all_viewer_id = "216adef6-5c7f-47e4-b989-5492eafa07d3" # AllViewer
+  # Vercel routes requests by Host header, so a proxied *.vercel.app origin
+  # must receive its own hostname; forwarding the viewer's `Host: iii.dev`
+  # there makes CloudFront 502.
+  origin_request_all_viewer_except_host_id = "b689b0a8-53d0-40ab-baf2-68738e2966ac" # AllViewerExceptHostHeader
+}
+
+resource "aws_cloudfront_distribution" "site" {
+  enabled             = true
+  is_ipv6_enabled     = true
+  comment             = "iii.dev marketing site (${var.apex_domain})"
+  default_root_object = "index.html"
+  http_version        = "http2and3"
+  price_class         = var.price_class
+
+  aliases = [
+    var.apex_domain,
+    var.www_domain,
+    var.preview_domain,
+  ]
+
+  origin {
+    origin_id                = "s3-site"
+    domain_name              = aws_s3_bucket.site.bucket_regional_domain_name
+    origin_access_control_id = aws_cloudfront_origin_access_control.site.id
+  }
+
+  origin {
+    origin_id   = "search-api"
+    domain_name = var.search_api_origin
+
+    custom_origin_config {
+      http_port                = 80
+      https_port               = 443
+      origin_protocol_policy   = "https-only"
+      origin_ssl_protocols     = ["TLSv1.2"]
+      origin_keepalive_timeout = 5
+      origin_read_timeout      = 30
+    }
+  }
+
+  # domain_name is docs.iii.dev so origin TLS SNI matches iii-dev-tls-docs at
+  # ingress-nginx; the /docs* and /registry* behaviors forward Host: iii.dev via
+  # AllViewer, which reaches the iii-edge-proxy nginx server block for iii.dev.
+  # Coupled to docs.iii.dev staying on the k8s NLB (see NEXT-STEPS.md item 13).
+  origin {
+    origin_id   = "docs-nlb"
+    domain_name = var.docs_domain
+
+    custom_origin_config {
+      http_port                = 80
+      https_port               = 443
+      origin_protocol_policy   = "https-only"
+      origin_ssl_protocols     = ["TLSv1.2"]
+      origin_keepalive_timeout = 5
+      origin_read_timeout      = 30
+    }
+  }
+
+  default_cache_behavior {
+    target_origin_id       = "s3-site"
+    viewer_protocol_policy = "redirect-to-https"
+    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
+    cached_methods         = ["GET", "HEAD"]
+    compress               = true
+
+    cache_policy_id            = local.cache_policy_optimized_id
+    origin_request_policy_id   = local.origin_request_cors_s3_id
+    response_headers_policy_id = aws_cloudfront_response_headers_policy.site.id
+
+    function_association {
+      event_type   = "viewer-request"
+      function_arn = aws_cloudfront_function.redirects.arn
+    }
+  }
+
+  ordered_cache_behavior {
+    path_pattern           = "/api/search*"
+    target_origin_id       = "search-api"
+    viewer_protocol_policy = "redirect-to-https"
+    allowed_methods        = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+    cached_methods         = ["GET", "HEAD"]
+    compress               = true
+
+    cache_policy_id            = local.cache_policy_disabled_id
+    origin_request_policy_id   = local.origin_request_all_viewer_except_host_id
+    response_headers_policy_id = aws_cloudfront_response_headers_policy.site.id
+
+    # No function_association: SPA fallback must not rewrite /api/search responses.
+  }
+
+  # Two behaviors because CloudFront path patterns are literal: /docs matches
+  # only the exact path, /docs/* matches everything under it.
+  # No function_association: the redirects function's SPA fallback would rewrite
+  # /docs/quickstart to /index.html.
+  # No response_headers_policy: the site CSP would break Mintlify's inline scripts.
+  ordered_cache_behavior {
+    path_pattern           = "/docs"
+    target_origin_id       = "docs-nlb"
+    viewer_protocol_policy = "redirect-to-https"
+    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
+    cached_methods         = ["GET", "HEAD"]
+    compress               = true
+
+    cache_policy_id          = local.cache_policy_disabled_id
+    origin_request_policy_id = local.origin_request_all_viewer_id
+  }
+
+  ordered_cache_behavior {
+    path_pattern           = "/docs/*"
+    target_origin_id       = "docs-nlb"
+    viewer_protocol_policy = "redirect-to-https"
+    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
+    cached_methods         = ["GET", "HEAD"]
+    compress               = true
+
+    cache_policy_id          = local.cache_policy_disabled_id
+    origin_request_policy_id = local.origin_request_all_viewer_id
+  }
+
+  # Checkpoint assets and verification POSTs must reach the docs origin.
+  # CloudFront requires the full method set to allow POST.
+  ordered_cache_behavior {
+    path_pattern           = "/.well-known/vercel/*"
+    target_origin_id       = "docs-nlb"
+    viewer_protocol_policy = "redirect-to-https"
+    allowed_methods        = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+    cached_methods         = ["GET", "HEAD"]
+    compress               = true
+
+    cache_policy_id          = local.cache_policy_disabled_id
+    origin_request_policy_id = local.origin_request_all_viewer_id
+
+    # The function preserves /.well-known/ requests and canonicalizes www.
+    function_association {
+      event_type   = "viewer-request"
+      function_arn = aws_cloudfront_function.redirects.arn
+    }
+  }
+
+  # Workers registry: iii-edge-proxy strips /registry and proxies to
+  # workers.iii.dev (iii-hq/iii-argocd-values, apps/site/manifests/iii-dev.yaml).
+  # Same pair of patterns and the same reasons for no function and no response
+  # headers policy as /docs. The full method set is needed because the
+  # registry's Next.js server actions POST to the page URL.
+  ordered_cache_behavior {
+    path_pattern           = "/registry"
+    target_origin_id       = "docs-nlb"
+    viewer_protocol_policy = "redirect-to-https"
+    allowed_methods        = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+    cached_methods         = ["GET", "HEAD"]
+    compress               = true
+
+    cache_policy_id          = local.cache_policy_disabled_id
+    origin_request_policy_id = local.origin_request_all_viewer_id
+  }
+
+  ordered_cache_behavior {
+    path_pattern           = "/registry/*"
+    target_origin_id       = "docs-nlb"
+    viewer_protocol_policy = "redirect-to-https"
+    allowed_methods        = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+    cached_methods         = ["GET", "HEAD"]
+    compress               = true
+
+    cache_policy_id          = local.cache_policy_disabled_id
+    origin_request_policy_id = local.origin_request_all_viewer_id
+  }
+
+  viewer_certificate {
+    acm_certificate_arn      = aws_acm_certificate_validation.site.certificate_arn
+    ssl_support_method       = "sni-only"
+    minimum_protocol_version = "TLSv1.2_2021"
+  }
+
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+}

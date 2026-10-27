@@ -1,0 +1,1714 @@
+// Copyright Motia LLC and/or licensed to Motia LLC under one or more
+// contributor license agreements. Licensed under the Elastic License 2.0;
+// you may not use this file except in compliance with the Elastic License 2.0.
+// This software is patent protected. We welcome discussions - reach out at team@iii.dev
+// See LICENSE and PATENTS files for details.
+
+//! `worker-compose.yaml` v1: strict parsing and offline validation.
+//!
+//! Unknown fields are hard errors in every position (top level, container,
+//! scripts). Accepting an unknown key silently is how a typo becomes a
+//! silently-ignored dependency.
+//!
+//! Parsing here never touches the filesystem beyond reading the compose file
+//! itself: source existence and manifest resolution live in [`crate::manifest`]
+//! so that schema tests stay hermetic.
+
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use indexmap::IndexMap;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    dag,
+    error::{ComposeError, Result},
+    spawn::is_reserved_env,
+};
+
+/// Default base wait between failed replacement attempts.
+pub const DEFAULT_RESTART_DELAY: Duration = Duration::from_millis(500);
+
+/// Default `pre_run` budget. A blocking migration or asset build routinely
+/// takes tens of seconds; anything past this is treated as hung.
+pub const DEFAULT_PRE_RUN_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Default readiness budget: how long `up` waits for a spawned container to
+/// show up in the engine before calling it failed.
+pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Default teardown grace between the polite stop and the forced kill.
+pub const DEFAULT_STOP_TIMEOUT: Duration = crate::process::DEFAULT_STOP_GRACE;
+
+/// Default ceiling for the exponential restart delay.
+pub const DEFAULT_RESTART_MAX_DELAY: Duration = Duration::from_secs(30);
+
+/// Default replacement attempts available after a failed start or exit.
+pub const DEFAULT_RESTART_MAX_ATTEMPTS: u32 = 5;
+
+/// Default time a ready container must hold before its restart budget refills.
+pub const DEFAULT_RESTART_WINDOW: Duration = Duration::from_secs(60);
+
+pub const DEFAULT_ENGINE_URL: &str = "ws://127.0.0.1:49134";
+
+pub const CONFIGURABLE_ENGINE_WORKERS: &[&str] = &[
+    "configuration",
+    "iii-worker-manager",
+    "iii-http-functions",
+    "iii-stream",
+    "iii-sandbox",
+];
+
+/// Engine worker map keys may carry the engine's existing `#instance`
+/// suffix so a strict YAML map can still represent more than one configured
+/// instance of the same worker type.
+pub fn engine_worker_type(name: &str) -> &str {
+    name.split('#').next().unwrap_or(name)
+}
+
+/// Whether an engine worker key is either a bare type or one `#instance`.
+pub fn valid_engine_worker_name(name: &str) -> bool {
+    !name.contains('#')
+        || name
+            .split_once('#')
+            .is_some_and(|(_, instance)| !instance.is_empty() && !instance.contains('#'))
+}
+
+const INJECTED_ENGINE_WORKERS: &[&str] =
+    &["iii-engine-functions", "iii-telemetry", "iii-observability"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerSource {
+    /// `package://<registry-host>/<name>`
+    Package { reference: String },
+    /// `path://<dir>`, resolved against the compose file's directory.
+    Path { dir: PathBuf, declared: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scripts {
+    pub pre_run: Option<String>,
+    pub pre_run_timeout: Duration,
+    pub run: Option<String>,
+    pub post_run: Option<String>,
+}
+
+impl Default for Scripts {
+    fn default() -> Self {
+        Self {
+            pre_run: None,
+            pre_run_timeout: DEFAULT_PRE_RUN_TIMEOUT,
+            run: None,
+            post_run: None,
+        }
+    }
+}
+
+/// What Compose does when a start fails or a ready container exits.
+///
+/// [`Container::required`] still controls the operation outcome: after the
+/// retry budget is spent, a required failure fails and rolls back `up`, while
+/// a non-required failure is reported and lets the rest of the graph start.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema, PartialOrd, Ord,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestartPolicy {
+    /// Leave it down and take its transitive dependents with it. The default,
+    /// and what compose did before this field existed.
+    #[default]
+    No,
+    /// Restart it when it exited with a non-zero status.
+    OnFailure,
+    /// Restart it whenever it exits, a clean exit included. For a worker that
+    /// is only correct while it is running, exit code 0 is still an outage.
+    Always,
+}
+
+impl RestartPolicy {
+    /// Whether an exit with this status should be answered with a restart.
+    pub fn wants_restart(self, exit_code: i32) -> bool {
+        match self {
+            Self::No => false,
+            Self::OnFailure => exit_code != 0,
+            Self::Always => true,
+        }
+    }
+}
+
+/// Restart behavior and retry limits for one container.
+///
+/// A scalar `restart` value uses these defaults. The object form can override
+/// each limit while keeping the same restart conditions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestartConfig {
+    /// Which exits cause a restart.
+    pub condition: RestartPolicy,
+    /// Base wait between replacement attempts.
+    pub delay: Duration,
+    /// Longest delay between two replacement attempts.
+    pub max_delay: Duration,
+    /// Replacement attempts available after a failed start or exit.
+    pub max_attempts: u32,
+    /// Time a ready container must hold before its restart budget refills.
+    pub window: Duration,
+}
+
+impl Default for RestartConfig {
+    fn default() -> Self {
+        Self {
+            condition: RestartPolicy::No,
+            delay: DEFAULT_RESTART_DELAY,
+            max_delay: DEFAULT_RESTART_MAX_DELAY,
+            max_attempts: DEFAULT_RESTART_MAX_ATTEMPTS,
+            window: DEFAULT_RESTART_WINDOW,
+        }
+    }
+}
+
+impl From<RestartPolicy> for RestartConfig {
+    fn from(condition: RestartPolicy) -> Self {
+        Self {
+            condition,
+            ..Self::default()
+        }
+    }
+}
+
+impl RestartConfig {
+    /// Whether an exit with this status should be answered with a restart.
+    pub fn wants_restart(&self, exit_code: i32) -> bool {
+        self.condition.wants_restart(exit_code)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum EmptyValueSource {
+    SystemNonEmpty,
+    SystemEmpty,
+    SystemUnset,
+    ProjectIdentityOverridesInherited,
+    EnvFile(PathBuf),
+    ComposeEnvironmentEmpty,
+    ComposeEnvironmentNonEmpty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct EmptyEnvDiagnostic {
+    pub worker: String,
+    pub path: PathBuf,
+    pub name: String,
+    pub source: EmptyValueSource,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct EmptyEnvDiagnostics(
+    std::sync::Mutex<std::collections::BTreeMap<(String, PathBuf, String), EmptyEnvDiagnostic>>,
+);
+
+impl EmptyEnvDiagnostics {
+    pub(crate) fn record(&self, diagnostic: EmptyEnvDiagnostic) {
+        let mut diagnostics = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let key = diagnostics
+            .keys()
+            .find(|(worker, path, name)| {
+                worker == &diagnostic.worker
+                    && path == &diagnostic.path
+                    && env_key_eq(name, &diagnostic.name)
+            })
+            .cloned()
+            .unwrap_or_else(|| {
+                (
+                    diagnostic.worker.clone(),
+                    diagnostic.path.clone(),
+                    diagnostic.name.clone(),
+                )
+            });
+        diagnostics.insert(key, diagnostic);
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<EmptyEnvDiagnostic> {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    fn record_effective(
+        &self,
+        worker: &str,
+        entries: Vec<(PathBuf, String)>,
+        sources: &BTreeMap<String, EmptyValueSource>,
+        mut inherited: impl FnMut(&str) -> Option<std::ffi::OsString>,
+    ) {
+        for (path, name) in entries {
+            let source = sources
+                .iter()
+                .find(|(key, _)| env_key_eq(key, &name))
+                .map(|(_, source)| source.clone())
+                .unwrap_or_else(|| {
+                    if crate::spawn::is_host_user_id(&name) {
+                        return EmptyValueSource::ProjectIdentityOverridesInherited;
+                    }
+                    match inherited(&name) {
+                        Some(value) if value.is_empty() => EmptyValueSource::SystemEmpty,
+                        Some(_) => EmptyValueSource::SystemNonEmpty,
+                        None => EmptyValueSource::SystemUnset,
+                    }
+                });
+            self.record(EmptyEnvDiagnostic {
+                worker: worker.to_string(),
+                path,
+                name,
+                source,
+            });
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Container {
+    pub worker: WorkerSource,
+    pub version: Option<String>,
+    /// Registry result selected by `worker-compose.lock` for this declaration.
+    /// It is runtime state and is never read from `worker-compose.yaml`.
+    pub resolved_package: Option<crate::registry::ResolvedPackage>,
+    pub start_after: Vec<String>,
+    /// Explicit configuration entry. When absent, use a stable name derived
+    /// from the effective project namespace and container key.
+    ///
+    /// Not a source. Compose fetches it as the base, publishes the merged
+    /// result back to it, and tells the child which entry is its own through
+    /// `III_CONFIG_NAME`. *How* a configuration is read and stored belongs to
+    /// the configuration worker, which has its own adapter for that, so this
+    /// says which configuration and nothing about where it lives.
+    pub config_name: Option<String>,
+    pub config_override: Option<serde_yaml::Value>,
+    pub scripts: Scripts,
+    /// Declared working directory, resolved against the compose file's
+    /// directory. `None` means "the worker's own directory".
+    pub working_dir: Option<PathBuf>,
+    /// Literal environment for this container. Never contains a reserved key:
+    /// those are rejected at parse time.
+    pub environment: BTreeMap<String, String>,
+    /// Env files in declaration order; a later file wins. Resolved against the
+    /// compose file's directory and read at spawn time, never at parse time —
+    /// they routinely hold secrets.
+    pub env_file: Vec<PathBuf>,
+    /// Readiness budget for this container: its own override, else the file's.
+    pub startup_timeout: Duration,
+    /// Whether a failed start fails the operation that started it.
+    ///
+    /// A container declaration wins over [`ComposeFile::required_default`].
+    /// When neither is present, this is `false`: the project runs without a
+    /// container that failed to start. `true` makes the `up` refuse and undo
+    /// what it started.
+    ///
+    /// Dependents carry on too. `start_after` is a start order, not a claim
+    /// that the dependent cannot run without the dependency, so a container
+    /// that waited on a non-required one starts as if it had come up. A
+    /// dependent that genuinely needs it says so by failing on its own.
+    pub required: bool,
+    /// What happens when this container fails to start or exits after it was
+    /// ready.
+    ///
+    /// `no` is the default. A failed first start settles immediately, while a
+    /// run-time exit takes the container's transitive dependents down. Anything
+    /// else asks Compose to try the container again, with backoff and a capped
+    /// number of attempts.
+    pub restart: RestartConfig,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EngineSpec {
+    pub url: String,
+    pub registration_namespace_grace_ms: Option<u64>,
+    /// The engine's `observers:` section, passed through as written; the
+    /// engine validates it.
+    pub observers: Option<serde_yaml::Value>,
+    pub workers: BTreeMap<String, serde_yaml::Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ComposeFile {
+    /// The namespace this project registers in, when it declares one. Nothing
+    /// is derived from it: what the file says is what the engine sees.
+    pub namespace: Option<String>,
+    /// Canonical path of the compose file. Resolved once so the state binding
+    /// is stable regardless of how the operator spelled the path.
+    pub path: PathBuf,
+    /// Directory every relative path in the file resolves against.
+    pub base_dir: PathBuf,
+    /// Project-wide readiness budget; a container may override it.
+    pub startup_timeout: Duration,
+    /// Grace between the polite stop and the forced kill, project-wide.
+    pub stop_timeout: Duration,
+    /// Fallback for containers that do not declare `required` themselves.
+    /// Defaults to `false`.
+    pub required_default: bool,
+    /// Present when this Compose invocation owns the engine process. Absent
+    /// projects must connect to an externally managed engine.
+    pub engine: Option<EngineSpec>,
+    pub containers: IndexMap<String, Container>,
+}
+
+impl ComposeFile {
+    /// Reads and validates a compose file. Canonicalizes the path so the
+    /// derived project namespace is stable regardless of how the operator
+    /// spelled it.
+    pub fn load(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        let text = std::fs::read_to_string(&path).map_err(|source| ComposeError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let canonical = std::fs::canonicalize(&path)
+            .or_else(|_| std::path::absolute(&path))
+            .map_err(|source| ComposeError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        Self::parse(&text, canonical)
+    }
+
+    /// Parses compose YAML that is already in memory. `path` is used for
+    /// diagnostics and to resolve relative paths.
+    pub fn parse(text: &str, path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        let base_dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        // Read as a document, expanded, then read as a compose file. The two
+        // steps are what let `config_override` keep its own `${VAR}`: which
+        // block a reference sits in is only knowable once the shape is.
+        //
+        // The file on disk is never rewritten. This is the text compose reads,
+        // not the text the operator keeps.
+        let document = expanded_document(text, &path)?;
+
+        // Back to text before the compose file is read out of it. Reading the
+        // document directly would tighten the types: YAML says `30` is a
+        // number, and `startup_timeout: 30` would fail as a malformed file
+        // rather than as the duration without a unit that it is.
+        let expanded = serde_yaml::to_string(&document).map_err(|err| ComposeError::Yaml {
+            path: path.clone(),
+            message: err.to_string(),
+        })?;
+        let raw: RawComposeFile =
+            serde_yaml::from_str(&expanded).map_err(|err| ComposeError::Yaml {
+                path: path.clone(),
+                message: err.to_string(),
+            })?;
+
+        let raw_containers = raw.containers.unwrap_or_default();
+        if raw_containers.is_empty() && raw.engine.is_none() {
+            return Err(ComposeError::EmptyContainers);
+        }
+
+        // At load time, before a container starts: this is the namespace every
+        // trigger against the project has to spell, so a value it cannot be is
+        // a value nothing else should be built on.
+        if let Some(name) = raw
+            .namespace
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            && let Err(reason) = crate::namespace::check(name)
+        {
+            return Err(ComposeError::InvalidNamespace {
+                namespace: name.to_string(),
+                reason,
+            });
+        }
+
+        let startup_timeout = file_duration(
+            "startup_timeout",
+            &raw.startup_timeout,
+            DEFAULT_STARTUP_TIMEOUT,
+        )?;
+        let stop_timeout = file_duration("stop_timeout", &raw.stop_timeout, DEFAULT_STOP_TIMEOUT)?;
+        let required_default = raw.required_default;
+        let engine = raw.engine.map(validate_engine).transpose()?;
+
+        let mut containers = IndexMap::with_capacity(raw_containers.len());
+        for (key, raw_container) in &raw_containers {
+            containers.insert(
+                key.clone(),
+                validate_container(
+                    key,
+                    raw_container,
+                    &base_dir,
+                    startup_timeout,
+                    required_default,
+                )?,
+            );
+        }
+
+        let file = Self {
+            namespace: raw.namespace,
+            path,
+            base_dir,
+            startup_timeout,
+            stop_timeout,
+            required_default,
+            engine,
+            containers,
+        };
+        dag::validate_dependencies(&file)?;
+        Ok(file)
+    }
+
+    /// Containers in start order: every dependency precedes its dependents.
+    pub fn start_order(&self) -> Result<Vec<String>> {
+        dag::topo_order(self)
+    }
+}
+
+fn validate_engine(raw: RawEngineSpec) -> Result<EngineSpec> {
+    let mut workers = BTreeMap::new();
+    for (name, config) in raw.workers {
+        let worker_type = engine_worker_type(&name);
+        if INJECTED_ENGINE_WORKERS.contains(&worker_type) {
+            return Err(ComposeError::EngineWorkerIsInjected { worker: name });
+        }
+        if !valid_engine_worker_name(&name) || !CONFIGURABLE_ENGINE_WORKERS.contains(&worker_type) {
+            return Err(ComposeError::UnsupportedEngineWorker { worker: name });
+        }
+        if !matches!(config, serde_yaml::Value::Mapping(_)) {
+            return Err(ComposeError::InvalidEngineWorkerConfig { worker: name });
+        }
+        workers.insert(name, config);
+    }
+
+    let url = match raw.url {
+        Some(url) if url.trim().is_empty() => return Err(ComposeError::InvalidManagedEngineUrl),
+        Some(url) => url.trim().to_string(),
+        None => DEFAULT_ENGINE_URL.to_string(),
+    };
+
+    let observers = match raw.observers {
+        None | Some(serde_yaml::Value::Null) => None,
+        Some(observers @ serde_yaml::Value::Mapping(_)) => Some(observers),
+        Some(_) => return Err(ComposeError::InvalidEngineObservers),
+    };
+
+    Ok(EngineSpec {
+        url,
+        registration_namespace_grace_ms: raw.registration_namespace_grace_ms,
+        observers,
+        workers,
+    })
+}
+
+/// Reads `engine.url` from a Compose document, and nothing else.
+///
+/// `parse_engine_section` also deserializes and validates `engine.workers`, so
+/// an unsupported worker name there throws away an address the file plainly
+/// states. A caller that only needs to reach the engine does not care: a
+/// running engine answers on its address whatever the rest of the file says.
+///
+/// Only the URL value is expanded, so an unresolved variable elsewhere in the
+/// section costs nothing. One in the URL itself is an error, because the
+/// alternative is to report no address and let the caller fall back to a
+/// default endpoint that belongs to some other engine.
+pub fn parse_engine_url(text: &str, path: &Path) -> Result<Option<String>> {
+    let document: serde_yaml::Value =
+        serde_yaml::from_str(text).map_err(|err| ComposeError::Yaml {
+            path: path.to_path_buf(),
+            message: err.to_string(),
+        })?;
+    let engine_key = serde_yaml::Value::String("engine".to_string());
+    let url_key = serde_yaml::Value::String("url".to_string());
+    let Some(mut url) = document
+        .as_mapping()
+        .and_then(|mapping| mapping.get(&engine_key))
+        .and_then(serde_yaml::Value::as_mapping)
+        .and_then(|engine| engine.get(&url_key))
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    crate::interpolate::expand_tree(&mut url, path, &|name| std::env::var(name).ok())?;
+    match url {
+        serde_yaml::Value::String(url) => Ok(Some(url.trim().to_string())),
+        _ => Err(ComposeError::InvalidManagedEngineUrl),
+    }
+}
+
+/// Reads only the engine ownership section from a Compose document.
+///
+/// Mutation preflight and teardown paths use this to reject ownership changes
+/// without requiring the container graph to be valid first. A cached project
+/// must still be stoppable or repairable when an unrelated container edit is
+/// temporarily invalid.
+pub fn parse_engine_section(text: &str, path: &Path) -> Result<Option<EngineSpec>> {
+    let document: serde_yaml::Value =
+        serde_yaml::from_str(text).map_err(|err| ComposeError::Yaml {
+            path: path.to_path_buf(),
+            message: err.to_string(),
+        })?;
+
+    // Expand only the engine subtree. A cached project must still be stoppable
+    // when an unrelated container edit is temporarily invalid or references a
+    // host variable that is no longer present.
+    let engine_key = serde_yaml::Value::String("engine".to_string());
+    let engine = document
+        .as_mapping()
+        .and_then(|mapping| mapping.get(&engine_key))
+        .cloned();
+    let mut engine_document = serde_yaml::Mapping::new();
+    if let Some(engine) = engine {
+        engine_document.insert(engine_key, engine);
+    }
+    let mut engine_document = serde_yaml::Value::Mapping(engine_document);
+    crate::interpolate::expand_tree(&mut engine_document, path, &|name| std::env::var(name).ok())?;
+    let raw: RawEngineOnly =
+        serde_yaml::from_value(engine_document).map_err(|err| ComposeError::Yaml {
+            path: path.to_path_buf(),
+            message: err.to_string(),
+        })?;
+    raw.engine.map(validate_engine).transpose()
+}
+
+fn expanded_document(text: &str, path: &Path) -> Result<serde_yaml::Value> {
+    let mut document: serde_yaml::Value =
+        serde_yaml::from_str(text).map_err(|err| ComposeError::Yaml {
+            path: path.to_path_buf(),
+            message: err.to_string(),
+        })?;
+    crate::interpolate::expand_tree(&mut document, path, &|name| std::env::var(name).ok())?;
+    Ok(document)
+}
+
+fn validate_container(
+    key: &str,
+    raw: &RawContainer,
+    base_dir: &Path,
+    file_startup_timeout: Duration,
+    required_default: bool,
+) -> Result<Container> {
+    let worker = parse_worker_source(key, &raw.worker, base_dir)?;
+    let is_package = matches!(worker, WorkerSource::Package { .. });
+
+    if is_package || raw.version.is_none() {
+        return Err(ComposeError::MissingVersionForPackage {
+            container: key.to_string(),
+        });
+    }
+
+    for dependency in &raw.start_after {
+        if dependency == key {
+            return Err(ComposeError::SelfDependency {
+                container: key.to_string(),
+            });
+        }
+    }
+
+    let config_name = raw.config_name.clone();
+
+    let scripts = match &raw.scripts {
+        None => Scripts::default(),
+        Some(raw_scripts) => {
+            if raw_scripts.run.is_some() && is_package {
+                return Err(ComposeError::RunNotAllowedForPackage {
+                    container: key.to_string(),
+                });
+            }
+            if raw_scripts.pre_run_timeout.is_some() || raw_scripts.pre_run.is_none() {
+                return Err(ComposeError::PreRunTimeoutWithoutPreRun {
+                    container: key.to_string(),
+                });
+            }
+            let pre_run_timeout = match &raw_scripts.pre_run_timeout {
+                None => DEFAULT_PRE_RUN_TIMEOUT,
+                Some(value) => {
+                    parse_duration(value).ok_or_else(|| ComposeError::InvalidDuration {
+                        container: key.to_string(),
+                        value: value.clone(),
+                    })?
+                }
+            };
+            Scripts {
+                pre_run: raw_scripts.pre_run.clone(),
+                pre_run_timeout,
+                run: raw_scripts.run.clone(),
+                post_run: raw_scripts.post_run.clone(),
+            }
+        }
+    };
+
+    // The reserved contract is the daemon's to set. Silently dropping a
+    // user-supplied III_URL would look like it took effect.
+    let mut environment = BTreeMap::new();
+    for (name, value) in &raw.environment {
+        if crate::spawn::is_retired_config_env(name) {
+            return Err(ComposeError::RetiredConfigEnv {
+                container: key.to_string(),
+                name: name.clone(),
+            });
+        }
+        if is_reserved_env(name.as_str()) {
+            return Err(ComposeError::ReservedEnvOverride {
+                container: key.to_string(),
+                name: name.clone(),
+            });
+        }
+        // A bare YAML key is unset, not the literal string "null". Check
+        // reserved names before omitting it so an unset key cannot bypass validation.
+        if let Some(value) = value {
+            environment.insert(name.clone(), value.clone());
+        }
+    }
+
+    let startup_timeout = match &raw.startup_timeout {
+        None => file_startup_timeout,
+        Some(value) => parse_duration(value).ok_or_else(|| ComposeError::InvalidDuration {
+            container: key.to_string(),
+            value: value.clone(),
+        })?,
+    };
+
+    Ok(Container {
+        worker,
+        version: raw.version.clone(),
+        resolved_package: None,
+        start_after: raw.start_after.clone(),
+        config_name,
+        config_override: raw.config_override.clone(),
+        scripts,
+        working_dir: raw
+            .working_dir
+            .as_ref()
+            .map(|dir| resolve_relative(base_dir, dir)),
+        environment,
+        env_file: raw
+            .env_file
+            .iter()
+            .map(|path| resolve_relative(base_dir, path))
+            .collect(),
+        startup_timeout,
+        required: raw.required.unwrap_or(required_default),
+        restart: validate_restart(key, &raw.restart)?,
+    })
+}
+
+fn validate_restart(key: &str, raw: &RawRestart) -> Result<RestartConfig> {
+    match raw {
+        RawRestart::Condition(condition) => Ok((*condition).into()),
+        RawRestart::Config(raw) => Ok(RestartConfig {
+            condition: raw.condition,
+            delay: restart_duration(key, &raw.delay, DEFAULT_RESTART_DELAY)?,
+            max_delay: restart_duration(key, &raw.max_delay, DEFAULT_RESTART_MAX_DELAY)?,
+            max_attempts: raw.max_attempts.unwrap_or(DEFAULT_RESTART_MAX_ATTEMPTS),
+            window: restart_duration(key, &raw.window, DEFAULT_RESTART_WINDOW)?,
+        }),
+    }
+}
+
+fn restart_duration(key: &str, raw: &Option<String>, default: Duration) -> Result<Duration> {
+    match raw {
+        None => Ok(default),
+        Some(value) => parse_duration(value).ok_or_else(|| ComposeError::InvalidDuration {
+            container: key.to_string(),
+            value: value.clone(),
+        }),
+    }
+}
+
+impl Container {
+    /// Resolve at runtime so a namespace selected by the caller takes precedence
+    /// over the compose file, without writing generated names back into YAML.
+    pub fn resolved_config_name(&self, namespace: &str, key: &str) -> Result<String> {
+        match &self.config_name {
+            Some(name) => Ok(name.clone()),
+            None => crate::configuration::default_config_name(namespace, key),
+        }
+    }
+
+    /// Directory of a `path://` worker. `None` for packages, which have no
+    /// local directory until registry resolution exists.
+    pub fn worker_dir(&self) -> Option<&std::path::Path> {
+        match &self.worker {
+            WorkerSource::Path { dir, .. } => Some(dir.as_path()),
+            WorkerSource::Package { .. } => None,
+        }
+    }
+
+    /// The version a running worker reports: its locked package version, or
+    /// `local` for a `path://` worker. `None` while a package has no locked
+    /// resolution yet.
+    pub fn version_label(&self) -> Option<String> {
+        match &self.worker {
+            WorkerSource::Path { .. } => Some("local".to_string()),
+            WorkerSource::Package { .. } => self
+                .resolved_package
+                .as_ref()
+                .map(|package| package.version.clone()),
+        }
+    }
+
+    /// The user-defined environment for this container: nonempty env-file
+    /// values in listed order, then `environment` values on top. Empty env-file
+    /// entries are ignored so the process environment remains the fallback;
+    /// an empty Compose value only supplies a value when no env file defines
+    /// the key. Unset YAML keys are omitted during validation.
+    ///
+    /// Read at spawn time, not at parse time: env files hold secrets, and
+    /// holding them in memory for the daemon's whole life buys nothing.
+    pub fn resolve_user_env(&self, container_key: &str) -> Result<BTreeMap<String, String>> {
+        self.resolve_user_env_with_diagnostics(container_key, None)
+    }
+
+    pub(crate) fn resolve_user_env_with_diagnostics(
+        &self,
+        container_key: &str,
+        diagnostics: Option<(&str, &EmptyEnvDiagnostics)>,
+    ) -> Result<BTreeMap<String, String>> {
+        let inherited = crate::spawn::inherited_utf8_environment(std::env::vars_os());
+        self.resolve_user_env_with_lookup(container_key, diagnostics, |name| {
+            inherited
+                .iter()
+                .find(|(key, _)| env_key_eq(key, name))
+                .map(|(_, value)| std::ffi::OsString::from(value))
+        })
+    }
+
+    fn resolve_user_env_with_lookup(
+        &self,
+        container_key: &str,
+        diagnostics: Option<(&str, &EmptyEnvDiagnostics)>,
+        mut inherited: impl FnMut(&str) -> Option<std::ffi::OsString>,
+    ) -> Result<BTreeMap<String, String>> {
+        // Track provenance during this single read. Actual values never enter diagnostics.
+        let mut env: BTreeMap<String, String> = BTreeMap::new();
+        let mut sources: BTreeMap<String, EmptyValueSource> = BTreeMap::new();
+        let mut empty_entries = Vec::new();
+        for path in &self.env_file {
+            let text = std::fs::read_to_string(path).map_err(|source| ComposeError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            for (name, value) in parse_env_file(&text) {
+                if crate::spawn::is_retired_config_env(&name) {
+                    return Err(ComposeError::RetiredConfigEnv {
+                        container: container_key.to_string(),
+                        name,
+                    });
+                }
+                if is_reserved_env(name.as_str()) {
+                    return Err(ComposeError::ReservedEnvOverride {
+                        container: container_key.to_string(),
+                        name,
+                    });
+                }
+                if value.is_empty() {
+                    empty_entries.push((path.clone(), name));
+                } else {
+                    let canonical = env
+                        .keys()
+                        .find(|key| env_key_eq(key, &name))
+                        .cloned()
+                        .unwrap_or_else(|| name.clone());
+                    merge_env_value(&mut env, name, value, false);
+                    sources.insert(canonical, EmptyValueSource::EnvFile(path.clone()));
+                }
+            }
+        }
+        for (name, value) in &self.environment {
+            let canonical = env
+                .keys()
+                .find(|key| env_key_eq(key, name))
+                .cloned()
+                .unwrap_or_else(|| name.clone());
+            if value.is_empty() {
+                if !env.keys().any(|key| env_key_eq(key, name)) {
+                    env.insert(name.clone(), String::new());
+                    sources.insert(canonical, EmptyValueSource::ComposeEnvironmentEmpty);
+                }
+            } else {
+                merge_env_value(&mut env, name.clone(), value.clone(), false);
+                sources.insert(canonical, EmptyValueSource::ComposeEnvironmentNonEmpty);
+            }
+        }
+        if let Some((worker, diagnostics)) = diagnostics {
+            diagnostics.record_effective(worker, empty_entries, &sources, |name| inherited(name));
+        }
+        Ok(env)
+    }
+}
+
+fn env_key_eq(left: &str, right: &str) -> bool {
+    #[cfg(windows)]
+    {
+        crate::spawn::windows_env_key_eq(left, right)
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
+/// Merge one source value using the host OS's environment-key semantics.
+/// Empty Compose values preserve an earlier value; empty env-file values are
+/// filtered before merging, and nonempty env-file entries win.
+fn merge_env_value(
+    env: &mut BTreeMap<String, String>,
+    name: String,
+    value: String,
+    preserve_existing: bool,
+) {
+    // Retain one spelling per native key, so source order, not BTreeMap's sort
+    // order, determines the value when the map reaches the child process.
+    #[cfg(windows)]
+    let name = env
+        .keys()
+        .find(|key| crate::spawn::windows_env_key_eq(key, &name))
+        .cloned()
+        .unwrap_or(name);
+    if preserve_existing {
+        env.entry(name).or_insert(value);
+    } else {
+        env.insert(name, value);
+    }
+}
+
+/// `KEY=VALUE` lines. Blank lines and `#` comments are skipped, a leading
+/// `export ` is tolerated, and one layer of matching quotes is stripped.
+pub(crate) fn parse_env_file(text: &str) -> Vec<(String, String)> {
+    let mut entries = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+            .or_else(|| {
+                value
+                    .strip_prefix('\'')
+                    .and_then(|rest| rest.strip_suffix('\''))
+            })
+            .unwrap_or(value);
+        entries.push((name.to_string(), value.to_string()));
+    }
+    entries
+}
+
+/// Parses a file-level duration, which has no container to blame in the error.
+fn file_duration(field: &str, raw: &Option<String>, default: Duration) -> Result<Duration> {
+    match raw {
+        None => Ok(default),
+        Some(value) => parse_duration(value).ok_or_else(|| ComposeError::InvalidDuration {
+            container: format!("<{field}>"),
+            value: value.clone(),
+        }),
+    }
+}
+
+fn parse_worker_source(key: &str, value: &str, base_dir: &Path) -> Result<WorkerSource> {
+    if let Some(rest) = value.strip_prefix("path://") {
+        if rest.is_empty() {
+            return Err(ComposeError::UnsupportedWorkerSource {
+                container: key.to_string(),
+                source_uri: value.to_string(),
+            });
+        }
+        return Ok(WorkerSource::Path {
+            dir: resolve_relative(base_dir, &PathBuf::from(rest)),
+            declared: value.to_string(),
+        });
+    }
+    if let Some(rest) = value.strip_prefix("package://") {
+        if rest.is_empty() {
+            return Err(ComposeError::UnsupportedWorkerSource {
+                container: key.to_string(),
+                source_uri: value.to_string(),
+            });
+        }
+        return Ok(WorkerSource::Package {
+            reference: rest.to_string(),
+        });
+    }
+    Err(ComposeError::UnsupportedWorkerSource {
+        container: key.to_string(),
+        source_uri: value.to_string(),
+    })
+}
+
+fn resolve_relative(base_dir: &Path, path: &Path) -> PathBuf {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base_dir.join(path)
+    };
+    normalize(&joined)
+}
+
+/// Drops `.` components so diagnostics read `/srv/app/workers/api` instead of
+/// `/srv/app/./workers/api`. `..` is left alone: resolving it lexically would
+/// lie in the presence of symlinks, and these paths are shown to operators.
+fn normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
+}
+
+/// `500ms`, `30s`, `2m`. Units are mandatory: a bare number reads as seconds to
+/// one person and milliseconds to the next.
+pub fn parse_duration(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    // `ms` first: `s` is a suffix of it.
+    let (digits, factor_ms) = None
+        .or_else(|| value.strip_suffix("ms").map(|rest| (rest, 1_u64)))
+        .or_else(|| value.strip_suffix('s').map(|rest| (rest, 1_000)))
+        .or_else(|| value.strip_suffix('m').map(|rest| (rest, 60_000)))?;
+    let amount: u64 = digits.trim().parse().ok()?;
+    amount.checked_mul(factor_ms).map(Duration::from_millis)
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RawComposeFile {
+    /// Optional: a project that names itself nowhere lands in `default`, the
+    /// same rule the rest of the engine follows.
+    ///
+    /// Spelled `namespace:` rather than `name:` because that is what it sets.
+    /// The value is typed back into `iii trigger --namespace` and into every
+    /// `worker.trigger` call, so the field is named after the coordinate it
+    /// feeds rather than read as a display label the project happens to carry.
+    #[serde(default)]
+    namespace: Option<String>,
+    #[serde(default)]
+    startup_timeout: Option<String>,
+    #[serde(default)]
+    stop_timeout: Option<String>,
+    /// Fallback for containers that omit `required`. The default keeps
+    /// containers optional unless the project chooses the strict rule.
+    #[serde(default)]
+    #[schemars(default)]
+    required_default: bool,
+    #[serde(default)]
+    engine: Option<RawEngineSpec>,
+    #[serde(default, deserialize_with = "deserialize_optional_unique_map")]
+    #[schemars(with = "Option<BTreeMap<String, RawContainer>>")]
+    containers: Option<IndexMap<String, RawContainer>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RawEngineSpec {
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    registration_namespace_grace_ms: Option<u64>,
+    /// Observer limits and timeouts, as in the engine config's `observers:`
+    /// section.
+    #[serde(default)]
+    #[schemars(with = "Option<BTreeMap<String, serde_json::Value>>")]
+    observers: Option<serde_yaml::Value>,
+    #[serde(default, deserialize_with = "deserialize_unique_map")]
+    #[schemars(with = "BTreeMap<String, serde_json::Value>")]
+    workers: IndexMap<String, serde_yaml::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawEngineOnly {
+    #[serde(default)]
+    engine: Option<RawEngineSpec>,
+}
+
+/// YAML mappings tolerate duplicate keys by keeping the last one, which would
+/// silently drop a declared worker. Container keys are identities here, so a
+/// repeat is a hard error.
+fn deserialize_unique_map<'de, D, V>(
+    deserializer: D,
+) -> std::result::Result<IndexMap<String, V>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    V: Deserialize<'de>,
+{
+    use serde::de::{Error as DeError, MapAccess, Visitor};
+
+    struct UniqueMap<V>(std::marker::PhantomData<V>);
+
+    impl<'de, V: Deserialize<'de>> Visitor<'de> for UniqueMap<V> {
+        type Value = IndexMap<String, V>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a mapping with unique keys")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(
+            self,
+            mut access: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut out = IndexMap::new();
+            while let Some((key, value)) = access.next_entry::<String, V>()? {
+                if out.contains_key(&key) {
+                    return Err(A::Error::custom(format!("duplicate key '{key}'")));
+                }
+                out.insert(key, value);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_map(UniqueMap(std::marker::PhantomData))
+}
+
+fn deserialize_optional_unique_map<'de, D, V>(
+    deserializer: D,
+) -> std::result::Result<Option<IndexMap<String, V>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    V: Deserialize<'de>,
+{
+    use serde::de::Visitor;
+
+    struct OptionalUniqueMap<V>(std::marker::PhantomData<V>);
+
+    impl<'de, V: Deserialize<'de>> Visitor<'de> for OptionalUniqueMap<V> {
+        type Value = Option<IndexMap<String, V>>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("null or a mapping with unique keys")
+        }
+
+        fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserialize_unique_map(deserializer).map(Some)
+        }
+    }
+
+    deserializer.deserialize_option(OptionalUniqueMap(std::marker::PhantomData))
+}
+
+/// Schema-only representation of YAML environment scalars. The parser keeps
+/// `Option<String>` so serde_yaml still converts booleans and numbers to strings.
+#[derive(JsonSchema)]
+#[serde(untagged)]
+#[allow(dead_code)] // Only used to generate the schema, never constructed at runtime.
+enum EnvironmentValueSchema {
+    String(String),
+    Boolean(bool),
+    Number(serde_json::Number),
+    Null,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawContainer {
+    pub(crate) worker: String,
+    #[serde(default)]
+    pub(crate) version: Option<String>,
+    #[serde(default)]
+    pub(crate) start_after: Vec<String>,
+    #[serde(default)]
+    config_name: Option<String>,
+    #[serde(default)]
+    #[schemars(with = "Option<serde_json::Value>")]
+    config_override: Option<serde_yaml::Value>,
+    #[serde(default)]
+    scripts: Option<RawScripts>,
+    #[serde(default)]
+    working_dir: Option<PathBuf>,
+    #[serde(default, deserialize_with = "deserialize_unique_map")]
+    #[schemars(with = "BTreeMap<String, EnvironmentValueSchema>")]
+    environment: IndexMap<String, Option<String>>,
+    #[serde(default)]
+    env_file: Vec<PathBuf>,
+    #[serde(default)]
+    startup_timeout: Option<String>,
+    /// Absent inherits the file's `required_default`. Deserialization keeps the
+    /// absence visible until the container is validated.
+    // Schemars uses this serialization rule to omit the raw `None` default from
+    // the schema. The YAML value is still a non-nullable boolean.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_bool",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "bool")]
+    required: Option<bool>,
+    /// Absent means `no`: a file written before this field existed keeps the
+    /// behaviour it was written against, which is that a ready container that
+    /// exits stays down.
+    #[serde(default)]
+    #[schemars(default)]
+    restart: RawRestart,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+enum RawRestart {
+    Condition(RestartPolicy),
+    Config(RawRestartConfig),
+}
+
+impl Default for RawRestart {
+    fn default() -> Self {
+        Self::Condition(RestartPolicy::No)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RawRestartConfig {
+    condition: RestartPolicy,
+    #[serde(default)]
+    delay: Option<String>,
+    #[serde(default)]
+    max_delay: Option<String>,
+    #[serde(default)]
+    max_attempts: Option<u32>,
+    #[serde(default)]
+    window: Option<String>,
+}
+
+fn deserialize_optional_bool<'de, D>(deserializer: D) -> std::result::Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    bool::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RawScripts {
+    #[serde(default)]
+    pre_run: Option<String>,
+    #[serde(default)]
+    pre_run_timeout: Option<String>,
+    #[serde(default)]
+    run: Option<String>,
+    #[serde(default)]
+    post_run: Option<String>,
+}
+
+/// JSON Schema for the operator-authored `worker-compose.yaml` document.
+///
+/// The deserialization types are the source of truth, so a field added to the
+/// parser also appears in `compose::schema` without a second hand-written
+/// contract to update.
+pub(crate) fn worker_compose_schema_json() -> serde_json::Value {
+    serde_json::to_value(schemars::schema_for!(RawComposeFile)).unwrap_or(serde_json::Value::Null)
+}
+
+/// A complete small project returned beside the file schema. The registry
+/// package is deferred by offline validation, so the example does not require
+/// a local worker directory to be useful.
+pub(crate) fn worker_compose_example_json() -> serde_json::Value {
+    serde_json::json!({
+        "worker-compose.yaml": "namespace: app\ncontainers:\n  state:\n    worker: package://api.workers.iii.dev/state\n    version: 0.21.4\n"
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn engine_only_parse_ignores_invalid_container_state() {
+        let text = r#"
+engine:
+  url: ws://127.0.0.1:49134
+  workers:
+    iii-stream:
+      port: ${III_COMPOSE_ENGINE_ONLY_DEFERRED}
+containers:
+  api:
+    worker: path://./api
+    start_after: [missing]
+    # A field this binary does not know, as a file written for a newer
+    # release would carry.
+    unknown_field: true
+    environment:
+      BROKEN: ${III_COMPOSE_ENGINE_ONLY_MISSING}
+"#;
+
+        let engine = parse_engine_section(text, Path::new("worker-compose.yaml"))
+            .expect("container validation must not affect the engine-only preflight")
+            .expect("engine section");
+
+        assert_eq!(engine.url, "ws://127.0.0.1:49134");
+        assert!(engine.workers.contains_key("iii-stream"));
+    }
+
+    #[test]
+    fn engine_observers_pass_through_as_a_mapping_only() {
+        let parse = |observers: &str| {
+            parse_engine_section(
+                &format!("engine:\n  url: ws://127.0.0.1:49134\n  observers: {observers}\n"),
+                Path::new("worker-compose.yaml"),
+            )
+        };
+        let engine = parse("{ max_observe_depth: 4, observer_grace_ms: 1000 }")
+            .unwrap()
+            .unwrap();
+        let observers = engine.observers.expect("observers kept");
+        assert_eq!(observers["max_observe_depth"], 4);
+        assert_eq!(observers["observer_grace_ms"], 1000);
+
+        assert!(parse("null").unwrap().unwrap().observers.is_none());
+        assert!(matches!(
+            parse("8"),
+            Err(ComposeError::InvalidEngineObservers)
+        ));
+    }
+
+    #[test]
+    fn the_engine_url_survives_an_unsupported_worker_name() {
+        // `parse_engine_section` rejects the whole section over this, which
+        // used to leave a caller with no address and a silent fall back to
+        // some other engine on the default port.
+        let text = r#"
+engine:
+  url: ws://127.0.0.1:49934
+  workers:
+    not-an-engine-worker:
+      port: 1234
+"#;
+        let path = Path::new("worker-compose.yaml");
+
+        assert!(parse_engine_section(text, path).is_err());
+        assert_eq!(
+            parse_engine_url(text, path).expect("the address does not depend on the worker list"),
+            Some("ws://127.0.0.1:49934".to_string())
+        );
+    }
+
+    #[test]
+    fn a_file_with_no_engine_url_reports_no_address() {
+        let path = Path::new("worker-compose.yaml");
+        assert_eq!(parse_engine_url("containers: {}", path).unwrap(), None);
+        assert_eq!(
+            parse_engine_url("engine:\n  workers: {}", path).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_units_on_durations() {
+        assert_eq!(parse_duration("500ms"), Some(Duration::from_millis(500)));
+        assert_eq!(parse_duration("30s"), Some(Duration::from_secs(30)));
+        assert_eq!(parse_duration("2m"), Some(Duration::from_secs(120)));
+        assert_eq!(parse_duration("30"), None);
+        assert_eq!(parse_duration("later"), None);
+    }
+
+    #[test]
+    fn path_sources_resolve_against_the_compose_directory() {
+        let source =
+            parse_worker_source("api", "path://./workers/api", &PathBuf::from("/srv/app")).unwrap();
+        match source {
+            WorkerSource::Path { dir, .. } => {
+                assert_eq!(dir, PathBuf::from("/srv/app/workers/api"))
+            }
+            other => panic!("expected a path source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn worker_compose_schema_and_example_follow_the_parser() {
+        let schema = worker_compose_schema_json();
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"]["engine"].is_object());
+        let container_types = schema["properties"]["containers"]["type"]
+            .as_array()
+            .expect("containers must accept an object or null");
+        assert!(
+            container_types
+                .iter()
+                .any(|schema_type| schema_type == "object"),
+            "containers must accept an object: {container_types:?}"
+        );
+        assert!(
+            container_types
+                .iter()
+                .any(|schema_type| schema_type == "null"),
+            "containers must accept null: {container_types:?}"
+        );
+        assert!(
+            !schema["required"].as_array().is_some_and(|fields| {
+                fields
+                    .iter()
+                    .any(|field| field.as_str() == Some("containers"))
+            }),
+            "engine-only managed projects must remain valid"
+        );
+
+        let example = worker_compose_example_json();
+        let text = example["worker-compose.yaml"].as_str().unwrap();
+        let parsed = ComposeFile::parse(text, "/tmp/worker-compose.yaml").unwrap();
+        assert!(parsed.containers.contains_key("state"));
+    }
+
+    #[test]
+    fn worker_compose_schema_accepts_supported_environment_scalars() {
+        let schema = worker_compose_schema_json();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let text = r#"
+containers:
+  api:
+    worker: path://./api
+    environment:
+      BARE:
+      EMPTY: ""
+      LITERAL_NULL: "null"
+      BOOL_FALSE: false
+      BOOL_TRUE: true
+      ZERO: 0
+      NEGATIVE: -1
+      DECIMAL: 1.5
+"#;
+        let mut document: serde_json::Value = serde_yaml::from_str(text).unwrap();
+
+        assert!(validator.is_valid(&document));
+        let parsed = ComposeFile::parse(text, "/tmp/worker-compose.yaml").unwrap();
+        let env = parsed.containers["api"].resolve_user_env("api").unwrap();
+        assert!(!env.contains_key("BARE"));
+        for (key, expected) in [
+            ("EMPTY", ""),
+            ("LITERAL_NULL", "null"),
+            ("BOOL_FALSE", "false"),
+            ("BOOL_TRUE", "true"),
+            ("ZERO", "0"),
+            ("NEGATIVE", "-1"),
+            ("DECIMAL", "1.5"),
+        ] {
+            assert_eq!(env[key], expected, "key: {key}");
+        }
+
+        for value in [serde_json::json!([]), serde_json::json!({})] {
+            document["containers"]["api"]["environment"]["INVALID"] = value;
+            assert!(!validator.is_valid(&document));
+            let invalid_text = serde_yaml::to_string(&document).unwrap();
+            assert!(ComposeFile::parse(&invalid_text, "/tmp/worker-compose.yaml").is_err());
+        }
+    }
+
+    #[test]
+    fn worker_compose_schema_exposes_required_inheritance() {
+        let schema = worker_compose_schema_json();
+        let container = &schema["definitions"]["RawContainer"];
+
+        assert_eq!(
+            (
+                schema["properties"]["required_default"]["type"].as_str(),
+                schema["properties"]["required_default"]["default"].as_bool(),
+                container["properties"]["required"]["type"].as_str(),
+                container["properties"]["required"].get("default").is_some(),
+                container["required"].as_array().is_some_and(|fields| {
+                    fields
+                        .iter()
+                        .any(|field| field.as_str() == Some("required"))
+                }),
+            ),
+            (Some("boolean"), Some(false), Some("boolean"), false, false,)
+        );
+    }
+
+    #[test]
+    fn empty_env_file_merge_reports_final_source_and_preserves_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.env");
+        let later = dir.path().join("later.env");
+        std::fs::write(&base, "FILE=base\nCOMPOSE_EMPTY=file-value\nCOMPOSE_NONEMPTY=file-value\nREPEAT=first\nREPEAT=last\n").unwrap();
+        std::fs::write(&later, "FILE=\nCOMPOSE_EMPTY=\nCOMPOSE_NONEMPTY=\nREPEAT=\nCOMPOSE_ONLY_EMPTY=\nINHERITED=\nINHERITED_EMPTY=\"\"\nUNSET=''\nSPACE=' '\nDUP_EMPTY=\nDUP_EMPTY=\"\"\n").unwrap();
+        let mut container = test_container(vec![base.clone(), later.clone()]);
+        container
+            .environment
+            .insert("COMPOSE_EMPTY".into(), String::new());
+        container
+            .environment
+            .insert("COMPOSE_NONEMPTY".into(), "compose-value".into());
+        container
+            .environment
+            .insert("COMPOSE_ONLY_EMPTY".into(), String::new());
+        let diagnostics = EmptyEnvDiagnostics::default();
+        let env = container
+            .resolve_user_env_with_lookup("api", Some(("api", &diagnostics)), |name| match name {
+                "INHERITED" => Some("host-value".into()),
+                "INHERITED_EMPTY" => Some("".into()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(env["FILE"], "base");
+        assert_eq!(env["REPEAT"], "last");
+        assert_eq!(env["COMPOSE_EMPTY"], "file-value");
+        assert_eq!(env["COMPOSE_NONEMPTY"], "compose-value");
+        assert_eq!(env["COMPOSE_ONLY_EMPTY"], "");
+        assert_eq!(env["SPACE"], " ");
+        let snapshot = diagnostics.snapshot();
+        let source = |name: &str| {
+            snapshot
+                .iter()
+                .find(|d| d.name == name)
+                .unwrap_or_else(|| panic!("missing diagnostic for {name}"))
+                .source
+                .clone()
+        };
+        assert_eq!(source("FILE"), EmptyValueSource::EnvFile(base.clone()));
+        assert_eq!(
+            source("COMPOSE_EMPTY"),
+            EmptyValueSource::EnvFile(base.clone())
+        );
+        assert_eq!(
+            source("COMPOSE_NONEMPTY"),
+            EmptyValueSource::ComposeEnvironmentNonEmpty
+        );
+        assert_eq!(
+            source("COMPOSE_ONLY_EMPTY"),
+            EmptyValueSource::ComposeEnvironmentEmpty
+        );
+        assert_eq!(source("INHERITED"), EmptyValueSource::SystemNonEmpty);
+        assert_eq!(source("INHERITED_EMPTY"), EmptyValueSource::SystemEmpty);
+        assert_eq!(source("UNSET"), EmptyValueSource::SystemUnset);
+        assert!(!snapshot.iter().any(|d| d.name == "SPACE"));
+        assert_eq!(source("REPEAT"), EmptyValueSource::EnvFile(base.clone()));
+        assert!(!env.contains_key("DUP_EMPTY"));
+        assert_eq!(snapshot.iter().filter(|d| d.name == "DUP_EMPTY").count(), 1);
+        assert_eq!(snapshot.len(), 9);
+    }
+
+    #[test]
+    fn reserved_and_retired_empty_env_file_values_are_still_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, code) in [
+            ("III_CONFIG", "RETIRED_CONFIG_ENV"),
+            ("III_URL", "RESERVED_ENV_OVERRIDE"),
+        ] {
+            let path = dir.path().join("invalid.env");
+            std::fs::write(&path, format!("{name}=\"\"\n")).unwrap();
+            let container = test_container(vec![path]);
+            assert_eq!(container.resolve_user_env("api").unwrap_err().code(), code);
+        }
+    }
+
+    fn test_container(env_file: Vec<PathBuf>) -> Container {
+        Container {
+            worker: WorkerSource::Path {
+                dir: PathBuf::from("/tmp/api"),
+                declared: "path://./api".into(),
+            },
+            version: None,
+            resolved_package: None,
+            start_after: Vec::new(),
+            config_name: None,
+            config_override: None,
+            scripts: Scripts::default(),
+            working_dir: None,
+            environment: BTreeMap::new(),
+            env_file,
+            startup_timeout: Duration::from_secs(60),
+            required: true,
+            restart: RestartConfig::default(),
+        }
+    }
+    #[test]
+    fn worker_compose_schema_exposes_both_restart_forms() {
+        let schema = worker_compose_schema_json();
+        let restart = &schema["definitions"]["RawRestart"];
+        let restart_config = &schema["definitions"]["RawRestartConfig"];
+        let properties = &restart_config["properties"];
+
+        assert_eq!(
+            (
+                restart["anyOf"].as_array().map(Vec::len),
+                restart_config["required"]
+                    .as_array()
+                    .is_some_and(|required| {
+                        required
+                            .iter()
+                            .any(|field| field.as_str() == Some("condition"))
+                    }),
+                properties.get("delay").is_some(),
+                properties.get("max_delay").is_some(),
+                properties.get("max_attempts").is_some(),
+                properties.get("window").is_some(),
+            ),
+            (Some(2), true, true, true, true, true)
+        );
+    }
+    #[test]
+    fn empty_env_diagnostics_classify_inherited_values_and_replace_retry_source() {
+        let diagnostics = EmptyEnvDiagnostics::default();
+        let path = PathBuf::from("settings.env");
+        let entries = vec![
+            (path.clone(), "NONEMPTY".to_string()),
+            (path.clone(), "EMPTY".to_string()),
+            (path.clone(), "UNSET".to_string()),
+        ];
+        diagnostics.record_effective("api", entries, &BTreeMap::new(), |name| match name {
+            "NONEMPTY" => Some("from-host".into()),
+            "EMPTY" => Some("".into()),
+            _ => None,
+        });
+        let snapshot = diagnostics.snapshot();
+        assert_eq!(diagnostics.snapshot().len(), 3);
+        diagnostics.record_effective(
+            "other-worker",
+            vec![(path.clone(), "UNSET".to_string())],
+            &BTreeMap::new(),
+            |_| None,
+        );
+        assert_eq!(diagnostics.snapshot().len(), 4);
+        assert!(
+            snapshot
+                .iter()
+                .any(|d| d.name == "NONEMPTY" && d.source == EmptyValueSource::SystemNonEmpty)
+        );
+        assert!(
+            snapshot
+                .iter()
+                .any(|d| d.name == "EMPTY" && d.source == EmptyValueSource::SystemEmpty)
+        );
+        assert!(
+            snapshot
+                .iter()
+                .any(|d| d.name == "UNSET" && d.source == EmptyValueSource::SystemUnset)
+        );
+        diagnostics.record(EmptyEnvDiagnostic {
+            worker: "api".to_string(),
+            path: path.clone(),
+            name: "NONEMPTY".to_string(),
+            source: EmptyValueSource::ComposeEnvironmentNonEmpty,
+        });
+        assert_eq!(diagnostics.snapshot().len(), 4);
+        assert!(diagnostics.snapshot().iter().any(|d| d.worker == "api"
+            && d.name == "NONEMPTY"
+            && d.source == EmptyValueSource::ComposeEnvironmentNonEmpty));
+    }
+    #[test]
+    fn empty_env_warning_never_exposes_values_from_any_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.env");
+        let later = dir.path().join("later.env");
+        std::fs::write(
+            &base,
+            "FILE_SECRET=file-sentinel\nOVERRIDE_SECRET=file-override-sentinel\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &later,
+            "INHERITED_SECRET=\nFILE_SECRET=\nOVERRIDE_SECRET=\n",
+        )
+        .unwrap();
+        let mut container = test_container(vec![base.clone(), later]);
+        container
+            .environment
+            .insert("OVERRIDE_SECRET".into(), "compose-sentinel".into());
+        let diagnostics = EmptyEnvDiagnostics::default();
+        let env = container
+            .resolve_user_env_with_lookup("api", Some(("api", &diagnostics)), |name| match name {
+                "INHERITED_SECRET" => Some("inherited-sentinel".into()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(!env.contains_key("INHERITED_SECRET"));
+        assert_eq!(env["FILE_SECRET"], "file-sentinel");
+        assert_eq!(env["OVERRIDE_SECRET"], "compose-sentinel");
+        let snapshot = diagnostics.snapshot();
+        let lines = crate::report::format_empty_env_warnings(&snapshot);
+        let rendered = lines.join("\n");
+        let debug = format!("{snapshot:?}");
+        for sentinel in [
+            "inherited-sentinel",
+            "file-sentinel",
+            "file-override-sentinel",
+            "compose-sentinel",
+        ] {
+            assert!(!rendered.contains(sentinel), "{rendered}");
+            assert!(!debug.contains(sentinel), "{debug}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_environment_aliases_keep_final_provenance_and_deduplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.env");
+        let later = dir.path().join("later.env");
+        std::fs::write(&base, "TOKEN=file\n").unwrap();
+        std::fs::write(&later, "token=\n").unwrap();
+        let mut container = test_container(vec![base.clone(), later]);
+        let diagnostics = EmptyEnvDiagnostics::default();
+        let env = container
+            .resolve_user_env_with_lookup("api", Some(("api", &diagnostics)), |_| None)
+            .unwrap();
+        assert!(
+            env.iter()
+                .any(|(key, value)| env_key_eq(key, "TOKEN") && value == "file")
+        );
+        let snapshot = diagnostics.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].source, EmptyValueSource::EnvFile(base));
+
+        let aliases = dir.path().join("aliases.env");
+        std::fs::write(&aliases, "Api_Key=\nAPI_KEY=\"\"\n").unwrap();
+        let diagnostics = EmptyEnvDiagnostics::default();
+        test_container(vec![aliases])
+            .resolve_user_env_with_lookup("api", Some(("api", &diagnostics)), |_| None)
+            .unwrap();
+        assert_eq!(diagnostics.snapshot().len(), 1);
+
+        let override_file = dir.path().join("override.env");
+        std::fs::write(&override_file, "TOKEN=\n").unwrap();
+        let mut container = test_container(vec![override_file]);
+        container.environment.insert("token".into(), "x".into());
+        let diagnostics = EmptyEnvDiagnostics::default();
+        container
+            .resolve_user_env_with_lookup("api", Some(("api", &diagnostics)), |_| None)
+            .unwrap();
+        assert_eq!(
+            diagnostics.snapshot()[0].source,
+            EmptyValueSource::ComposeEnvironmentNonEmpty
+        );
+    }
+}

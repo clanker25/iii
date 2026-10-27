@@ -1,0 +1,101 @@
+# Dependencies
+node_modules/
+.venv/
+__pycache__/
+*.egg-info/
+
+# Build outputs
+dist/
+target/
+.turbo/
+.next/
+.bin/
+
+# Runtime data
+**/.iii/compose/
+tmp/
+data/
+*.log
+app.log
+*.db
+*.sqlite*
+
+# Test / coverage
+.coverage
+coverage/
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Environment
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# IDE / editor
+.vscode/
+.idea/
+.cursor/**
+!.cursor/rules/
+!.cursor/rules/**
+!.cursor/skills/
+!.cursor/skills/**
+.cursor/rules/architecture-docs.mdc
+.cursor/rules/sdk-api-consistency.mdc
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# AI tools
+.claude/
+.planning/
+.gstack/
+AGENTS.md
+!website/public/AGENTS.md
+
+architecture/
+
+# Project-specific
+.shared/
+.worktrees/
+.sisyphus/
+conductor
+.omc
+iii_workers/
+
+# Generated API doc intermediates
+sdk/packages/node/iii/api-docs.json
+sdk/packages/node/iii-browser/api-docs.json
+sdk/packages/node/helpers/api-docs.json
+sdk/packages/python/iii/api-docs.json
+sdk/packages/python/helpers/api-docs.json
+sdk/packages/go/iii/api-docs.json
+graphify-out
+
+docs/plans/
+# Local-only personal notes (per-contributor, not tracked)
+TODOS.md
+
+# Per-contributor coding-agent state (not tracked)
+.serena/
+CLAUDE.md
+
+# Impeccable editor hook cache
+.impeccable/
+
+# Runtime artifacts written by `iii-worker` when run from a crate dir.
+# Never source files: config.yaml/iii.lock are CLI inputs the daemon reads,
+# and .iii-worker.lock holds a live pid.
+/crates/iii-worker/config.yaml
+/crates/iii-worker/iii.lock
+.iii-worker.lock
+
+# Playwright CLI session logs and snapshots
+.playwright-cli/

@@ -1,0 +1,8 @@
+{
+  "$schema": "https://react.doctor/schema/config.json",
+  "ignore": {
+    // public/console-demo is the prebuilt console demo (a minified vendor bundle), kept for the deploy
+    // smoke check; it is not source maintained here. Everything else is scanned.
+    "files": ["public/**"]
+  }
+}

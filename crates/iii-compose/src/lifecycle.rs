@@ -1,0 +1,1967 @@
+// Copyright Motia LLC and/or licensed to Motia LLC under one or more
+// contributor license agreements. Licensed under the Elastic License 2.0;
+// you may not use this file except in compliance with the Elastic License 2.0.
+// This software is patent protected. We welcome discussions - reach out at team@iii.dev
+// See LICENSE and PATENTS files for details.
+
+//! `up` and `down`.
+//!
+//! Three rules shape everything here:
+//!
+//! 1. **A container is up only when the engine has seen it.** Spawning is not
+//!    starting: readiness is the child appearing under `(namespace, container)`
+//!    in the engine, which is the same fact its dependents rely on.
+//! 2. **Rollback undoes this operation, not the world.** A failed `up` stops
+//!    what it started, in reverse order, and leaves containers that were
+//!    already running untouched.
+//! 3. **Teardown follows the graph backwards.** Dependents stop before the
+//!    things they depend on, so nothing is talking to a worker that just went
+//!    away. Removal is the explicit exception: its validated new graph first
+//!    drops those edges, then only the deleted container stops.
+
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
+
+use futures::StreamExt;
+use serde::Serialize;
+
+use crate::{
+    config::{ComposeFile, Container, RestartPolicy},
+    configuration::merge,
+    dag,
+    engine::EngineClient,
+    error::{ComposeError, Result},
+    hooks,
+    logs::LogStore,
+    manifest::{StartSpec, VmSpec, resolve_start},
+    process::{Outcome, Supervised, spawn_supervised_piped},
+    report, restart,
+    spawn::{SpawnCtx, resolve_working_dir, spawn_plan},
+    state::{ChildRecord, ChildStatus},
+};
+
+/// Outcome of one `up` or `down`. The shape is the JSON that `compose::*`
+/// returns, so it is a contract: fields are added, never repurposed.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+pub struct OpResult {
+    pub operation_id: String,
+    pub status: OpStatus,
+    /// False when the operation was a no-op — every requested container was
+    /// already in the desired state.
+    pub changed: bool,
+    pub containers: Vec<ContainerResult>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) primary_error: Option<OpError>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OpStatus {
+    Ok,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+pub struct ContainerResult {
+    pub container: String,
+    pub state: ChildStatus,
+    pub changed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<OpError>,
+}
+
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+pub struct OpError {
+    pub code: String,
+    pub message: String,
+}
+
+impl From<&ComposeError> for OpError {
+    fn from(error: &ComposeError) -> Self {
+        Self {
+            code: error.code().to_string(),
+            message: error.to_string(),
+        }
+    }
+}
+
+pub(crate) fn cancelled_op(operation_id: String) -> OpResult {
+    let error = ComposeError::OperationCancelled {
+        operation_id: operation_id.clone(),
+    };
+    failed_op(operation_id, None, &error)
+}
+
+/// Everything `up`/`down` need that is not the compose file itself.
+pub struct LifecycleCtx<'a> {
+    pub(crate) shutdown: &'a crate::shutdown::ShutdownController,
+    pub file: &'a ComposeFile,
+    pub engine: &'a EngineClient,
+    pub post_runs: &'a hooks::PostRunSupervisor,
+    /// Namespace of the compose daemon that owns this project. Children use
+    /// it for explicit per-call routing to `compose::*`.
+    pub compose_namespace: &'a str,
+    /// Namespace the *children* register in — not the daemon's own.
+    pub project_namespace: &'a str,
+    pub engine_url: &'a str,
+    /// Where installed packages live, shared across projects on this machine.
+    pub package_cache: &'a std::path::Path,
+    /// Persistent, bounded stdout and stderr for every project worker.
+    pub logs: &'a LogStore,
+    /// Root of the per-container VM state.
+    pub vm_dir: &'a std::path::Path,
+    pub(crate) empty_env_diagnostics: &'a crate::config::EmptyEnvDiagnostics,
+}
+
+/// What one container's start produced: which one, how long it took, and
+/// whether it came up.
+enum StartAttempt {
+    Ready {
+        record: ChildRecord,
+        child: Supervised,
+        recovery: Option<RetryRecovery>,
+    },
+    Failed(ComposeError),
+    Interrupted,
+}
+
+struct RetryRecovery {
+    attempt: u32,
+    total_attempts: u32,
+    elapsed: Duration,
+}
+
+enum StartFailure {
+    Failed(ComposeError),
+    Interrupted,
+}
+
+impl From<ComposeError> for StartFailure {
+    fn from(error: ComposeError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+/// Containers currently supervised by this daemon, keyed by container id.
+pub type Children = BTreeMap<String, Supervised>;
+
+/// Starts `target` (or the whole graph) in dependency order.
+///
+/// Containers already running are left alone and reported `changed: false`, so
+/// a repeated `up` is a no-op.
+pub async fn up(
+    ctx: &LifecycleCtx<'_>,
+    children: &mut Children,
+    records: &mut BTreeMap<String, ChildRecord>,
+    target: Option<&str>,
+    operation_id: String,
+) -> OpResult {
+    up_inner(
+        ctx,
+        children,
+        records,
+        target,
+        operation_id.clone(),
+        Some(ctx.shutdown.signal()),
+    )
+    .await
+    .unwrap_or_else(|| cancelled_op(operation_id))
+}
+
+/// Starts the foreground project's graph, rolling back this operation when an
+/// OS shutdown signal arrives.
+pub(crate) async fn up_until_shutdown(
+    ctx: &LifecycleCtx<'_>,
+    children: &mut Children,
+    records: &mut BTreeMap<String, ChildRecord>,
+    target: Option<&str>,
+    operation_id: String,
+    shutdown: crate::shutdown::ShutdownSignal,
+) -> Option<OpResult> {
+    up_inner(
+        ctx,
+        children,
+        records,
+        target,
+        operation_id,
+        Some(shutdown.or(ctx.shutdown.signal())),
+    )
+    .await
+}
+
+async fn up_inner(
+    ctx: &LifecycleCtx<'_>,
+    children: &mut Children,
+    records: &mut BTreeMap<String, ChildRecord>,
+    target: Option<&str>,
+    operation_id: String,
+    shutdown: Option<crate::shutdown::ShutdownSignal>,
+) -> Option<OpResult> {
+    report::in_project_scope(
+        &ctx.file.path,
+        up_scoped(ctx, children, records, target, operation_id, shutdown),
+    )
+    .await
+}
+
+async fn up_scoped(
+    ctx: &LifecycleCtx<'_>,
+    children: &mut Children,
+    records: &mut BTreeMap<String, ChildRecord>,
+    target: Option<&str>,
+    operation_id: String,
+    shutdown: Option<crate::shutdown::ShutdownSignal>,
+) -> Option<OpResult> {
+    let began = Instant::now();
+    let order = match plan_targets(ctx.file, target) {
+        Ok(order) => order,
+        Err(error) => {
+            report::summary_failed("up", error.code(), began.elapsed());
+            return Some(failed_op(operation_id, target, &error));
+        }
+    };
+
+    let mut results: Vec<ContainerResult> = Vec::new();
+    // Only what *this* operation started may be rolled back.
+    let mut started: Vec<String> = Vec::new();
+    // Containers that failed and said their failure does not fail the
+    // operation. Named so the closing line reports the partial project.
+    let mut not_required_failures = Vec::new();
+    let max_parallel_workers = crate::parallelism::max_parallel_workers();
+
+    // Everything this operation will touch, drawn before any of it moves, so an
+    // operator sees the shape rather than a line at a time.
+    let versions = version_labels(ctx.file, order.iter().map(String::as_str));
+    if target.is_none() {
+        report::plan_full_labeled(&dag::outline(ctx.file, &order), &versions);
+    } else {
+        report::plan_labeled(&dag::outline(ctx.file, &order), &versions);
+    }
+    if let Some(operation) = crate::operation::active(&operation_id) {
+        let outline = dag::outline(ctx.file, &order);
+        operation.plan(outline.len()).await;
+        for (key, depth) in &outline {
+            operation
+                .emit_tree(key, *depth, "waiting for dependencies")
+                .await;
+        }
+    }
+
+    // Grouped rather than listed: only a declared dependency has to wait, and
+    // in a project of fourteen where one worker calls the other thirteen, the
+    // thirteen have nothing to wait for.
+    for wave in dag::waves(ctx.file, &order) {
+        if shutdown.as_ref().is_some_and(|signal| signal.requested()) {
+            report::plan_done();
+            rollback(ctx, children, records, &started, &mut results).await;
+            return None;
+        }
+
+        let mut starting: Vec<String> = Vec::new();
+        for key in &wave {
+            if is_running(children, key) {
+                report::unchanged(key, "already running");
+                if let Some(operation) = crate::operation::active(&operation_id) {
+                    operation.emit(Some(key), "ready", "already running").await;
+                    operation.completed_one().await;
+                }
+                results.push(ContainerResult {
+                    container: key.clone(),
+                    state: ChildStatus::Ready,
+                    changed: false,
+                    error: None,
+                });
+                continue;
+            }
+            report::starting(key, "starting");
+            if let Some(operation) = crate::operation::active(&operation_id) {
+                operation
+                    .emit(Some(key), "starting", "starting worker")
+                    .await;
+            }
+            starting.push(key.clone());
+        }
+        // Bounded: a wave may hold every container in the file, and each one
+        // can be a download, a process, or a VM. An operator's machine should
+        // not have to survive all of them at once.
+        let mut outcomes = futures::stream::iter(starting.into_iter().map(|key| {
+            let shutdown = shutdown.clone();
+            let start_operation_id = operation_id.clone();
+            async move {
+                let began = Instant::now();
+                let outcome =
+                    start_one_with_retries(ctx, &key, shutdown, Some(&start_operation_id)).await;
+                (key, began.elapsed(), outcome)
+            }
+        }))
+        .buffer_unordered(max_parallel_workers);
+
+        // Adopt and publish each worker as soon as it settles. We still drain
+        // the already-launched wave before rollback so no child is orphaned.
+        let mut failure: Option<(String, ComposeError)> = None;
+        let mut interrupted = false;
+        while let Some((key, took, outcome)) = outcomes.next().await {
+            let key = &key;
+            match outcome {
+                StartAttempt::Ready {
+                    record,
+                    child,
+                    recovery,
+                } => {
+                    if let Some(recovery) = recovery {
+                        report::retry_recovered(
+                            key,
+                            recovery.attempt,
+                            recovery.total_attempts,
+                            recovery.elapsed,
+                        );
+                    } else {
+                        report::ready(key, took);
+                    }
+                    records.insert(key.clone(), record);
+                    children.insert(key.clone(), child);
+                    started.push(key.clone());
+                    if let Some(operation) = crate::operation::active(&operation_id) {
+                        operation
+                            .emit(Some(key), "ready", "registered with engine")
+                            .await;
+                        operation.completed_one().await;
+                    }
+                    results.push(ContainerResult {
+                        container: key.clone(),
+                        state: ChildStatus::Ready,
+                        changed: true,
+                        error: None,
+                    });
+                }
+                StartAttempt::Failed(error) => {
+                    report::failed(
+                        key,
+                        error.code(),
+                        &strip_container_prefix(&error.to_string(), key),
+                    );
+                    results.push(ContainerResult {
+                        container: key.clone(),
+                        state: ChildStatus::Failed,
+                        changed: false,
+                        error: Some(OpError::from(&error)),
+                    });
+                    if let Some(operation) = crate::operation::active(&operation_id) {
+                        operation.emit(Some(key), "failed", error.to_string()).await;
+                    }
+                    if is_required(ctx.file, key) {
+                        if failure.is_none() {
+                            failure = Some((key.clone(), error));
+                        }
+                    } else {
+                        // The plan counted it, so the progress has to account
+                        // for it however it settled.
+                        if let Some(operation) = crate::operation::active(&operation_id) {
+                            operation.completed_one().await;
+                        }
+                        not_required_failures.push(key.clone());
+                    }
+                }
+                StartAttempt::Interrupted => interrupted = true,
+            }
+        }
+        drop(outcomes);
+
+        if interrupted {
+            report::plan_done();
+            rollback(ctx, children, records, &started, &mut results).await;
+            return None;
+        }
+
+        if let Some((_, error)) = failure {
+            report::plan_done();
+            rollback(ctx, children, records, &started, &mut results).await;
+            report::summary_failed("up", error.code(), began.elapsed());
+            return Some(OpResult {
+                operation_id,
+                status: OpStatus::Failed,
+                changed: !started.is_empty(),
+                containers: results,
+                primary_error: Some(OpError::from(&error)),
+            });
+        }
+    }
+
+    // Declaration order, whatever order they finished in: the JSON is a
+    // contract, and a caller diffing two runs should not see the machine's
+    // scheduling.
+    results.sort_by_key(|result| {
+        ctx.file
+            .containers
+            .get_index_of(&result.container)
+            .unwrap_or(usize::MAX)
+    });
+
+    report::plan_done();
+    let changed = results.iter().filter(|result| result.changed).count();
+    if !not_required_failures.is_empty() {
+        report::not_required_failed(&not_required_failures);
+    }
+    report::summary_ok("up", changed, results.len(), began.elapsed());
+    Some(OpResult {
+        operation_id,
+        status: OpStatus::Ok,
+        changed: changed > 0,
+        containers: results,
+        primary_error: None,
+    })
+}
+
+/// Whether this container's failure fails the operation. A container the file
+/// no longer declares is treated as required: the strict rule is the one that
+/// refuses rather than the one that carries on.
+fn is_required(file: &ComposeFile, key: &str) -> bool {
+    file.containers
+        .get(key)
+        .is_none_or(|container| container.required)
+}
+
+/// Drops a leading `container '<name>': ` from a message that is already being
+/// printed under that container's name.
+fn strip_container_prefix(message: &str, container: &str) -> String {
+    let prefix = format!("container '{container}': ");
+    message.strip_prefix(&prefix).unwrap_or(message).to_string()
+}
+
+/// Stops one container and starts it again, touching nothing else.
+///
+/// Deliberately narrower than `down` and `up` with a target, which take the
+/// container's dependents and dependencies with them. Restarting a worker to
+/// pick up an edit or a new version is a local act: the operator names one
+/// container and expects one container to bounce, not a graph.
+///
+/// What that costs is real and left to the operator: a dependent holding a
+/// connection to this worker sees it drop. Compose does not restart the
+/// dependents to hide that, because deciding which of them can tolerate it is
+/// not compose's to make.
+pub async fn restart_one(
+    ctx: &LifecycleCtx<'_>,
+    children: &mut Children,
+    records: &mut BTreeMap<String, ChildRecord>,
+    key: &str,
+    operation_id: String,
+) -> OpResult {
+    restart_one_inner(
+        ctx,
+        children,
+        records,
+        key,
+        operation_id.clone(),
+        None,
+        None,
+    )
+    .await
+    .unwrap_or_else(|| cancelled_op(operation_id))
+}
+
+pub(crate) async fn restart_one_supervised(
+    ctx: &LifecycleCtx<'_>,
+    children: &mut Children,
+    records: &mut BTreeMap<String, ChildRecord>,
+    key: &str,
+    operation_id: String,
+    attempt: u32,
+    total_attempts: u32,
+) -> OpResult {
+    restart_one_inner(
+        ctx,
+        children,
+        records,
+        key,
+        operation_id.clone(),
+        None,
+        Some((attempt, total_attempts)),
+    )
+    .await
+    .unwrap_or_else(|| cancelled_op(operation_id))
+}
+
+pub(crate) async fn restart_one_until_shutdown(
+    ctx: &LifecycleCtx<'_>,
+    children: &mut Children,
+    records: &mut BTreeMap<String, ChildRecord>,
+    key: &str,
+    operation_id: String,
+    shutdown: crate::shutdown::ShutdownSignal,
+) -> Option<OpResult> {
+    restart_one_inner(
+        ctx,
+        children,
+        records,
+        key,
+        operation_id,
+        Some(shutdown),
+        None,
+    )
+    .await
+}
+
+async fn restart_one_inner(
+    ctx: &LifecycleCtx<'_>,
+    children: &mut Children,
+    records: &mut BTreeMap<String, ChildRecord>,
+    key: &str,
+    operation_id: String,
+    shutdown: Option<crate::shutdown::ShutdownSignal>,
+    retry: Option<(u32, u32)>,
+) -> Option<OpResult> {
+    report::in_project_scope(
+        &ctx.file.path,
+        restart_one_scoped(ctx, children, records, key, operation_id, shutdown, retry),
+    )
+    .await
+}
+
+async fn restart_one_scoped(
+    ctx: &LifecycleCtx<'_>,
+    children: &mut Children,
+    records: &mut BTreeMap<String, ChildRecord>,
+    key: &str,
+    operation_id: String,
+    shutdown: Option<crate::shutdown::ShutdownSignal>,
+    retry: Option<(u32, u32)>,
+) -> Option<OpResult> {
+    let began = Instant::now();
+    if !ctx.file.containers.contains_key(key) {
+        let error = ComposeError::UnknownContainer {
+            container: key.to_string(),
+        };
+        report::summary_failed("restart", error.code(), began.elapsed());
+        return Some(failed_op(operation_id, Some(key), &error));
+    }
+    if ctx.shutdown.signal().requested()
+        || shutdown.as_ref().is_some_and(|signal| signal.requested())
+    {
+        return None;
+    }
+
+    report::restarting(key);
+    if let Some((attempt, total_attempts)) = retry {
+        report::retry_starting(key, attempt, total_attempts);
+    } else {
+        report::plan_labeled(&[(key.to_string(), 0)], &version_labels(ctx.file, [key]));
+    }
+    let stopped = stop_one(ctx, children, records, key).await;
+
+    // The child is gone, but the engine learns that from a socket closing and
+    // not from us. Starting into that window makes the replacement collide
+    // with the corpse of its predecessor and fail CONTAINER_NAME_TAKEN, which
+    // is the honest answer to the wrong question. `down` then `up` never saw
+    // this because re-reading the project happened to take long enough.
+    let Some(released) = ctx
+        .shutdown
+        .signal()
+        .run(await_name_release(ctx, key))
+        .await
+    else {
+        report::plan_done();
+        return None;
+    };
+    if let Err(error) = released {
+        report::failed(key, error.code(), &error.to_string());
+        report::plan_done();
+        report::summary_failed("restart", error.code(), began.elapsed());
+        return Some(failed_op(operation_id, Some(key), &error));
+    }
+
+    report::starting(key, "starting");
+    let started = Instant::now();
+    // An individual operation cancellation still finishes its replacement.
+    // Daemon shutdown is different: the target state is stopped, so interrupt
+    // preparation/readiness and reap any child already started by this attempt.
+    let outcome =
+        start_one_attempt(ctx, key, Some(ctx.shutdown.signal()), Some(&operation_id)).await;
+    let took = started.elapsed();
+
+    let result = match outcome {
+        StartAttempt::Ready {
+            record,
+            child,
+            recovery: _,
+        } => {
+            if let Some((attempt, total_attempts)) = retry {
+                report::retry_recovered(key, attempt, total_attempts, took);
+            } else {
+                report::ready(key, took);
+            }
+            records.insert(key.to_string(), record);
+            children.insert(key.to_string(), child);
+            ContainerResult {
+                container: key.to_string(),
+                state: ChildStatus::Ready,
+                changed: true,
+                error: None,
+            }
+        }
+        StartAttempt::Failed(error) => {
+            report::failed(
+                key,
+                error.code(),
+                &strip_container_prefix(&error.to_string(), key),
+            );
+            report::plan_done();
+            let required = is_required(ctx.file, key);
+            if required {
+                report::summary_failed("restart", error.code(), began.elapsed());
+            } else {
+                report::not_required_failed(&[key.to_string()]);
+                report::summary_ok("restart", 0, 1, began.elapsed());
+            }
+            let error = OpError::from(&error);
+            let primary_error = required.then(|| error.clone());
+            return Some(OpResult {
+                operation_id,
+                status: if required {
+                    OpStatus::Failed
+                } else {
+                    OpStatus::Ok
+                },
+                changed: stopped,
+                containers: vec![ContainerResult {
+                    container: key.to_string(),
+                    state: ChildStatus::Failed,
+                    changed: stopped,
+                    error: Some(error),
+                }],
+                primary_error,
+            });
+        }
+        StartAttempt::Interrupted => {
+            report::plan_done();
+            return None;
+        }
+    };
+
+    report::plan_done();
+    report::summary_ok("restart", 1, 1, began.elapsed());
+    Some(OpResult {
+        operation_id,
+        status: OpStatus::Ok,
+        changed: true,
+        containers: vec![result],
+        primary_error: None,
+    })
+}
+
+/// Stops one container because its declaration is being removed.
+///
+/// This path is intentionally narrower than targeted `down`: dependency edges
+/// pointing at the container are removed from the new declaration, so stopping
+/// dependents would discard healthy processes that the following idempotent
+/// `up` is expected to preserve. The old declaration remains available here so
+/// the removed container can still run its `post_run` hook.
+pub async fn remove_one(
+    ctx: &LifecycleCtx<'_>,
+    children: &mut Children,
+    records: &mut BTreeMap<String, ChildRecord>,
+    key: &str,
+    operation_id: String,
+) -> OpResult {
+    report::in_project_scope(
+        &ctx.file.path,
+        remove_one_scoped(ctx, children, records, key, operation_id),
+    )
+    .await
+}
+
+async fn remove_one_scoped(
+    ctx: &LifecycleCtx<'_>,
+    children: &mut Children,
+    records: &mut BTreeMap<String, ChildRecord>,
+    key: &str,
+    operation_id: String,
+) -> OpResult {
+    let began = Instant::now();
+    if !ctx.file.containers.contains_key(key) {
+        let error = ComposeError::UnknownContainer {
+            container: key.to_string(),
+        };
+        report::summary_failed("remove", error.code(), began.elapsed());
+        return failed_op(operation_id, Some(key), &error);
+    }
+
+    report::plan(&[(key.to_string(), 0)]);
+    let changed = children.contains_key(key);
+    if changed {
+        report::starting(key, "stopping");
+        stop_one(ctx, children, records, key).await;
+        report::stopped(key);
+    } else {
+        report::unchanged(key, "not running");
+    }
+    records.remove(key);
+    report::plan_done();
+    report::summary_ok("remove", usize::from(changed), 1, began.elapsed());
+
+    OpResult {
+        operation_id,
+        status: OpStatus::Ok,
+        changed,
+        containers: vec![ContainerResult {
+            container: key.to_string(),
+            state: ChildStatus::Stopped,
+            changed,
+            error: None,
+        }],
+        primary_error: None,
+    }
+}
+
+/// How long a name may stay registered after the process holding it exits.
+/// Generous, because the cost of being wrong is refusing a restart that would
+/// have worked a moment later.
+const NAME_RELEASE_WITHIN: Duration = Duration::from_secs(10);
+
+/// Waits for the engine to forget a worker that has already exited.
+///
+/// Times out into `CONTAINER_NAME_TAKEN`, which by then is true rather than a
+/// race: something else is holding the name.
+async fn await_name_release(ctx: &LifecycleCtx<'_>, key: &str) -> Result<()> {
+    let deadline = Instant::now() + NAME_RELEASE_WITHIN;
+    loop {
+        if !ctx.engine.is_registered(ctx.project_namespace, key).await? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(ComposeError::ContainerNameTaken {
+                container: key.to_string(),
+                namespace: ctx.project_namespace.to_string(),
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Stops `target` (or every local container), dependents first.
+pub async fn down(
+    ctx: &LifecycleCtx<'_>,
+    children: &mut Children,
+    records: &mut BTreeMap<String, ChildRecord>,
+    target: Option<&str>,
+    operation_id: String,
+) -> OpResult {
+    report::in_project_scope(
+        &ctx.file.path,
+        down_scoped(ctx, children, records, target, operation_id),
+    )
+    .await
+}
+
+async fn down_scoped(
+    ctx: &LifecycleCtx<'_>,
+    children: &mut Children,
+    records: &mut BTreeMap<String, ChildRecord>,
+    target: Option<&str>,
+    operation_id: String,
+) -> OpResult {
+    let began = Instant::now();
+    let mut order = match plan_targets(ctx.file, target) {
+        Ok(order) => order,
+        Err(error) => {
+            report::summary_failed("down", error.code(), began.elapsed());
+            return failed_op(operation_id, target, &error);
+        }
+    };
+
+    // Both branches must end up dependents-first: nothing may stop while
+    // something that depends on it is still running.
+    match target {
+        // A single target takes its local dependents with it.
+        // `transitive_dependents` returns them in stop order, so the target
+        // goes last and the list needs no reversing.
+        Some(target) => {
+            let mut with_dependents = dag::transitive_dependents(ctx.file, target);
+            with_dependents.push(target.to_string());
+            order = with_dependents;
+        }
+        // The full plan comes back dependencies-first; teardown is its mirror.
+        None => order.reverse(),
+    }
+    order.dedup();
+
+    let mut results = Vec::new();
+    for key in order {
+        if !children.contains_key(&key) {
+            report::unchanged(&key, "not running");
+            results.push(ContainerResult {
+                container: key,
+                state: ChildStatus::Stopped,
+                changed: false,
+                error: None,
+            });
+            continue;
+        }
+        report::starting(&key, "stopping");
+        stop_one(ctx, children, records, &key).await;
+        report::stopped(&key);
+        results.push(ContainerResult {
+            container: key,
+            state: ChildStatus::Stopped,
+            changed: true,
+            error: None,
+        });
+    }
+
+    let cancelled = results
+        .iter()
+        .map(|result| result.container.clone())
+        .collect::<Vec<_>>();
+    report::retries_cancelled(&cancelled);
+    let changed = results.iter().filter(|result| result.changed).count();
+    report::summary_ok("down", changed, results.len(), began.elapsed());
+    OpResult {
+        operation_id,
+        status: OpStatus::Ok,
+        changed: changed > 0,
+        containers: results,
+        primary_error: None,
+    }
+}
+
+/// Starts a container and applies its restart policy before the operation
+/// settles. The original start is not part of the replacement budget, which
+/// matches run-time supervision: a worker gets the configured number of
+/// replacements after the process it was using failed.
+async fn start_one_with_retries(
+    ctx: &LifecycleCtx<'_>,
+    key: &str,
+    mut shutdown: Option<crate::shutdown::ShutdownSignal>,
+    operation_id: Option<&str>,
+) -> StartAttempt {
+    let restart_config = ctx
+        .file
+        .containers
+        .get(key)
+        .map(|container| container.restart.clone())
+        .unwrap_or_default();
+    let mut error = match start_one_attempt(ctx, key, shutdown.clone(), operation_id).await {
+        StartAttempt::Failed(error) if retries_start_failure(restart_config.condition, &error) => {
+            error
+        }
+        settled => return settled,
+    };
+
+    for attempt in 1..=restart_config.max_attempts {
+        report::retry_starting(key, attempt, restart_config.max_attempts);
+        if let Some(operation) = operation_id.and_then(crate::operation::active) {
+            operation
+                .emit(
+                    Some(key),
+                    "retrying",
+                    format!(
+                        "starting attempt {attempt} of {}",
+                        restart_config.max_attempts
+                    ),
+                )
+                .await;
+        }
+
+        let began = Instant::now();
+        match start_one_attempt(ctx, key, shutdown.clone(), operation_id).await {
+            StartAttempt::Ready {
+                record,
+                child,
+                recovery: _,
+            } => {
+                return StartAttempt::Ready {
+                    record,
+                    child,
+                    recovery: Some(RetryRecovery {
+                        attempt,
+                        total_attempts: restart_config.max_attempts,
+                        elapsed: began.elapsed(),
+                    }),
+                };
+            }
+            StartAttempt::Failed(next_error) => error = next_error,
+            StartAttempt::Interrupted => return StartAttempt::Interrupted,
+        }
+
+        if attempt == restart_config.max_attempts
+            || !retries_start_failure(restart_config.condition, &error)
+        {
+            break;
+        }
+
+        let delay = restart::backoff(&restart_config, attempt);
+        let next_attempt = attempt + 1;
+        report::retry_waiting(key, next_attempt, restart_config.max_attempts, delay);
+        if let Some(operation) = operation_id.and_then(crate::operation::active) {
+            operation
+                .emit(
+                    Some(key),
+                    "retrying",
+                    format!(
+                        "waiting before attempt {next_attempt} of {}",
+                        restart_config.max_attempts
+                    ),
+                )
+                .await;
+        }
+        if !wait_for_retry(&mut shutdown, delay).await {
+            return StartAttempt::Interrupted;
+        }
+    }
+
+    StartAttempt::Failed(error)
+}
+
+/// `on-failure` excludes the one start outcome that is not a failure: a child
+/// that exits successfully before registration. Every other startup error is a
+/// failed attempt, including a rejected `pre_run` hook.
+fn retries_start_failure(policy: RestartPolicy, error: &ComposeError) -> bool {
+    match policy {
+        RestartPolicy::No => false,
+        RestartPolicy::Always => true,
+        RestartPolicy::OnFailure => {
+            !matches!(error, ComposeError::ChildExitedBeforeReady { code: 0, .. })
+        }
+    }
+}
+
+async fn wait_for_retry(
+    shutdown: &mut Option<crate::shutdown::ShutdownSignal>,
+    delay: Duration,
+) -> bool {
+    if let Some(signal) = shutdown {
+        tokio::select! {
+            biased;
+            _ = signal.wait() => false,
+            _ = tokio::time::sleep(delay) => true,
+        }
+    } else {
+        tokio::time::sleep(delay).await;
+        true
+    }
+}
+
+async fn start_one_attempt(
+    ctx: &LifecycleCtx<'_>,
+    key: &str,
+    shutdown: Option<crate::shutdown::ShutdownSignal>,
+    operation_id: Option<&str>,
+) -> StartAttempt {
+    match start_one_until_shutdown(ctx, key, shutdown, operation_id).await {
+        Ok((record, child)) => StartAttempt::Ready {
+            record,
+            child,
+            recovery: None,
+        },
+        Err(StartFailure::Failed(error)) => StartAttempt::Failed(error),
+        Err(StartFailure::Interrupted) => StartAttempt::Interrupted,
+    }
+}
+
+async fn start_one_until_shutdown(
+    ctx: &LifecycleCtx<'_>,
+    key: &str,
+    mut shutdown: Option<crate::shutdown::ShutdownSignal>,
+    operation_id: Option<&str>,
+) -> std::result::Result<(ChildRecord, Supervised), StartFailure> {
+    macro_rules! wait_or_interrupt {
+        ($future:expr) => {{
+            if let Some(signal) = shutdown.as_mut() {
+                match signal.run($future).await {
+                    Some(result) => result,
+                    None => return Err(StartFailure::Interrupted),
+                }
+            } else {
+                $future.await
+            }
+        }};
+    }
+
+    let container = ctx
+        .file
+        .containers
+        .get(key)
+        .ok_or_else(|| ComposeError::UnknownContainer {
+            container: key.to_string(),
+        })?;
+
+    // Readiness is "a worker named `key` is registered in this namespace". If
+    // one already is before we spawn, that check would pass on the *stranger*:
+    // the container would be reported ready in milliseconds while the process
+    // we started loses the `(namespace, worker_name)` lease and dies rejected.
+    // Refuse instead, and say who is holding the name.
+    if wait_or_interrupt!(ctx.engine.is_registered(ctx.project_namespace, key))? {
+        return Err(ComposeError::ContainerNameTaken {
+            container: key.to_string(),
+            namespace: ctx.project_namespace.to_string(),
+        }
+        .into());
+    }
+
+    // Taken here, at the last moment nothing of ours is running yet. Readiness
+    // reports differences against it, and a package install below can take
+    // seconds — long enough for an unrelated worker to arrive and be mistaken
+    // for the child we are about to start.
+    let baseline = wait_or_interrupt!(ctx.engine.readiness_baseline(ctx.project_namespace, key))?;
+
+    // A package is acquired here rather than at validation time. Project load
+    // attaches a locked registry result, while `validate` stays offline.
+    let (start, shipped_config) = match &container.worker {
+        crate::config::WorkerSource::Package { reference } => {
+            let range = container.version.as_deref().unwrap_or("*");
+            report::starting(key, &format!("installing {reference}@{range}"));
+            if let Some(operation) = operation_id.and_then(crate::operation::active) {
+                operation
+                    .emit(
+                        Some(key),
+                        "installing",
+                        format!("installing {reference}@{range}"),
+                    )
+                    .await;
+            }
+            let installed = match &container.resolved_package {
+                Some(resolved) => wait_or_interrupt!(crate::registry::install_resolved(
+                    key,
+                    resolved,
+                    ctx.package_cache,
+                ))?,
+                None => wait_or_interrupt!(crate::registry::install(
+                    key,
+                    reference,
+                    range,
+                    ctx.package_cache,
+                ))?,
+            };
+            let operation = operation_id.and_then(crate::operation::active);
+            crate::registry::warn_alias(
+                key,
+                reference,
+                installed.alias_of.as_deref(),
+                operation.as_deref(),
+            )
+            .await;
+            report::starting(
+                key,
+                &format!("starting {} {}", installed.name, installed.version),
+            );
+            match installed.payload {
+                crate::registry::Payload::Binary(program) => (
+                    StartSpec::Exec {
+                        program,
+                        args: Vec::new(),
+                    },
+                    installed.default_config,
+                ),
+                // The start command is the bundle's own, read from its manifest
+                // inside the VM. Nothing on the host runs it.
+                crate::registry::Payload::Bundle(install_dir) => (
+                    StartSpec::Vm(VmSpec::Bundle { install_dir }),
+                    installed.default_config,
+                ),
+            }
+        }
+        crate::config::WorkerSource::Path { .. } => (resolve_start(key, container)?, None),
+    };
+
+    report::starting(key, "configuring");
+    if let Some(operation) = operation_id.and_then(crate::operation::active) {
+        operation
+            .emit(Some(key), "configuring", "resolving configuration")
+            .await;
+    }
+
+    let user_env =
+        container.resolve_user_env_with_diagnostics(key, Some((key, ctx.empty_env_diagnostics)))?;
+    let config = wait_or_interrupt!(resolve_config(ctx, container, key, shipped_config))?;
+    let worker_dir = container.worker_dir();
+    let working_dir = resolve_working_dir(
+        container.working_dir.as_deref(),
+        worker_dir,
+        &ctx.file.base_dir,
+    );
+
+    let spawn_ctx = SpawnCtx {
+        engine_url: ctx.engine_url,
+        namespace: ctx.project_namespace,
+        compose_namespace: ctx.compose_namespace,
+        compose_file: &ctx.file.path,
+        container_key: key,
+        start: &start,
+        config_name: Some(&config.name),
+        working_dir: &working_dir,
+        user_env: &user_env,
+    };
+
+    if let Some(script) = &container.scripts.pre_run {
+        report::starting(key, "running pre-run hook");
+        let Some(result) = hooks::await_pre_run_until_shutdown(
+            &spawn_ctx,
+            script,
+            container.scripts.pre_run_timeout,
+            shutdown.as_mut(),
+        )
+        .await
+        else {
+            return Err(StartFailure::Interrupted);
+        };
+        result.map_err(|err| ComposeError::HookFailed {
+            container: key.to_string(),
+            hook_code: err.code(),
+            message: err.to_string(),
+        })?;
+    }
+
+    let plan = spawn_plan(&spawn_ctx);
+    // A VM boot process also takes the worker env on stdin (MOT-5492).
+    let (command, boot_stdin) = match plan.command() {
+        Some(command) => (command, None),
+        // A VM worker is booted instead of run here. The handle that comes
+        // back is an ordinary child, so readiness, stop, crash cascade and log
+        // capture below are unchanged.
+        None => {
+            report::starting(key, "preparing VM runtime");
+            if let Some(operation) = operation_id.and_then(crate::operation::active) {
+                operation
+                    .emit(Some(key), "preparing", "preparing VM runtime")
+                    .await;
+            }
+            wait_or_interrupt!(vm_command(ctx, key, &start, &plan)).map_err(|message| {
+                ComposeError::SpawnFailed {
+                    container: key.to_string(),
+                    message,
+                }
+            })?
+        }
+    };
+
+    if shutdown.as_ref().is_some_and(|signal| signal.requested()) {
+        return Err(StartFailure::Interrupted);
+    }
+
+    let spawned = spawn_with_boot_stdin(command, boot_stdin).await;
+    let (child, output) = spawned.map_err(|err| ComposeError::SpawnFailed {
+        container: key.to_string(),
+        message: err.to_string(),
+    })?;
+    report::starting(key, "waiting for engine registration");
+    if let Some(operation) = operation_id.and_then(crate::operation::active) {
+        operation
+            .emit(Some(key), "registering", "waiting for engine registration")
+            .await;
+    }
+    // Capture before waiting on readiness: whatever the child prints while
+    // starting is exactly what an operator needs when it does not.
+    ctx.logs.capture(key, output.stdout, output.stderr);
+
+    let readiness = if let Some(signal) = shutdown.as_mut() {
+        tokio::select! {
+            biased;
+            _ = signal.wait() => {
+                child.stop(ctx.file.stop_timeout).await;
+                fire_post_run(ctx, &spawn_ctx, container).await;
+                return Err(StartFailure::Interrupted);
+            }
+            readiness = ctx.engine.wait_until_ready(
+                ctx.project_namespace,
+                key,
+                &child,
+                container.startup_timeout,
+                &baseline,
+                ctx.logs.dir(),
+            ) => readiness,
+        }
+    } else {
+        ctx.engine
+            .wait_until_ready(
+                ctx.project_namespace,
+                key,
+                &child,
+                container.startup_timeout,
+                &baseline,
+                ctx.logs.dir(),
+            )
+            .await
+    };
+
+    if let Err(error) = readiness {
+        // The child is ours whether or not it registered; it must not outlive
+        // the failed attempt.
+        child.stop(ctx.file.stop_timeout).await;
+        fire_post_run(ctx, &spawn_ctx, container).await;
+        return Err(StartFailure::Failed(error));
+    }
+
+    let record = ChildRecord::from_supervised(&child, ChildStatus::Ready);
+    Ok((record, child))
+}
+
+/// Builds the boot command for a VM container, by asking `iii-worker` for it.
+///
+/// A process boundary rather than a call: libkrun needs glibc, and the engine
+/// ships a musl build so it installs on any Linux. Linked, the two do not fit
+/// in one binary — the musl target does not compile. Split, the engine stays
+/// portable and the VM machinery stays where its platform rules already live,
+/// which is the same split the installer makes by shipping `iii-worker` as its
+/// own asset.
+///
+/// Uses the host container environment. Configuration is served by the engine,
+/// not mounted into the guest.
+async fn vm_command(
+    ctx: &LifecycleCtx<'_>,
+    key: &str,
+    start: &StartSpec,
+    plan: &crate::spawn::SpawnPlan,
+) -> std::result::Result<(tokio::process::Command, Option<Vec<u8>>), String> {
+    let (worker_dir, run_override, prepare_command) = match start {
+        StartSpec::Vm(VmSpec::Bundle { install_dir }) => (install_dir, None, "__bundle-prepare"),
+        StartSpec::Vm(VmSpec::Local {
+            worker_dir,
+            run_override,
+        }) => (worker_dir, run_override.as_deref(), "__local-prepare"),
+        _ => return Err("not a VM container".to_string()),
+    };
+
+    let env: BTreeMap<String, String> = plan.env.clone();
+    let request = serde_json::json!({
+        "worker_name": key,
+        "worker_dir": worker_dir,
+        "state_dir": ctx.vm_dir.join(key),
+        "engine_url": ctx.engine_url,
+        "extra_env": env,
+        "run_override": run_override,
+    });
+
+    let plan = prepare_vm(prepare_command, &request).await?;
+    Ok(boot_command(plan))
+}
+
+/// The boot command for a prepared plan, and the worker env to write to its
+/// stdin when the plan carries one (an older iii-worker's plan does not, and
+/// gets a null stdin).
+fn boot_command(plan: VmPlan) -> (tokio::process::Command, Option<Vec<u8>>) {
+    let mut command = tokio::process::Command::new(&plan.program);
+    command.args(&plan.args);
+    for (name, value) in &plan.env {
+        command.env(name, value);
+    }
+    // Not inherited: a lifeline from whoever started compose would tie the VM
+    // to the wrong process.
+    for name in &plan.env_remove {
+        command.env_remove(name);
+    }
+    let stdin = plan.stdin.map(String::into_bytes);
+    command.stdin(if stdin.is_some() {
+        std::process::Stdio::piped()
+    } else {
+        std::process::Stdio::null()
+    });
+    (command, stdin)
+}
+
+/// Spawns a container's command; a VM boot command with a plan `stdin` also
+/// gets the worker env written to it.
+async fn spawn_with_boot_stdin(
+    command: tokio::process::Command,
+    boot_stdin: Option<Vec<u8>>,
+) -> std::io::Result<(Supervised, crate::process::ChildOutput)> {
+    match boot_stdin {
+        None => spawn_supervised_piped(command),
+        Some(payload) => spawn_vm_with_env(command, payload).await,
+    }
+}
+
+/// Spawns a VM boot process and writes the worker env to its stdin
+/// (`__vm-boot --env-stdin`); in argv every local user could read it with
+/// `ps` (MOT-5492). `__vm-boot` drains stdin before anything else, so the
+/// write does not wait on the boot. If it fails, the child is left with a
+/// truncated payload and exits by itself with the reason on stderr, which
+/// the readiness wait reports like any other crash.
+async fn spawn_vm_with_env(
+    command: tokio::process::Command,
+    payload: Vec<u8>,
+) -> std::io::Result<(Supervised, crate::process::ChildOutput)> {
+    use tokio::io::AsyncWriteExt;
+
+    let (child, output, mut stdin) = crate::process::spawn_supervised_piped_with_stdin(command)?;
+    let written = async {
+        stdin.write_all(&payload).await?;
+        stdin.shutdown().await
+    }
+    .await;
+    drop(stdin);
+    if let Err(err) = written {
+        eprintln!("warning: cannot send the worker environment to the VM: {err}");
+    }
+    Ok((child, output))
+}
+
+/// What an `iii-worker` VM prepare command answers: a program, its arguments, and
+/// the environment to start it with.
+#[derive(serde::Deserialize)]
+struct VmPlan {
+    program: std::path::PathBuf,
+    args: Vec<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    #[serde(default)]
+    env_remove: Vec<String>,
+    /// Worker env for the boot process's stdin (MOT-5492). An older
+    /// iii-worker leaves it out and keeps the env in `args`.
+    #[serde(default)]
+    stdin: Option<String>,
+}
+
+/// Runs an `iii-worker` VM prepare command and reads the plan back.
+async fn prepare_vm(
+    prepare_command: &str,
+    request: &serde_json::Value,
+) -> std::result::Result<VmPlan, String> {
+    let program = worker_binary()?;
+    let mut command = tokio::process::Command::new(&program);
+    command
+        .arg(prepare_command)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // `vm_command` is cancellation-safe: dropping this future after a shutdown
+    // signal must not leave its short-lived helper running.
+    command.kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("cannot run {}: {err}", program.display()))?;
+
+    let output = tokio::time::timeout(std::time::Duration::from_secs(20 * 60), async {
+        let body = request.to_string();
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin
+                .write_all(body.as_bytes())
+                .await
+                .map_err(|err| format!("cannot send the request to iii-worker: {err}"))?;
+            // Dropped here: the prepare command reads to end of file, so it would wait
+            // forever on a pipe compose still holds open.
+            drop(stdin);
+        }
+
+        child
+            .wait_with_output()
+            .await
+            .map_err(|err| format!("iii-worker did not answer: {err}"))
+    })
+    .await
+    .map_err(|_| "iii-worker VM preparation timed out after 20 minutes".to_string())??;
+
+    if !output.status.success() {
+        let reason = String::from_utf8_lossy(&output.stderr);
+        let reason = reason.trim();
+        // The one failure whose message says nothing useful. Two binaries with
+        // one contract between them can be installed apart, and clap answers a
+        // subcommand it does not know by printing usage — which reads as a bug
+        // in compose rather than as the version skew it is.
+        if reason.contains("unrecognized subcommand") {
+            return Err(format!(
+                "{} is too old: it does not know `{prepare_command}`, which compose uses to \
+                 build a worker VM. Install it from the same release as iii — they are \
+                 shipped together and are updated together",
+                program.display()
+            ));
+        }
+        // Otherwise its stderr is the diagnosis — the kill switch, a tampered
+        // manifest, a rootfs that could not be prepared — already written for a
+        // human, so it is passed through rather than summarised.
+        return Err(if reason.is_empty() {
+            format!("iii-worker could not prepare the VM ({})", output.status)
+        } else {
+            reason.to_string()
+        });
+    }
+
+    serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("iii-worker answered something unreadable: {err}"))
+}
+
+/// The `iii-worker` next to this binary, else one on `PATH`.
+///
+/// The sibling wins: the installer puts both in the same directory and keeps
+/// them at one version, while a copy earlier on `PATH` may belong to another
+/// install and boot a VM built for a different engine.
+fn worker_binary() -> std::result::Result<std::path::PathBuf, String> {
+    let name = format!("iii-worker{}", std::env::consts::EXE_SUFFIX);
+    if let Ok(current) = std::env::current_exe() {
+        let sibling = current.with_file_name(&name);
+        if sibling.is_file() {
+            return Ok(sibling);
+        }
+    }
+    std::env::var_os("PATH")
+        .iter()
+        .flat_map(std::env::split_paths)
+        .map(|dir| dir.join(&name))
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| {
+            format!(
+                "{name} is not installed. VM containers need this binary to boot; install it \
+                 beside iii, or remove the worker's VM requirement"
+            )
+        })
+}
+
+async fn stop_one(
+    ctx: &LifecycleCtx<'_>,
+    children: &mut Children,
+    records: &mut BTreeMap<String, ChildRecord>,
+    key: &str,
+) -> bool {
+    let Some(child) = children.remove(key) else {
+        return false;
+    };
+    child.stop(ctx.file.stop_timeout).await;
+
+    // post_run fires after the exit is confirmed, on every path out. Any step
+    // that cannot be rebuilt (a container that vanished from the file, an
+    // env_file that is gone) simply means no hook runs — teardown never fails
+    // because of its own cleanup hook.
+    //
+    // The spec is the hook's own. A hook is a host shell command whatever the
+    // container was, and asking `resolve_start` for one instead gated the hook
+    // on an answer only a `path://` container has: a package container's spec
+    // comes from what was installed, which teardown cannot resolve offline. So
+    // post_run never fired for the containers most likely to need it.
+    if let Some(container) = ctx.file.containers.get(key)
+        && let Some(script) = container.scripts.post_run.clone()
+        && let Ok(user_env) = container.resolve_user_env(key)
+    {
+        let start = StartSpec::Shell(script);
+        let working_dir = resolve_working_dir(
+            container.working_dir.as_deref(),
+            container.worker_dir(),
+            &ctx.file.base_dir,
+        );
+        let spawn_ctx = SpawnCtx {
+            engine_url: ctx.engine_url,
+            namespace: ctx.project_namespace,
+            compose_namespace: ctx.compose_namespace,
+            compose_file: &ctx.file.path,
+            container_key: key,
+            start: &start,
+            config_name: None,
+            working_dir: &working_dir,
+            user_env: &user_env,
+        };
+        fire_post_run(ctx, &spawn_ctx, container).await;
+    }
+
+    if let Some(record) = records.get_mut(key) {
+        record.status = ChildStatus::Stopped;
+    }
+
+    true
+}
+
+/// Undoes one failed `up`: stops what this operation started, in reverse.
+async fn rollback(
+    ctx: &LifecycleCtx<'_>,
+    children: &mut Children,
+    records: &mut BTreeMap<String, ChildRecord>,
+    started: &[String],
+    results: &mut [ContainerResult],
+) {
+    for key in started.iter().rev() {
+        stop_one(ctx, children, records, key).await;
+        report::rolled_back(key);
+        if let Some(result) = results.iter_mut().find(|r| &r.container == key) {
+            result.state = ChildStatus::Stopped;
+            result.changed = false;
+        }
+    }
+}
+
+/// The configuration identity is always delivered, even before first registration.
+pub struct ResolvedConfig {
+    pub name: String,
+}
+
+fn resolve_config_value(
+    shipped: Option<serde_yaml::Value>,
+    fetched: Option<serde_yaml::Value>,
+    overrides: Option<serde_yaml::Value>,
+) -> Option<serde_yaml::Value> {
+    // An empty published mapping means the package has no public default. Do
+    // not inject it before the worker can register its own runtime default.
+    let mut value = shipped.filter(
+        |value| !matches!(value, serde_yaml::Value::Mapping(mapping) if mapping.is_empty()),
+    );
+
+    if let Some(fetched) = fetched {
+        value = Some(match value {
+            Some(base) => merge(base, fetched),
+            None => fetched,
+        });
+    }
+
+    if let Some(overrides) = overrides {
+        value = Some(match value {
+            Some(base) => merge(base, overrides),
+            None => overrides,
+        });
+    }
+
+    value
+}
+
+/// Resolves the identity and merges package defaults, current values, and overrides.
+/// Injects the execution value into the service without persisting it, while
+/// service failures propagate rather than silently starting with stale defaults.
+async fn resolve_config(
+    ctx: &LifecycleCtx<'_>,
+    container: &Container,
+    key: &str,
+    shipped: Option<serde_yaml::Value>,
+) -> Result<ResolvedConfig> {
+    let name = container.resolved_config_name(ctx.project_namespace, key)?;
+    if container.config_name.is_none() {
+        let legacy = crate::configuration::legacy_config_name(ctx.project_namespace, key);
+        ctx.engine.migrate_config(&legacy, &name).await?;
+        // Pre-namespace installations used the container key directly. Only
+        // the default namespace may adopt it, and never steal a name another
+        // container in this project explicitly owns. The bare legacy source
+        // wins even over a destination created by an earlier Compose version.
+        // The authority archives the source after publishing the destination.
+        if ctx.project_namespace == "default"
+            && !ctx
+                .file
+                .containers
+                .values()
+                .any(|other| other.config_name.as_deref() == Some(key))
+        {
+            ctx.engine.migrate_config(key, &name).await?;
+        }
+    }
+    // Lowest to highest: package defaults, current active value, compose override.
+    // NOT_FOUND contributes nothing; transport/service failures still fail boot.
+    let fetched = ctx.engine.fetch_config(&name).await?;
+    let value = resolve_config_value(shipped, fetched, container.config_override.clone());
+
+    // GET supplies the current active value, not a forced reload from disk.
+    // Omitting an override keeps that value, including after a worker restart.
+    if let Some(value) = execution_value(value) {
+        ctx.engine.set_config(&name, value).await?;
+    }
+    Ok(ResolvedConfig { name })
+}
+
+/// What to inject as the execution value. A null delivers nothing: the active
+/// value is already null (or absent), and an injected null would shadow the
+/// stored entry, including the default a worker seeds there at boot. That left
+/// a fresh project's `ide` failing `configuration::get` on its second start: the
+/// first start had persisted a null under the injected defaults (MOT-5355). A
+/// null overlay already in a running engine is only replaced by a save or an
+/// engine restart.
+fn execution_value(value: Option<serde_yaml::Value>) -> Option<serde_yaml::Value> {
+    value.filter(|value| !value.is_null())
+}
+
+async fn fire_post_run(ctx: &LifecycleCtx<'_>, spawn_ctx: &SpawnCtx<'_>, container: &Container) {
+    if let Some(script) = &container.scripts.post_run {
+        ctx.post_runs
+            .fire(spawn_ctx, script, ctx.file.stop_timeout)
+            .await;
+    }
+}
+
+fn is_running(children: &Children, key: &str) -> bool {
+    children
+        .get(key)
+        .is_some_and(|child| matches!(child.poll(), Outcome::Running))
+}
+
+/// Containers to act on, in dependency order: the whole graph, or the target
+/// plus everything it depends on.
+fn plan_targets(file: &ComposeFile, target: Option<&str>) -> Result<Vec<String>> {
+    let order = file.start_order()?;
+    let Some(target) = target else {
+        return Ok(order);
+    };
+    if !file.containers.contains_key(target) {
+        return Err(ComposeError::UnknownContainer {
+            container: target.to_string(),
+        });
+    }
+
+    let closure = dag::dependency_closure(file, target);
+    Ok(order
+        .into_iter()
+        .filter(|key| closure.contains(key))
+        .collect())
+}
+
+/// The version each planned worker shows beside its name in the panel.
+fn version_labels<'a>(
+    file: &ComposeFile,
+    keys: impl IntoIterator<Item = &'a str>,
+) -> Vec<(String, Option<String>)> {
+    keys.into_iter()
+        .map(|key| {
+            (
+                key.to_string(),
+                file.containers.get(key).and_then(Container::version_label),
+            )
+        })
+        .collect()
+}
+
+fn failed_op(operation_id: String, target: Option<&str>, error: &ComposeError) -> OpResult {
+    OpResult {
+        operation_id,
+        status: OpStatus::Failed,
+        changed: false,
+        containers: vec![ContainerResult {
+            container: target.unwrap_or("*").to_string(),
+            state: ChildStatus::Failed,
+            changed: false,
+            error: Some(OpError::from(error)),
+        }],
+        primary_error: Some(OpError::from(error)),
+    }
+}
+
+/// Grace used when the daemon itself is going down.
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PROJECT: &str = r#"
+namespace: orders
+containers:
+  web:
+    worker: path://./workers/web
+    start_after: [api]
+  api:
+    worker: path://./workers/api
+    start_after: [database]
+  database:
+    worker: path://./workers/database
+  lonely:
+    worker: path://./workers/lonely
+"#;
+
+    fn file() -> ComposeFile {
+        ComposeFile::parse(PROJECT, "/srv/app/worker-compose.yaml").expect("fixture should parse")
+    }
+
+    #[test]
+    fn a_bare_up_plans_the_whole_graph_in_dependency_order() {
+        let plan = plan_targets(&file(), None).unwrap();
+        assert_eq!(plan, vec!["database", "lonely", "api", "web"]);
+    }
+
+    #[test]
+    fn a_targeted_up_plans_the_target_and_what_it_needs() {
+        // `api` needs `database`, but nothing else in the project.
+        let plan = plan_targets(&file(), Some("api")).unwrap();
+        assert_eq!(plan, vec!["database", "api"]);
+    }
+
+    #[test]
+    fn a_leaf_target_plans_only_itself() {
+        assert_eq!(
+            plan_targets(&file(), Some("lonely")).unwrap(),
+            vec!["lonely"]
+        );
+    }
+
+    #[test]
+    fn an_unknown_target_is_rejected_before_anything_starts() {
+        let err = plan_targets(&file(), Some("ghost")).unwrap_err();
+        assert_eq!(err.code(), "UNKNOWN_CONTAINER");
+    }
+
+    fn yaml(text: &str) -> serde_yaml::Value {
+        serde_yaml::from_str(text).expect("fixture should parse")
+    }
+
+    #[test]
+    fn an_empty_shipped_default_without_other_layers_is_not_injected() {
+        assert_eq!(resolve_config_value(Some(yaml("{}")), None, None), None);
+    }
+
+    #[test]
+    fn a_null_shipped_default_is_not_normalized() {
+        assert_eq!(
+            resolve_config_value(Some(serde_yaml::Value::Null), None, None),
+            Some(serde_yaml::Value::Null)
+        );
+    }
+    #[test]
+    fn a_stored_null_over_package_defaults_is_not_injected() {
+        // The second start of a fresh project: the first one persisted a null
+        // under the injected defaults, and the stored null wins the merge.
+        let resolved = resolve_config_value(
+            Some(yaml("code: {max_read_bytes: 10}")),
+            Some(serde_yaml::Value::Null),
+            None,
+        );
+        assert_eq!(resolved, Some(serde_yaml::Value::Null));
+        assert_eq!(execution_value(resolved), None);
+    }
+
+    #[test]
+    fn a_non_null_override_over_a_stored_null_is_still_injected() {
+        let resolved = resolve_config_value(
+            Some(yaml("port: 1")),
+            Some(serde_yaml::Value::Null),
+            Some(yaml("port: 2")),
+        );
+        assert_eq!(execution_value(resolved), Some(yaml("port: 2")));
+    }
+
+    #[test]
+    fn an_empty_shipped_default_preserves_the_active_configuration() {
+        assert_eq!(
+            resolve_config_value(Some(yaml("{}")), Some(yaml("port: 5432")), None),
+            Some(yaml("port: 5432"))
+        );
+    }
+
+    #[test]
+    fn an_empty_shipped_default_preserves_the_compose_override() {
+        assert_eq!(
+            resolve_config_value(Some(yaml("{}")), None, Some(yaml("port: 6432"))),
+            Some(yaml("port: 6432"))
+        );
+    }
+
+    #[test]
+    fn a_real_shipped_default_preserves_layer_precedence() {
+        assert_eq!(
+            resolve_config_value(
+                Some(yaml("host: package\nport: 1111\n")),
+                Some(yaml("port: 2222\n")),
+                Some(yaml("port: 3333\n")),
+            ),
+            Some(yaml("host: package\nport: 3333\n"))
+        );
+    }
+
+    #[test]
+    fn an_explicit_empty_active_configuration_is_not_normalized() {
+        assert_eq!(
+            resolve_config_value(Some(yaml("{}")), Some(yaml("{}")), None),
+            Some(yaml("{}"))
+        );
+    }
+
+    #[test]
+    fn an_explicit_empty_override_is_not_normalized() {
+        assert_eq!(
+            resolve_config_value(Some(yaml("{}")), None, Some(yaml("{}"))),
+            Some(yaml("{}"))
+        );
+    }
+
+    #[test]
+    fn on_failure_does_not_retry_a_clean_exit_before_ready() {
+        let error = ComposeError::ChildExitedBeforeReady {
+            container: "api".to_string(),
+            code: 0,
+            tail: None,
+        };
+
+        assert!(!retries_start_failure(RestartPolicy::OnFailure, &error));
+    }
+
+    #[test]
+    fn always_retries_a_clean_exit_before_ready() {
+        let error = ComposeError::ChildExitedBeforeReady {
+            container: "api".to_string(),
+            code: 0,
+            tail: None,
+        };
+
+        assert!(retries_start_failure(RestartPolicy::Always, &error));
+    }
+
+    #[test]
+    fn a_failed_plan_reports_the_code_on_the_operation() {
+        let error = ComposeError::UnknownContainer {
+            container: "ghost".to_string(),
+        };
+        let result = failed_op("op-1".to_string(), Some("ghost"), &error);
+
+        assert_eq!(result.status, OpStatus::Failed);
+        assert!(!result.changed, "a rejected plan changed nothing");
+        assert_eq!(
+            result.containers[0].error.as_ref().unwrap().code,
+            "UNKNOWN_CONTAINER"
+        );
+    }
+
+    /// `OpResult` is the JSON `compose::up` returns; the field names are a
+    /// contract, so this pins them.
+    #[test]
+    fn op_result_serializes_with_the_documented_shape() {
+        let result = OpResult {
+            operation_id: "op-1".to_string(),
+            status: OpStatus::Ok,
+            changed: true,
+            containers: vec![ContainerResult {
+                container: "api".to_string(),
+                state: ChildStatus::Ready,
+                changed: true,
+                error: None,
+            }],
+            primary_error: None,
+        };
+
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["operation_id"], "op-1");
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["changed"], true);
+        assert_eq!(json["containers"][0]["container"], "api");
+        assert_eq!(json["containers"][0]["state"], "ready");
+        assert!(
+            json["containers"][0].get("error").is_none(),
+            "a successful container carries no error key"
+        );
+        assert!(
+            json.get("primary_error").is_none(),
+            "the internal primary error must not be serialized"
+        )
+    }
+}
+
+#[cfg(test)]
+mod teardown_order_tests {
+    use super::*;
+
+    /// Regression: a targeted `down` was reversing an already dependents-first
+    /// list, stopping the target before the things that depend on it — the exact
+    /// state `down` exists to prevent. Found by the smoke-test project.
+    #[test]
+    fn a_targeted_down_stops_dependents_before_their_dependency() {
+        let file = ComposeFile::parse(
+            r#"
+namespace: orders
+containers:
+  web:
+    worker: path://./workers/web
+    start_after: [api]
+  api:
+    worker: path://./workers/api
+    start_after: [database]
+  database:
+    worker: path://./workers/database
+"#,
+            "/srv/app/worker-compose.yaml",
+        )
+        .unwrap();
+
+        let mut order = dag::transitive_dependents(&file, "api");
+        order.push("api".to_string());
+        assert_eq!(
+            order,
+            vec!["web", "api"],
+            "web depends on api, so web stops first"
+        );
+
+        // And the whole-project teardown is the mirror of the start order.
+        let mut full = file.start_order().unwrap();
+        full.reverse();
+        assert_eq!(full, vec!["web", "api", "database"]);
+    }
+
+    /// The case the test above cannot reach. With a depth-1 target, discovery
+    /// order and reverse-topological order agree, so a breadth-first walk
+    /// passes it while still being the wrong rule. Two levels below the target
+    /// is where they diverge: discovery returns `[api, reports, web]` and
+    /// stops `api` while `web` is still calling it.
+    #[test]
+    fn a_two_level_cascade_stops_the_far_dependent_first() {
+        let file = ComposeFile::parse(
+            r#"
+namespace: orders
+containers:
+  web:
+    worker: path://./workers/web
+    start_after: [api]
+  api:
+    worker: path://./workers/api
+    start_after: [database]
+  reports:
+    worker: path://./workers/reports
+    start_after: [database]
+  database:
+    worker: path://./workers/database
+"#,
+            "/srv/app/worker-compose.yaml",
+        )
+        .unwrap();
+
+        let mut order = dag::transitive_dependents(&file, "database");
+        order.push("database".to_string());
+
+        let at = |key: &str| {
+            order
+                .iter()
+                .position(|candidate| candidate == key)
+                .unwrap_or_else(|| panic!("{key} missing from {order:?}"))
+        };
+        assert!(
+            at("web") < at("api"),
+            "web depends on api, so web stops first: {order:?}"
+        );
+        assert!(
+            at("api") < at("database") && at("reports") < at("database"),
+            "the target stops last: {order:?}"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod vm_env_stdin_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_plan_with_stdin_gets_its_env_written_and_one_without_a_null_stdin() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (name, stdin) in [
+            ("with", Some(r#"[["API_KEY","sk-secret"]]"#)),
+            ("without", None),
+        ] {
+            let out = tmp.path().join(name);
+            let plan = VmPlan {
+                program: "/bin/sh".into(),
+                args: vec!["-c".to_string(), format!("cat > '{}'", out.display())],
+                env: std::collections::BTreeMap::new(),
+                env_remove: Vec::new(),
+                stdin: stdin.map(str::to_string),
+            };
+            let (command, boot_stdin) = boot_command(plan);
+            let (child, _output) = spawn_with_boot_stdin(command, boot_stdin).await.unwrap();
+            // `cat` exits only at EOF: the pipe was closed after the write,
+            // or stdin was /dev/null (an inherited stdin would hang here).
+            child.wait().await;
+            assert_eq!(
+                std::fs::read_to_string(&out).unwrap(),
+                stdin.unwrap_or(""),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_plan_stdin_is_optional_for_an_older_iii_worker() {
+        let old: VmPlan =
+            serde_json::from_str(r#"{"program":"/bin/iii-worker","args":["__vm-boot"]}"#).unwrap();
+        assert!(old.stdin.is_none());
+        let new: VmPlan = serde_json::from_str(
+            r#"{"program":"/bin/iii-worker","args":["__vm-boot","--env-stdin"],"stdin":"[]"}"#,
+        )
+        .unwrap();
+        assert_eq!(new.stdin.as_deref(), Some("[]"));
+    }
+}

@@ -1,0 +1,1398 @@
+// Copyright Motia LLC and/or licensed to Motia LLC under one or more
+// contributor license agreements. Licensed under the Elastic License 2.0;
+// you may not use this file except in compliance with the Elastic License 2.0.
+// This software is patent protected. We welcome discussions - reach out at team@iii.dev
+// See LICENSE and PATENTS files for details.
+
+use machineid_rs::{Encryption, HWIDComponent, IdBuilder};
+use sha2::{Digest, Sha256};
+
+const TELEMETRY_SCHEMA_VERSION: u8 = 3;
+const DEVICE_ID_SALT: &str = "iii-machine-id";
+const EXECUTION_CONTEXT_ENV: &str = "III_EXECUTION_CONTEXT";
+const EXECUTION_CONTEXT_YAML_DEFAULT: &str = "${III_EXECUTION_CONTEXT:user}";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+struct TelemetryYaml {
+    version: Option<u8>,
+    #[serde(default)]
+    identity: IdentitySection,
+    #[serde(default)]
+    state: StateSection,
+    #[serde(default)]
+    iii_execution_context: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+struct IdentitySection {
+    #[serde(default)]
+    device_id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+struct StateSection {
+    #[serde(default)]
+    first_run_sent: Option<bool>,
+}
+
+fn iii_dir() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".iii")
+}
+
+pub fn telemetry_config_path() -> std::path::PathBuf {
+    iii_dir().join("telemetry.yaml")
+}
+
+fn write_atomic(path: &std::path::Path, content: &str) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, content).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(&tmp, perms).ok();
+        }
+        std::fs::rename(&tmp, path).ok();
+    }
+}
+
+fn normalize_execution_context(value: &str) -> String {
+    match value.trim().to_lowercase().as_str() {
+        "kubernetes" | "k8s" => "kubernetes".to_string(),
+        "docker" => "docker".to_string(),
+        "container" => "container".to_string(),
+        "ci" | "cicd" => "ci".to_string(),
+        "user" => "user".to_string(),
+        "" => "user".to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
+fn parse_yaml_env_syntax(raw: &str) -> Option<(String, Option<String>)> {
+    if !(raw.starts_with("${") && raw.ends_with('}')) {
+        return None;
+    }
+
+    let inner = &raw[2..raw.len() - 1];
+    let mut parts = inner.splitn(2, ':');
+    let var = parts.next()?.trim();
+    if var.is_empty() {
+        return None;
+    }
+    let default = parts.next().map(|s| s.to_string());
+    Some((var.to_string(), default))
+}
+
+fn expand_yaml_env_syntax(raw: &str) -> String {
+    if let Some((var, default)) = parse_yaml_env_syntax(raw) {
+        match std::env::var(&var) {
+            Ok(val) if !val.is_empty() => val,
+            _ => default.unwrap_or_default(),
+        }
+    } else {
+        raw.to_string()
+    }
+}
+
+fn machine_id_from_machineid_rs() -> Option<String> {
+    let mut builder = IdBuilder::new(Encryption::SHA256);
+    builder.add_component(HWIDComponent::SystemID);
+    builder
+        .build(DEVICE_ID_SALT)
+        .ok()
+        .filter(|id| !id.trim().is_empty())
+}
+
+fn is_container_environment() -> bool {
+    if detect_container_runtime() != "none" {
+        return true;
+    }
+    let ctx = std::env::var(EXECUTION_CONTEXT_ENV).unwrap_or_default();
+    matches!(
+        normalize_execution_context(&ctx).as_str(),
+        "docker" | "container" | "kubernetes"
+    )
+}
+
+fn container_hostname() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn find_project_root() -> Option<std::path::PathBuf> {
+    std::env::var("III_PROJECT_ROOT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            let mut dir = std::env::current_dir().ok()?;
+            loop {
+                if dir.join(".iii").join("project.ini").exists() {
+                    return Some(dir);
+                }
+                if !dir.pop() {
+                    break;
+                }
+            }
+            None
+        })
+}
+
+/// How early a heartbeat may land and still count as on-schedule. The interval
+/// timer drifts by a few seconds per tick and an engine restart resets it, so an
+/// exact comparison would drop heartbeats that are due.
+pub(super) const HEARTBEAT_STAMP_SLACK_SECS: u64 = 600;
+
+/// Stamp file recording when the last heartbeat was sent. It lives in the
+/// project's `.iii` directory rather than `~/.iii` because a container that
+/// mounts the project keeps the stamp across restarts, where a home directory
+/// inside the image does not.
+fn heartbeat_stamp_path() -> Option<std::path::PathBuf> {
+    Some(find_project_root()?.join(".iii").join("last_heartbeat"))
+}
+
+fn read_heartbeat_stamp(path: &std::path::Path) -> Option<i64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Returns true when a heartbeat is due, and stamps the current time when it is.
+/// A heartbeat is due when the stamp is missing, unreadable, or older than
+/// `interval_secs` less the slack window.
+///
+/// Fails open: with no project directory there is nowhere to persist the stamp,
+/// so the heartbeat is sent and the in-process timers are the only limit. A
+/// stamp dated in the future (a clock moved backwards) is treated as stale and
+/// overwritten, so a bad value cannot silence heartbeats indefinitely.
+pub fn claim_heartbeat(interval_secs: u64) -> bool {
+    // ponytail: read-then-write, no lock. Two engines starting in the same
+    // project at the same moment can both see no stamp and both report. The
+    // ceiling is one extra event per interval; take a lock file if that ever
+    // shows up in the data.
+    let Some(path) = heartbeat_stamp_path() else {
+        return true;
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    // Clamp rather than cast: an interval past `i64::MAX` wraps negative, which
+    // would invert the comparison below and suppress nothing.
+    let min_gap =
+        i64::try_from(interval_secs.saturating_sub(HEARTBEAT_STAMP_SLACK_SECS)).unwrap_or(i64::MAX);
+
+    if let Some(last) = read_heartbeat_stamp(&path)
+        && now >= last
+        && now - last < min_gap
+    {
+        return false;
+    }
+
+    write_atomic(&path, &now.to_string());
+    true
+}
+
+pub fn find_project_ini_device_id() -> Option<String> {
+    let root = find_project_root()?;
+    let contents = std::fs::read_to_string(root.join(".iii").join("project.ini")).ok()?;
+    contents.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("device_id=")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    })
+}
+
+fn write_device_id_to_project_ini(device_id: &str) {
+    let Some(root) = find_project_root() else {
+        return;
+    };
+    let path = root.join(".iii").join("project.ini");
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    // Already has a device_id line — don't overwrite
+    if contents.lines().any(|l| l.trim().starts_with("device_id=")) {
+        return;
+    }
+
+    let new_contents = format!("{}device_id={}\n", contents, device_id);
+    write_atomic(&path, &new_contents);
+}
+
+fn salted_sha256(input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input);
+    hasher.update(DEVICE_ID_SALT);
+    format!("{:x}", hasher.finalize())
+}
+
+fn generate_container_device_id() -> String {
+    let hostname = container_hostname();
+
+    if let Some(host_device_id) = find_project_ini_device_id() {
+        return salted_sha256(&format!("{host_device_id}-{hostname}"));
+    }
+
+    let base = match std::env::var("III_HOST_USER_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        Some(host_id) => format!("{host_id}-{hostname}"),
+        None => hostname,
+    };
+
+    format!("docker-{}", salted_sha256(&base))
+}
+
+fn generate_new_device_id() -> String {
+    if is_container_environment() {
+        return generate_container_device_id();
+    }
+    if let Some(machine_id) = machine_id_from_machineid_rs() {
+        return machine_id;
+    }
+    format!("fallback-{}", uuid::Uuid::new_v4())
+}
+
+fn build_fresh_v2_yaml() -> TelemetryYaml {
+    TelemetryYaml {
+        version: Some(TELEMETRY_SCHEMA_VERSION),
+        identity: IdentitySection {
+            device_id: Some(generate_new_device_id()),
+        },
+        state: StateSection::default(),
+        iii_execution_context: Some(EXECUTION_CONTEXT_YAML_DEFAULT.to_string()),
+    }
+}
+
+fn read_telemetry_yaml(path: &std::path::Path) -> Option<TelemetryYaml> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    serde_yaml::from_str(&contents).ok()
+}
+
+fn write_telemetry_yaml(state: &TelemetryYaml) {
+    if let Ok(serialized) = serde_yaml::to_string(state) {
+        write_atomic(&telemetry_config_path(), &serialized);
+    }
+}
+
+fn load_or_migrate_v2_state() -> TelemetryYaml {
+    let path = telemetry_config_path();
+    let parsed = read_telemetry_yaml(&path);
+
+    if let Some(mut state) = parsed
+        && state.version == Some(TELEMETRY_SCHEMA_VERSION)
+    {
+        let mut changed = false;
+        if state.identity.device_id.is_none() {
+            state.identity.device_id = Some(generate_new_device_id());
+            changed = true;
+        }
+        if state.iii_execution_context.is_none() {
+            state.iii_execution_context = Some(EXECUTION_CONTEXT_YAML_DEFAULT.to_string());
+            changed = true;
+        }
+        if changed {
+            write_telemetry_yaml(&state);
+        }
+        return state;
+    }
+
+    let fresh = build_fresh_v2_yaml();
+    write_telemetry_yaml(&fresh);
+    fresh
+}
+
+pub fn get_or_create_device_id() -> String {
+    let id = ensure_device_id();
+    if !is_container_environment() {
+        write_device_id_to_project_ini(&id);
+    }
+    id
+}
+
+/// The device id from `~/.iii/telemetry.yaml`, creating the version-2 file
+/// when it is missing.
+///
+/// Unlike [`get_or_create_device_id`], this never writes `device_id=` into the
+/// `.iii/project.ini` found from the current directory, which may belong to an
+/// unrelated project.
+pub fn ensure_device_id() -> String {
+    let mut state = load_or_migrate_v2_state();
+    if let Some(existing) = state.identity.device_id.clone()
+        && !existing.is_empty()
+    {
+        return existing;
+    }
+
+    let id = generate_new_device_id();
+    state.identity.device_id = Some(id.clone());
+    write_telemetry_yaml(&state);
+    id
+}
+
+pub fn resolve_execution_context() -> String {
+    if is_ci_environment() {
+        return "ci".to_string();
+    }
+
+    if let Ok(env_ctx) = std::env::var(EXECUTION_CONTEXT_ENV)
+        && !env_ctx.is_empty()
+    {
+        return normalize_execution_context(&env_ctx);
+    }
+
+    let runtime = detect_container_runtime();
+    if runtime != "none" {
+        return runtime;
+    }
+
+    let mut state = load_or_migrate_v2_state();
+    if state.iii_execution_context.is_none() {
+        state.iii_execution_context = Some(EXECUTION_CONTEXT_YAML_DEFAULT.to_string());
+        write_telemetry_yaml(&state);
+    }
+
+    let raw = state
+        .iii_execution_context
+        .clone()
+        .unwrap_or_else(|| EXECUTION_CONTEXT_YAML_DEFAULT.to_string());
+    normalize_execution_context(&expand_yaml_env_syntax(&raw))
+}
+
+pub fn read_config_key(section: &str, key: &str) -> Option<String> {
+    let state = load_or_migrate_v2_state();
+    match (section, key) {
+        ("identity", "device_id") | ("identity", "id") => {
+            state.identity.device_id.filter(|v| !v.is_empty())
+        }
+        ("state", "first_run_sent") => state.state.first_run_sent.map(|v| v.to_string()),
+        ("telemetry", "iii_execution_context") => state.iii_execution_context,
+        _ => None,
+    }
+}
+
+pub fn set_config_key(section: &str, key: &str, value: &str) {
+    let mut state = load_or_migrate_v2_state();
+    match (section, key) {
+        ("identity", "device_id") | ("identity", "id") => {
+            state.identity.device_id = Some(value.to_string());
+        }
+        ("state", "first_run_sent") => {
+            state.state.first_run_sent = Some(value.eq_ignore_ascii_case("true") || value == "1");
+        }
+        ("telemetry", "iii_execution_context") => {
+            state.iii_execution_context = Some(value.to_string());
+        }
+        _ => {}
+    }
+    state.version = Some(TELEMETRY_SCHEMA_VERSION);
+    write_telemetry_yaml(&state);
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EnvironmentInfo {
+    pub machine_id: String,
+    pub iii_execution_context: String,
+    pub timezone: String,
+    pub cpu_cores: usize,
+    pub os: String,
+    pub arch: String,
+    pub host_user_id: Option<String>,
+}
+
+impl EnvironmentInfo {
+    pub fn collect() -> Self {
+        Self {
+            machine_id: get_or_create_device_id(),
+            iii_execution_context: resolve_execution_context(),
+            timezone: detect_timezone(),
+            cpu_cores: std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1),
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            host_user_id: std::env::var("III_HOST_USER_ID")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .or_else(find_project_ini_device_id),
+        }
+    }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut obj = serde_json::json!({
+            "machine_id": self.machine_id,
+            "iii_execution_context": self.iii_execution_context,
+            "timezone": self.timezone,
+            "cpu_cores": self.cpu_cores,
+            "os": self.os,
+            "arch": self.arch,
+        });
+        if let Some(ref id) = self.host_user_id {
+            obj["host_user_id"] = serde_json::json!(id);
+        }
+        obj
+    }
+}
+
+/// Detect whether the process runs inside a container.
+/// Returns `"kubernetes"`, `"docker"`, `"container"`, or `"none"`.
+pub fn detect_container_runtime() -> String {
+    if std::env::var("KUBERNETES_SERVICE_HOST").is_ok() {
+        return "kubernetes".to_string();
+    }
+
+    if std::path::Path::new("/.dockerenv").exists() {
+        return "docker".to_string();
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(contents) = std::fs::read_to_string("/proc/1/cgroup") {
+            let lower = contents.to_lowercase();
+            if lower.contains("kubepods") {
+                return "kubernetes".to_string();
+            }
+            if lower.contains("docker") || lower.contains("containerd") {
+                return "container".to_string();
+            }
+        }
+    }
+
+    "none".to_string()
+}
+
+fn detect_timezone() -> String {
+    if let Ok(tz) = iana_time_zone::get_timezone()
+        && !tz.is_empty()
+    {
+        return tz;
+    }
+
+    std::env::var("TZ").unwrap_or_else(|_| "Unknown".to_string())
+}
+
+/// Environment variables that mark a CI runner. Public so a test that needs to
+/// look like a developer machine can clear the whole set instead of keeping its
+/// own copy, which would drift and pass locally while failing on a runner.
+pub const CI_ENV_VARS: &[&str] = &[
+    "CI",
+    "GITHUB_ACTIONS",
+    "GITLAB_CI",
+    "CIRCLECI",
+    "JENKINS_URL",
+    "TRAVIS",
+    "BUILDKITE",
+    "TF_BUILD",
+    "CODEBUILD_BUILD_ID",
+    "BITBUCKET_BUILD_NUMBER",
+    "DRONE",
+    "TEAMCITY_VERSION",
+];
+
+pub fn is_ci_environment() -> bool {
+    CI_ENV_VARS.iter().any(|var| std::env::var(var).is_ok())
+}
+
+/// True when `III_TELEMETRY_ENABLED` is set to a value that reads as off.
+/// Accepts `false`, `0`, `no`, or `off` case-insensitively, ignoring
+/// surrounding whitespace. A truthy or unrecognized value does not opt out
+/// here; CI detection and dev opt-out still apply.
+pub fn env_opt_out() -> bool {
+    std::env::var("III_TELEMETRY_ENABLED")
+        .map(|val| is_falsey(&val))
+        .unwrap_or(false)
+}
+
+fn is_falsey(val: &str) -> bool {
+    matches!(
+        val.trim().to_ascii_lowercase().as_str(),
+        "false" | "0" | "no" | "off"
+    )
+}
+
+pub fn is_dev_optout() -> bool {
+    if std::env::var("III_TELEMETRY_DEV").ok().as_deref() == Some("true") {
+        return true;
+    }
+
+    let base_dir = dirs::home_dir().unwrap_or_else(std::env::temp_dir);
+    base_dir.join(".iii").join("telemetry_dev_optout").exists()
+}
+
+pub fn detect_client_type() -> &'static str {
+    "iii_direct"
+}
+
+pub fn detect_language() -> Option<String> {
+    std::env::var("LANG")
+        .or_else(|_| std::env::var("LC_ALL"))
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.split('.').next().unwrap_or(&s).to_string())
+}
+
+/// Detect the install method based on the current executable path.
+pub fn detect_install_method() -> &'static str {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return "unknown",
+    };
+
+    let path_str = exe.to_string_lossy();
+
+    if path_str.contains("/opt/homebrew/")
+        || path_str.contains("/usr/local/Cellar/")
+        || path_str.contains("/home/linuxbrew/")
+    {
+        return "brew";
+    }
+
+    if path_str.contains("\\ProgramData\\chocolatey\\") || path_str.contains("/chocolatey/") {
+        return "chocolatey";
+    }
+
+    if path_str.contains("/.local/bin/") {
+        return "sh";
+    }
+
+    "manual"
+}
+
+/// Read the `III_ENV` environment variable, defaulting to `"unknown"`.
+pub fn detect_env() -> String {
+    std::env::var("III_ENV")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+    use std::env;
+
+    // =========================================================================
+    // telemetry.yaml + migration
+    // =========================================================================
+
+    #[test]
+    #[serial]
+    fn test_telemetry_config_path_is_yaml() {
+        assert!(
+            telemetry_config_path()
+                .to_string_lossy()
+                .ends_with("telemetry.yaml")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_load_or_migrate_writes_v2_yaml_with_device_id() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            env::set_var("HOME", dir.path());
+        }
+        let state = load_or_migrate_v2_state();
+        assert_eq!(state.version, Some(2));
+        assert!(state.identity.device_id.is_some());
+        assert!(telemetry_config_path().exists());
+        unsafe {
+            env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn ensure_device_id_writes_the_yaml_and_leaves_project_ini_alone() {
+        let home = tempfile::tempdir().unwrap();
+        let unrelated = tempfile::tempdir().unwrap();
+        let ini = unrelated.path().join(".iii").join("project.ini");
+        std::fs::create_dir_all(ini.parent().unwrap()).unwrap();
+        let before = "[project]\nproject_id=unrelated\n";
+        std::fs::write(&ini, before).unwrap();
+        unsafe {
+            env::set_var("HOME", home.path());
+            env::set_var("III_PROJECT_ROOT", unrelated.path());
+        }
+
+        let id = ensure_device_id();
+        let state = read_telemetry_yaml(&telemetry_config_path());
+        let after = std::fs::read_to_string(&ini).unwrap();
+
+        unsafe {
+            env::remove_var("HOME");
+            env::remove_var("III_PROJECT_ROOT");
+        }
+        let state = state.expect("telemetry.yaml written");
+        assert_eq!(state.version, Some(TELEMETRY_SCHEMA_VERSION));
+        assert_eq!(state.identity.device_id.as_deref(), Some(id.as_str()));
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    #[serial]
+    fn test_v1_yaml_resets_to_fresh_v2_state() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            env::set_var("HOME", dir.path());
+        }
+        let path = telemetry_config_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"version: 1
+identity:
+  device_id: "legacy-id"
+state:
+  first_run_sent: true
+"#,
+        )
+        .unwrap();
+
+        let state = load_or_migrate_v2_state();
+        assert_eq!(state.version, Some(2));
+        assert_ne!(state.identity.device_id.as_deref(), Some("legacy-id"));
+        assert_eq!(state.state.first_run_sent, None);
+        unsafe {
+            env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_set_and_read_config_key_for_state() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            env::set_var("HOME", dir.path());
+        }
+        set_config_key("state", "first_run_sent", "true");
+        assert_eq!(
+            read_config_key("state", "first_run_sent").as_deref(),
+            Some("true")
+        );
+        unsafe {
+            env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_get_or_create_device_id_is_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            env::set_var("HOME", dir.path());
+        }
+        let d1 = get_or_create_device_id();
+        let d2 = get_or_create_device_id();
+        assert!(!d1.is_empty());
+        assert_eq!(d1, d2);
+        unsafe {
+            env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_execution_context_prefers_explicit_env() {
+        const CI_VARS: &[&str] = &[
+            "CI",
+            "GITHUB_ACTIONS",
+            "GITLAB_CI",
+            "CIRCLECI",
+            "JENKINS_URL",
+            "TRAVIS",
+            "BUILDKITE",
+            "TF_BUILD",
+            "CODEBUILD_BUILD_ID",
+            "BITBUCKET_BUILD_NUMBER",
+            "DRONE",
+            "TEAMCITY_VERSION",
+        ];
+
+        let saved: Vec<(&str, Option<String>)> =
+            CI_VARS.iter().map(|v| (*v, env::var(v).ok())).collect();
+
+        unsafe {
+            for var in CI_VARS {
+                env::remove_var(var);
+            }
+            env::set_var(EXECUTION_CONTEXT_ENV, "docker");
+        }
+
+        assert_eq!(resolve_execution_context(), "docker");
+
+        unsafe {
+            env::remove_var(EXECUTION_CONTEXT_ENV);
+            for (var, val) in &saved {
+                match val {
+                    Some(v) => env::set_var(var, v),
+                    None => env::remove_var(var),
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_execution_context_detects_ci() {
+        unsafe {
+            env::remove_var(EXECUTION_CONTEXT_ENV);
+            env::set_var("CI", "true");
+        }
+        assert_eq!(resolve_execution_context(), "ci");
+        unsafe {
+            env::remove_var("CI");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_execution_context_ci_overrides_env_var() {
+        unsafe {
+            env::set_var(EXECUTION_CONTEXT_ENV, "docker");
+            env::set_var("CI", "true");
+        }
+        assert_eq!(resolve_execution_context(), "ci");
+        unsafe {
+            env::remove_var(EXECUTION_CONTEXT_ENV);
+            env::remove_var("CI");
+        }
+    }
+
+    // =========================================================================
+    // EnvironmentInfo
+    // =========================================================================
+
+    #[test]
+    #[serial]
+    fn test_environment_info_collect_returns_valid_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            env::set_var("HOME", dir.path());
+        }
+        let info = EnvironmentInfo::collect();
+        assert!(!info.machine_id.is_empty());
+        assert!(!info.iii_execution_context.is_empty());
+        assert!(info.cpu_cores >= 1);
+        assert!(!info.os.is_empty());
+        assert!(!info.arch.is_empty());
+        assert!(!info.timezone.is_empty());
+        unsafe {
+            env::remove_var("HOME");
+        }
+    }
+
+    // =========================================================================
+    // detect_container_runtime
+    // =========================================================================
+
+    #[test]
+    #[serial]
+    fn test_detect_container_runtime_kubernetes_env() {
+        unsafe {
+            env::set_var("KUBERNETES_SERVICE_HOST", "10.96.0.1");
+        }
+        assert_eq!(detect_container_runtime(), "kubernetes");
+        unsafe {
+            env::remove_var("KUBERNETES_SERVICE_HOST");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_detect_container_runtime_none_on_host() {
+        unsafe {
+            env::remove_var("KUBERNETES_SERVICE_HOST");
+        }
+        let runtime = detect_container_runtime();
+        assert!(
+            runtime == "none"
+                || runtime == "docker"
+                || runtime == "container"
+                || runtime == "kubernetes",
+            "unexpected runtime: {runtime}"
+        );
+    }
+
+    // =========================================================================
+    // detect_env
+    // =========================================================================
+
+    #[test]
+    #[serial]
+    fn test_detect_env_default_unknown() {
+        unsafe {
+            env::remove_var("III_ENV");
+        }
+        assert_eq!(detect_env(), "unknown");
+    }
+
+    #[test]
+    #[serial]
+    fn test_detect_env_from_var() {
+        unsafe {
+            env::set_var("III_ENV", "production");
+        }
+        assert_eq!(detect_env(), "production");
+        unsafe {
+            env::remove_var("III_ENV");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_detect_env_empty_defaults_to_unknown() {
+        unsafe {
+            env::set_var("III_ENV", "");
+        }
+        assert_eq!(detect_env(), "unknown");
+        unsafe {
+            env::remove_var("III_ENV");
+        }
+    }
+
+    // =========================================================================
+    // detect_install_method
+    // =========================================================================
+
+    #[test]
+    fn test_detect_install_method_returns_known_value() {
+        let method = detect_install_method();
+        assert!(
+            matches!(method, "brew" | "chocolatey" | "sh" | "manual" | "unknown"),
+            "unexpected install method: {method}"
+        );
+    }
+
+    // =========================================================================
+    // is_ci_environment
+    // =========================================================================
+
+    #[test]
+    #[serial]
+    fn test_is_ci_environment_detects_ci_var() {
+        let ci_vars = [
+            "CI",
+            "GITHUB_ACTIONS",
+            "GITLAB_CI",
+            "CIRCLECI",
+            "JENKINS_URL",
+            "TRAVIS",
+            "BUILDKITE",
+            "TF_BUILD",
+            "CODEBUILD_BUILD_ID",
+            "BITBUCKET_BUILD_NUMBER",
+            "DRONE",
+            "TEAMCITY_VERSION",
+        ];
+        for var in &ci_vars {
+            unsafe {
+                env::remove_var(var);
+            }
+        }
+
+        assert!(
+            !is_ci_environment(),
+            "should not detect CI when no CI vars set"
+        );
+
+        unsafe {
+            env::set_var("CI", "true");
+        }
+        assert!(is_ci_environment(), "should detect CI when CI=true");
+        unsafe {
+            env::remove_var("CI");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_is_ci_environment_detects_github_actions() {
+        let ci_vars = [
+            "CI",
+            "GITHUB_ACTIONS",
+            "GITLAB_CI",
+            "CIRCLECI",
+            "JENKINS_URL",
+            "TRAVIS",
+            "BUILDKITE",
+            "TF_BUILD",
+            "CODEBUILD_BUILD_ID",
+            "BITBUCKET_BUILD_NUMBER",
+            "DRONE",
+            "TEAMCITY_VERSION",
+        ];
+        for var in &ci_vars {
+            unsafe {
+                env::remove_var(var);
+            }
+        }
+
+        unsafe {
+            env::set_var("GITHUB_ACTIONS", "true");
+        }
+        assert!(
+            is_ci_environment(),
+            "should detect CI when GITHUB_ACTIONS is set"
+        );
+        unsafe {
+            env::remove_var("GITHUB_ACTIONS");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_is_ci_environment_detects_gitlab_ci() {
+        let ci_vars = [
+            "CI",
+            "GITHUB_ACTIONS",
+            "GITLAB_CI",
+            "CIRCLECI",
+            "JENKINS_URL",
+            "TRAVIS",
+            "BUILDKITE",
+            "TF_BUILD",
+            "CODEBUILD_BUILD_ID",
+            "BITBUCKET_BUILD_NUMBER",
+            "DRONE",
+            "TEAMCITY_VERSION",
+        ];
+        for var in &ci_vars {
+            unsafe {
+                env::remove_var(var);
+            }
+        }
+
+        unsafe {
+            env::set_var("GITLAB_CI", "true");
+        }
+        assert!(
+            is_ci_environment(),
+            "should detect CI when GITLAB_CI is set"
+        );
+        unsafe {
+            env::remove_var("GITLAB_CI");
+        }
+    }
+
+    // =========================================================================
+    // env_opt_out
+    // =========================================================================
+
+    #[test]
+    #[serial]
+    fn test_env_opt_out_true_for_falsey_values() {
+        for val in [
+            "false",
+            "False",
+            "FALSE",
+            "0",
+            "no",
+            "No",
+            "NO",
+            "off",
+            "Off",
+            "OFF",
+            "  false  ",
+            "\t0\n",
+            " off ",
+        ] {
+            unsafe {
+                env::set_var("III_TELEMETRY_ENABLED", val);
+            }
+            assert!(env_opt_out(), "{val:?} should opt out");
+        }
+        unsafe {
+            env::remove_var("III_TELEMETRY_ENABLED");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_env_opt_out_false_for_truthy_and_unrecognized_values() {
+        for val in [
+            "true",
+            "True",
+            "TRUE",
+            "1",
+            "on",
+            "On",
+            "ON",
+            "yes",
+            "Yes",
+            "YES",
+            "enabled",
+            "",
+            "  ",
+            "2",
+            "false-ish",
+            "0.0",
+            "n",
+            "disable",
+        ] {
+            unsafe {
+                env::set_var("III_TELEMETRY_ENABLED", val);
+            }
+            assert!(!env_opt_out(), "{val:?} should not opt out");
+        }
+        unsafe {
+            env::remove_var("III_TELEMETRY_ENABLED");
+        }
+        assert!(!env_opt_out(), "unset should not opt out");
+    }
+
+    // =========================================================================
+    // is_dev_optout
+    // =========================================================================
+
+    #[test]
+    #[serial]
+    fn test_is_dev_optout_with_env_var() {
+        unsafe {
+            env::remove_var("III_TELEMETRY_DEV");
+        }
+        assert!(
+            !is_dev_optout() || is_dev_optout(),
+            "baseline call should not panic"
+        );
+
+        unsafe {
+            env::set_var("III_TELEMETRY_DEV", "true");
+        }
+        assert!(
+            is_dev_optout(),
+            "should detect dev optout when III_TELEMETRY_DEV=true"
+        );
+        unsafe {
+            env::remove_var("III_TELEMETRY_DEV");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_is_dev_optout_false_value_not_triggered() {
+        unsafe {
+            env::set_var("III_TELEMETRY_DEV", "false");
+        }
+        let _ = is_dev_optout();
+        unsafe {
+            env::remove_var("III_TELEMETRY_DEV");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_is_dev_optout_with_marker_file() {
+        // The user creates ~/.iii/telemetry_dev_optout by hand; iii never
+        // writes it. Point HOME at a tempdir and create the marker there.
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            env::remove_var("III_TELEMETRY_DEV");
+            env::set_var("HOME", dir.path());
+        }
+
+        let iii_dir = dir.path().join(".iii");
+        std::fs::create_dir_all(&iii_dir).unwrap();
+
+        assert!(!is_dev_optout(), "no opt-out before the marker file exists");
+
+        std::fs::write(iii_dir.join("telemetry_dev_optout"), "").unwrap();
+        assert!(
+            is_dev_optout(),
+            "should detect dev opt-out once the marker file exists"
+        );
+
+        unsafe {
+            env::remove_var("HOME");
+        }
+    }
+
+    // =========================================================================
+    // detect_client_type
+    // =========================================================================
+
+    #[test]
+    fn test_detect_client_type_returns_iii_direct() {
+        assert_eq!(detect_client_type(), "iii_direct");
+    }
+
+    // =========================================================================
+    // detect_language
+    // =========================================================================
+
+    #[test]
+    #[serial]
+    fn test_detect_language_from_lang_env() {
+        unsafe {
+            env::set_var("LANG", "en_US.UTF-8");
+            env::remove_var("LC_ALL");
+        }
+        let lang = detect_language();
+        assert_eq!(lang, Some("en_US".to_string()));
+        unsafe {
+            env::remove_var("LANG");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_detect_language_from_lc_all_fallback() {
+        unsafe {
+            env::remove_var("LANG");
+            env::set_var("LC_ALL", "fr_FR.UTF-8");
+        }
+        let lang = detect_language();
+        assert_eq!(lang, Some("fr_FR".to_string()));
+        unsafe {
+            env::remove_var("LC_ALL");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_detect_language_none_when_unset() {
+        unsafe {
+            env::remove_var("LANG");
+            env::remove_var("LC_ALL");
+        }
+        let lang = detect_language();
+        assert_eq!(lang, None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_detect_language_none_when_empty() {
+        unsafe {
+            env::set_var("LANG", "");
+            env::remove_var("LC_ALL");
+        }
+        let lang = detect_language();
+        assert_eq!(lang, None);
+        unsafe {
+            env::remove_var("LANG");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_detect_language_without_dot() {
+        unsafe {
+            env::set_var("LANG", "C");
+            env::remove_var("LC_ALL");
+        }
+        let lang = detect_language();
+        assert_eq!(lang, Some("C".to_string()));
+        unsafe {
+            env::remove_var("LANG");
+        }
+    }
+
+    // =========================================================================
+    // detect_timezone
+    // =========================================================================
+
+    #[test]
+    fn test_detect_timezone_returns_nonempty() {
+        let tz = detect_timezone();
+        assert!(!tz.is_empty(), "timezone should not be empty");
+    }
+
+    // =========================================================================
+    // claim_heartbeat
+    // =========================================================================
+
+    const SIX_HOURS: u64 = 6 * 60 * 60;
+
+    /// Points the project root at a fresh temporary directory and returns it.
+    /// The caller keeps the `TempDir` alive for the length of the test.
+    fn project_root_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            env::set_var("III_PROJECT_ROOT", dir.path());
+        }
+        dir
+    }
+
+    fn clear_project_root() {
+        unsafe {
+            env::remove_var("III_PROJECT_ROOT");
+        }
+    }
+
+    /// Backdates the stamp by `age_secs` so a test does not have to wait.
+    fn backdate_stamp(age_secs: i64) {
+        let stamp = chrono::Utc::now().timestamp() - age_secs;
+        write_atomic(&heartbeat_stamp_path().unwrap(), &stamp.to_string());
+    }
+
+    #[test]
+    #[serial]
+    fn test_claim_heartbeat_sends_when_no_stamp_exists() {
+        let _dir = project_root_fixture();
+        assert!(
+            claim_heartbeat(SIX_HOURS),
+            "a first run has no stamp, so the heartbeat is due"
+        );
+        clear_project_root();
+    }
+
+    #[test]
+    #[serial]
+    fn test_claim_heartbeat_suppresses_a_restart_within_the_interval() {
+        let _dir = project_root_fixture();
+        assert!(claim_heartbeat(SIX_HOURS));
+        assert!(
+            !claim_heartbeat(SIX_HOURS),
+            "a restart moments later must not report again"
+        );
+        assert!(
+            !claim_heartbeat(SIX_HOURS),
+            "repeated restarts stay suppressed"
+        );
+        clear_project_root();
+    }
+
+    #[test]
+    #[serial]
+    fn test_claim_heartbeat_stamp_is_written_under_the_project_iii_dir() {
+        let dir = project_root_fixture();
+        assert!(claim_heartbeat(SIX_HOURS));
+
+        let stamp = dir.path().join(".iii").join("last_heartbeat");
+        assert!(
+            stamp.exists(),
+            "the stamp belongs to the project, not $HOME"
+        );
+        assert_eq!(heartbeat_stamp_path().unwrap(), stamp);
+        assert!(
+            read_heartbeat_stamp(&stamp).is_some(),
+            "the stamp holds a parsable unix timestamp"
+        );
+        clear_project_root();
+    }
+
+    #[test]
+    #[serial]
+    fn test_claim_heartbeat_sends_once_the_slack_window_is_reached() {
+        let _dir = project_root_fixture();
+
+        // One second short of the window: still suppressed.
+        backdate_stamp(SIX_HOURS as i64 - HEARTBEAT_STAMP_SLACK_SECS as i64 - 1);
+        assert!(!claim_heartbeat(SIX_HOURS));
+
+        // At the window: a tick that runs early by the slack amount is due.
+        backdate_stamp(SIX_HOURS as i64 - HEARTBEAT_STAMP_SLACK_SECS as i64);
+        assert!(claim_heartbeat(SIX_HOURS));
+
+        clear_project_root();
+    }
+
+    #[test]
+    #[serial]
+    fn test_claim_heartbeat_sends_when_the_stamp_is_dated_in_the_future() {
+        let _dir = project_root_fixture();
+        backdate_stamp(-(SIX_HOURS as i64)); // a clock that moved backwards
+        assert!(
+            claim_heartbeat(SIX_HOURS),
+            "a future stamp is stale, not a reason to stay silent forever"
+        );
+        clear_project_root();
+    }
+
+    #[test]
+    #[serial]
+    fn test_claim_heartbeat_sends_when_the_stamp_is_unreadable() {
+        let _dir = project_root_fixture();
+        let path = heartbeat_stamp_path().unwrap();
+
+        write_atomic(&path, "not a timestamp");
+        assert!(claim_heartbeat(SIX_HOURS), "a corrupt stamp fails open");
+
+        write_atomic(&path, "");
+        assert!(claim_heartbeat(SIX_HOURS), "an empty stamp fails open");
+
+        clear_project_root();
+    }
+
+    #[test]
+    #[serial]
+    fn test_claim_heartbeat_tolerates_whitespace_in_the_stamp() {
+        let _dir = project_root_fixture();
+        let stamp = chrono::Utc::now().timestamp();
+        write_atomic(&heartbeat_stamp_path().unwrap(), &format!("{stamp}\n"));
+        assert!(
+            !claim_heartbeat(SIX_HOURS),
+            "a trailing newline must still parse, or the gate never holds"
+        );
+        clear_project_root();
+    }
+
+    #[test]
+    #[serial]
+    fn test_claim_heartbeat_fails_open_when_the_stamp_cannot_be_written() {
+        // A project root that does not exist: `write_atomic` cannot land the
+        // file, so every call has to fall through to sending.
+        unsafe {
+            env::set_var("III_PROJECT_ROOT", "/nonexistent-iii-project-root/nope");
+        }
+        assert!(claim_heartbeat(SIX_HOURS));
+        assert!(claim_heartbeat(SIX_HOURS));
+        clear_project_root();
+    }
+
+    #[test]
+    #[serial]
+    fn test_claim_heartbeat_fails_open_without_a_project_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = env::current_dir().unwrap();
+        clear_project_root();
+        env::set_current_dir(dir.path()).unwrap();
+
+        assert!(
+            heartbeat_stamp_path().is_none(),
+            "no project means nowhere to persist the stamp"
+        );
+        assert!(claim_heartbeat(SIX_HOURS));
+        assert!(claim_heartbeat(SIX_HOURS));
+
+        env::set_current_dir(cwd).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_claim_heartbeat_suppresses_for_an_interval_past_i64() {
+        // `u64::MAX` less the slack window does not fit in an i64. Casting would
+        // wrap negative and stop suppressing anything.
+        let _dir = project_root_fixture();
+        assert!(claim_heartbeat(u64::MAX));
+        assert!(!claim_heartbeat(u64::MAX));
+        clear_project_root();
+    }
+
+    #[test]
+    #[serial]
+    fn test_claim_heartbeat_gate_opens_for_intervals_inside_the_slack_window() {
+        // An operator who configures an interval shorter than the slack window
+        // has asked for frequent heartbeats, so the gate must not fight them.
+        let _dir = project_root_fixture();
+        assert!(claim_heartbeat(HEARTBEAT_STAMP_SLACK_SECS));
+        assert!(claim_heartbeat(HEARTBEAT_STAMP_SLACK_SECS));
+        assert!(claim_heartbeat(60));
+        clear_project_root();
+    }
+}

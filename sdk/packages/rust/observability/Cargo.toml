@@ -1,0 +1,19 @@
+[package]
+name = "iii-observability"
+version = "0.25.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+authors = ["Motia LLC"]
+description = "OpenTelemetry and logging primitives shared across iii SDKs."
+repository = "https://github.com/iii-hq/iii"
+homepage = "https://github.com/iii-hq/iii"
+keywords = ["iii", "observability", "opentelemetry", "logger"]
+categories = ["api-bindings", "asynchronous", "development-tools"]
+
+[lib]
+name = "iii_observability"
+path = "src/lib.rs"
+
+[dependencies]
+iii-helpers = { workspace = true }

